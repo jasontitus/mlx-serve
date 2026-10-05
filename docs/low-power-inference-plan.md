@@ -11,10 +11,11 @@ threadgroup size, or ANE split. Smaller work units can increase total work and
 energy; faster completion can reduce energy even at higher instantaneous power.
 The main hardware comparison is **Low Power versus High Power**, with Automatic
 optional. We will use these OS modes, not finer-grained frequency/power controls.
-The primary target is the **M5 Max MacBook Pro**. Use the base M5 MacBook as a
-secondary portability check, with Low versus Automatic where High is unavailable.
-Choose candidates on the Max, then check the shortlisted changes on the base M5;
-do not average their results or assume their optimal dispatch thresholds match.
+The primary target is the **M5 Max MacBook Pro**. Use the base M5 MacBook for
+portability within the generation and the **M2 Max MacBook Pro** for older-GPU
+fallback coverage. Compare Low versus High where available, otherwise Low versus
+Automatic. Choose candidates on the M5 Max, then check the shortlisted changes
+on the other machines; do not pool results or assume dispatch thresholds match.
 
 ## Scope and evidence
 

@@ -10,18 +10,29 @@ laptop, not a ready-made energy benchmark runner or a list of measured wins.
 | --- | --- | --- |
 | **M5 Max MacBook Pro — primary** | Low versus High; Automatic optional, particularly for the sustained comparison | Run E0–E4 and the M5 qualification below. Select E5/E6 from its traces. Add a larger dense and a MoE checkpoint only when actual RAM admits them with reserve. |
 | Base M5 MacBook — secondary | Low versus Automatic; record actual available modes | Repeat the small-model baseline and shortlisted candidates, including their reachable NAX/fallback paths. Check for regressions and changed crossovers; do not repeat every Max sweep. |
+| **M2 Max MacBook Pro — older-generation check** | Low versus High if exposed on its chassis/OS; otherwise Low versus Automatic | Repeat E0 and shortlisted E1–E4 controls on shared checkpoints. Validate non-NAX dispatch, prefill crossovers, speculation and contention; prioritize a memory-eligible ANE trial if E7 is pursued. |
 
-Apple lists High Power support for recent MacBook Pro models with Pro/Max chips;
-verify the settings on each machine and power source.
+Apple lists High Power support for recent Pro/Max MacBook Pro models and older
+Max models; verify the settings on each specific chassis, OS and power source.
 ([Supported power modes](https://support.apple.com/en-us/101613))
 Record exact chip/core count, RAM, chassis size and OS build. Use the same small
 checkpoint revision and scenarios for the portability check, but judge each
 candidate against that machine's own baseline in the same mode. Different memory
 capacity, cooling and dispatch choices prevent pooling raw rates or energy.
 
-After qualifying the Max, run its baseline, prefill and speculation comparisons
+After qualifying the M5 Max, run its baseline, prefill and speculation comparisons
 first, then contention/cache and the shortlisted follow-ups. Transfer the useful
-candidates to the base M5 before considering general defaults.
+candidates to the base M5 and M2 Max before considering general defaults.
+
+The M2 Max adds a non-NAX control: verify that unsupported NAX routes decline
+and stock/custom shader fallbacks remain correct, then remeasure the DQ crossover
+and speculative widths rather than copying the M5 choices. Repeat the GLM hcPre
+oracle there too to help localize the existing M1 failure. A difference between
+M2 and M5 cannot isolate NAX's contribution: CPU, memory, cooling and other GPU
+changes are confounded. NAX attribution still needs a same-M5 path comparison.
+If a candidate only wins on M5, preserve the original M2 behavior and require
+evidence before adding a hardware-specific policy. ANE tests on M2 still need
+memory eligibility, lossy-quality checks, engagement and cold/warm energy records.
 
 | M5 follow-up | Concrete test and decision | Adversarial guard |
 | --- | --- | --- |
@@ -210,8 +221,9 @@ and median-of-3 protocol. Estimate uncertainty from paired **blocks**, not
 individual tokens or correlated inner repetitions. Retest the selected result
 in a second session; use a separate prompt set to confirm it.
 
-For first E0 runs on the Max, A/B means High/Low with identical software (Auto
-optional); on the base M5 it means Automatic/Low.
+For first E0 runs on the M5 Max, A/B means High/Low with identical software (Auto
+optional); on the base M5 it means Automatic/Low. On M2 Max use High/Low if
+available, otherwise Automatic/Low; record which comparison actually ran.
 For optimization runs, A/B means baseline/candidate **inside the same power mode and source**;
 repeat in the other mode. This prevents a mode change from being mistaken for a
 software gain. Include a baseline return to detect drift. Let charge and idle

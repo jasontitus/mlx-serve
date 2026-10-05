@@ -11,6 +11,10 @@ threadgroup size, or ANE split. Smaller work units can increase total work and
 energy; faster completion can reduce energy even at higher instantaneous power.
 The main hardware comparison is **Low Power versus High Power**, with Automatic
 optional. We will use these OS modes, not finer-grained frequency/power controls.
+The primary target is the **M5 Max MacBook Pro**. Use the base M5 MacBook as a
+secondary portability check, with Low versus Automatic where High is unavailable.
+Choose candidates on the Max, then check the shortlisted changes on the base M5;
+do not average their results or assume their optimal dispatch thresholds match.
 
 ## Scope and evidence
 
@@ -32,6 +36,10 @@ Engine routing must be recorded: findings about `qmatmulBits` do not establish
 anything about an embedded GGUF engine. Large-model kernels are secondary targets
 only if a laptop has enough memory for their real checkpoints. Synthetic geometry
 tests establish kernel correctness, not model throughput.
+Record the Max's actual RAM, GPU core count and chassis size before selecting
+large checkpoints; the chip name alone does not establish a memory budget.
+The runbook's [hardware allocation and M5 follow-ups](low-power-inference-experiments.md#hardware-allocation-and-m5-follow-ups)
+cover NAX qualification, idle bursts, memory pressure and resume behavior.
 
 Apple documents Low Power Mode as an energy-saving mode, separately configurable
 on battery and AC. It does not specify one universal CPU/GPU/DRAM frequency ratio.

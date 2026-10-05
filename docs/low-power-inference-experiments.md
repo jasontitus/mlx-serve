@@ -4,9 +4,42 @@ Use with the [review and optimization plan](low-power-inference-plan.md).
 All E0–E8 rows below are **planned, not run**. This is a protocol for the target
 laptop, not a ready-made energy benchmark runner or a list of measured wins.
 
+## Hardware allocation and M5 follow-ups
+
+| Machine | Role and power modes | Work allocation |
+| --- | --- | --- |
+| **M5 Max MacBook Pro — primary** | Low versus High; Automatic optional, particularly for the sustained comparison | Run E0–E4 and the M5 qualification below. Select E5/E6 from its traces. Add a larger dense and a MoE checkpoint only when actual RAM admits them with reserve. |
+| Base M5 MacBook — secondary | Low versus Automatic; record actual available modes | Repeat the small-model baseline and shortlisted candidates, including their reachable NAX/fallback paths. Check for regressions and changed crossovers; do not repeat every Max sweep. |
+
+Apple lists High Power support for recent MacBook Pro models with Pro/Max chips;
+verify the settings on each machine and power source.
+([Supported power modes](https://support.apple.com/en-us/101613))
+Record exact chip/core count, RAM, chassis size and OS build. Use the same small
+checkpoint revision and scenarios for the portability check, but judge each
+candidate against that machine's own baseline in the same mode. Different memory
+capacity, cooling and dispatch choices prevent pooling raw rates or energy.
+
+After qualifying the Max, run its baseline, prefill and speculation comparisons
+first, then contention/cache and the shortlisted follow-ups. Transfer the useful
+candidates to the base M5 before considering general defaults.
+
+| M5 follow-up | Concrete test and decision | Adversarial guard |
+| --- | --- | --- |
+| Correctness qualification, before timing | Run the new DQ oracle, reachable NAX kernel oracles and the GLM hcPre test in Low and High on the Max; repeat relevant checks in Low/Auto on base M5 | A staged metallib is not execution proof. Preserve tolerances; passing on M5 does not resolve the M1 baseline failure. |
+| NAX crossover map, E1/E2/E5 | Probe actual verification widths around 4/8/16 rows and prefill widths 256–8192, then narrow around observed dispatch boundaries | Compare one reachable NAX path with its valid fallback, preserving weight layout. Per-kernel switches do not disable all MLX NAX use. Record engagement; decline synthetic wins absent from full requests. |
+| Interactive bursts, E0/E2/E6 | Repeat a fixed short conversation after 5/30/120 seconds idle; measure TTFT and energy over the request plus a fixed post-request window | Warm shaders separately; preserve the same idle duration and cache state within pairs. Report complete-cycle energy and request latency separately so a long idle interval cannot hide a regression. Requires a tested burst scenario and aligned energy windows. |
+| Bottleneck attribution, E5/E6 | Compare production-sized weight-streaming operations, prefill GEMMs and small dependent chains in each mode | Use working sets that do not fit entirely in cache. Diagnostic timings identify the limiting resource; llmprobe request results remain the performance gate. |
+| Realistic memory headroom, E4 | Repeat a shortlisted workload with a recorded browser/IDE workload, then grow context/cache within admission limits | Background work is a separate scenario, not noise to mix into isolated A/B. Record compression/swap and repeat the background load; never bypass reserve or preflight. |
+| Sleep/wake and charger transitions, E0/E2/E8 | With the model resident, resume and test a cached conversation and speculative decode against a fresh-server reference | Separate source changes from mode changes, record transition markers and settling. Check restored state and timing-controller recovery; do not count sleep time as request service time. |
+
+ANE remains a separate optional E7 follow-up after the GPU baseline. A bounded
+M5 Low Power trial may revisit its energy tradeoff despite prior throughput losses;
+it requires explicit force-path engagement, sufficient memory, lossy-quality
+validation and cold/warm accounting. It is not part of the initial default matrix.
+
 ## First session: establish what changes
 
-1. Select a laptop/OS combination that actually exposes Low Power Mode. Record
+1. Start on the M5 Max MacBook Pro and verify the exposed power modes. Record
    model, chip, CPU/GPU cores, RAM, OS build, battery health/charge and adapter.
    Read active state as well as configured AC/battery settings. Do not emulate
    Low Power Mode on the Studio with sleeps, concurrency limits or QoS changes.
@@ -177,7 +210,8 @@ and median-of-3 protocol. Estimate uncertainty from paired **blocks**, not
 individual tokens or correlated inner repetitions. Retest the selected result
 in a second session; use a separate prompt set to confirm it.
 
-For first E0 runs, A/B means High/Low with identical software (Auto optional).
+For first E0 runs on the Max, A/B means High/Low with identical software (Auto
+optional); on the base M5 it means Automatic/Low.
 For optimization runs, A/B means baseline/candidate **inside the same power mode and source**;
 repeat in the other mode. This prevents a mode change from being mistaken for a
 software gain. Include a baseline return to detect drift. Let charge and idle

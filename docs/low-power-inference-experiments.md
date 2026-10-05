@@ -1,16 +1,19 @@
 # Low-power inference: laptop experiment runbook
 
 Use with the [review and optimization plan](low-power-inference-plan.md).
-All E0–E8 rows below are **planned, not run**. This is a protocol for the target
-laptop, not a ready-made energy benchmark runner or a list of measured wins.
+The branch’s E0–E8 candidate experiments remain **planned, not run**. The supplied
+M5 Max session establishes the [engine-bench protocol and reference evidence](low-power-engine-bench.md).
+That protocol governs primary timing/energy claims and supersedes earlier
+standalone llmprobe, battery-run and generic power-integration suggestions here.
+Use the laptop’s existing harness; this branch adds no competing timing loop.
 
 ## Hardware allocation and M5 follow-ups
 
 | Machine | Role and power modes | Work allocation |
 | --- | --- | --- |
-| **M5 Max MacBook Pro — primary** | Low versus High; Automatic optional, particularly for the sustained comparison | Run E0–E4 and the M5 qualification below. Select E5/E6 from its traces. Add a larger dense and a MoE checkpoint only when actual RAM admits them with reserve. |
-| Base M5 MacBook — secondary | Low versus Automatic; record actual available modes | Repeat the small-model baseline and shortlisted candidates, including their reachable NAX/fallback paths. Check for regressions and changed crossovers; do not repeat every Max sweep. |
-| **M2 Max MacBook Pro — older-generation check** | Low versus High if exposed on its chassis/OS; otherwise Low versus Automatic | Repeat E0 and shortlisted E1–E4 controls on shared checkpoints. Validate non-NAX dispatch, prefill crossovers, speculation and contention; prioritize a memory-eligible ANE trial if E7 is pursued. |
+| **M5 Max 128 GB MacBook Pro — primary** | Separate Low and High campaigns; Automatic optional | Qualify correctness, then fresh Low Power E0/E2 arms to investigate DFlash2’s long tail, followed by E1/E3/E4. Select E5/E6 from traces. Add a larger dense and a MoE checkpoint only when actual RAM admits them with reserve. |
+| Base M5 MacBook — secondary | Separate Low and Automatic campaigns; record actual available modes | Repeat the small-model baseline and shortlisted candidates, including their reachable NAX/fallback paths. Check for regressions and changed crossovers; do not repeat every Max sweep. |
+| **M2 Max MacBook Pro — older-generation check** | Separate Low and High campaigns if exposed; otherwise Low and Automatic | Repeat E0 and shortlisted E1–E4 controls on shared checkpoints. Validate non-NAX dispatch, prefill crossovers, speculation and contention; prioritize a memory-eligible ANE trial if E7 is pursued. |
 
 Apple lists High Power support for recent Pro/Max MacBook Pro models and older
 Max models; verify the settings on each specific chassis, OS and power source.
@@ -18,10 +21,13 @@ Max models; verify the settings on each specific chassis, OS and power source.
 Record exact chip/core count, RAM, chassis size and OS build. Use the same small
 checkpoint revision and scenarios for the portability check, but judge each
 candidate against that machine's own baseline in the same mode. Different memory
-capacity, cooling and dispatch choices prevent pooling raw rates or energy.
+capacity, cooling and dispatch choices prevent pooling raw rates or energy. The
+M5 Max’s 0.918 W harness-overhead calibration and energy-counter behavior must
+be validated separately before using this protocol on the base M5 or M2 Max.
 
-After qualifying the M5 Max, run its baseline, prefill and speculation comparisons
-first, then contention/cache and the shortlisted follow-ups. Transfer the useful
+After qualifying the M5 Max, reproduce the supplied long-reply speculation
+problem with a fresh baseline, then prefill, contention/cache and the shortlisted
+follow-ups. Transfer the useful
 candidates to the base M5 and M2 Max before considering general defaults.
 
 The M2 Max adds a non-NAX control: verify that unsupported NAX routes decline
@@ -38,10 +44,10 @@ memory eligibility, lossy-quality checks, engagement and cold/warm energy record
 | --- | --- | --- |
 | Correctness qualification, before timing | Run the new DQ oracle, reachable NAX kernel oracles and the GLM hcPre test in Low and High on the Max; repeat relevant checks in Low/Auto on base M5 | A staged metallib is not execution proof. Preserve tolerances; passing on M5 does not resolve the M1 baseline failure. |
 | NAX crossover map, E1/E2/E5 | Probe actual verification widths around 4/8/16 rows and prefill widths 256–8192, then narrow around observed dispatch boundaries | Compare one reachable NAX path with its valid fallback, preserving weight layout. Per-kernel switches do not disable all MLX NAX use. Record engagement; decline synthetic wins absent from full requests. |
-| Interactive bursts, E0/E2/E6 | Repeat a fixed short conversation after 5/30/120 seconds idle; measure TTFT and energy over the request plus a fixed post-request window | Warm shaders separately; preserve the same idle duration and cache state within pairs. Report complete-cycle energy and request latency separately so a long idle interval cannot hide a regression. Requires a tested burst scenario and aligned energy windows. |
-| Bottleneck attribution, E5/E6 | Compare production-sized weight-streaming operations, prefill GEMMs and small dependent chains in each mode | Use working sets that do not fit entirely in cache. Diagnostic timings identify the limiting resource; llmprobe request results remain the performance gate. |
-| Realistic memory headroom, E4 | Repeat a shortlisted workload with a recorded browser/IDE workload, then grow context/cache within admission limits | Background work is a separate scenario, not noise to mix into isolated A/B. Record compression/swap and repeat the background load; never bypass reserve or preflight. |
-| Sleep/wake and charger transitions, E0/E2/E8 | With the model resident, resume and test a cached conversation and speculative decode against a fresh-server reference | Separate source changes from mode changes, record transition markers and settling. Check restored state and timing-controller recovery; do not count sleep time as request service time. |
+| Interactive bursts, E0/E2/E6 | Separate latency-only diagnostic after 5/30/120 seconds idle | The battery-controller counters cannot resolve a short burst. Do not attach J/token to it; energy requires a validated long steady-load harness scenario. Keep shaders/cache/idle duration matched. |
+| Bottleneck attribution, E5/E6 | Compare production-sized weight-streaming operations, prefill GEMMs and small dependent chains in each mode | Use working sets that do not fit entirely in cache. Diagnostic timings identify the limiting resource; valid engine-bench arms remain the primary performance gate. |
+| Realistic memory headroom, E4 | Repeat a shortlisted workload with a recorded browser/IDE workload, then grow context/cache within admission limits | Background work is a separate diagnostic, never mixed into the primary quiet-Mac arms. Record compression/swap and repeat the background load; never bypass reserve or preflight. |
+| Sleep/wake and charger transitions, E0/E2/E8 | With the model resident, resume and test a cached conversation and speculative decode against a fresh-server reference | Run outside the primary AC-only arms, which reject sleep/battery transitions. Separate source from mode changes and record settling. Check restored state and timing-controller recovery; do not count sleep time as request service time. |
 
 ANE remains a separate optional E7 follow-up after the GPU baseline. A bounded
 M5 Low Power trial may revisit its energy tradeoff despite prior throughput losses;
@@ -50,29 +56,30 @@ validation and cold/warm accounting. It is not part of the initial default matri
 
 ## First session: establish what changes
 
-1. Start on the M5 Max MacBook Pro and verify the exposed power modes. Record
-   model, chip, CPU/GPU cores, RAM, OS build, battery health/charge and adapter.
-   Read active state as well as configured AC/battery settings. Do not emulate
-   Low Power Mode on the Studio with sleeps, concurrency limits or QoS changes.
-2. Build once, pin the model and llmprobe versions, and predownload everything.
-   No downloads, shader builds, Spotlight indexing or unrelated inference during
-   timed runs. Use the same display brightness, peripherals and fan policy.
-3. Start with one small dense/hybrid pack and one small attention pack. Run
-   High versus Low on AC, then repeat on battery as separate strata. Automatic
-   is an optional third arm. If a mode/source combination is unavailable, mark it
-   unavailable; do not relabel another mode or treat unplugging as the toggle.
-   No finer-grained power/frequency settings are part of this campaign.
-4. Measure a warm resident model, no prefix reuse, plain decode: short prompt,
-   long prefill, long-context decode. Then repeat shipping speculation and a
-   warm conversation. Take separate phase traces for the cases that change most.
-5. Choose the next experiment from the observed critical path. Do not start with
-   the full cross-product of models, quantizations, contexts and all knobs.
+1. Read the current laptop `LOW-POWER-TESTING.md` and the linked protocol. Respect
+   the occupied GPU, kernel/Sushi locks, watchdog and quiet periods. The supplied
+   Rapid-MLX chain’s estimated finish is not a lock-release signal. No GPU work
+   until it completes; no interactive analysis during any arm’s idle readings.
+2. Prepare ReleaseFast binaries, correctness checks and candidate version roots
+   between arms. Record commits, binary mtimes, library hashes, harness revision,
+   model/template/sidecar identity and effective settings. Keep AC, 80% non-charging
+   battery, display/peripheral state and quiet-Mac lifecycle consistent.
+3. Begin with the existing 27B Low Power scenarios and fresh baseline/candidate
+   arms. Set AC Energy Mode 1 through the verified setup and settle two minutes.
+   Do not compare a Low candidate against a High baseline. High/Auto campaigns
+   are separate within-mode comparisons; primary arms never run on battery.
+4. Preserve the client’s thinking-off, temperature-1, top_p-1 workload. Validate
+   the 1-user prompt count and actual draft engagement for every short/long step.
+   Prioritize reproducing the DFlash2 disable event before changing its gate.
+5. Use the supplied 4-user, long-reply and prefill suite, then choose extra
+   diagnostic scenarios from the critical path. Counterbalance at least two arms
+   per side in one sitting. Read both counts and energy-validity verdicts.
 
 ## Build and freeze the inputs
 
-Follow [building.md](building.md), including submodules, the pinned Zig, staged
-MLX/MLX-C and llama dependencies. Run these from the repo in a **bash** shell once
-dependencies are staged:
+Repository build/correctness preparation follows [building.md](building.md) and
+[tests/CLAUDE.md](../tests/CLAUDE.md). Run it outside occupied/quiet GPU periods;
+these are repo commands, not primary benchmark arms:
 
 ```bash
 export PATH="$PWD/.zig-toolchain:$PATH"
@@ -83,102 +90,64 @@ git submodule status
 shasum -a 256 zig-out/bin/mlx-serve lib/mlx/lib/libmlx.dylib
 ```
 
-Check the actual staged dylib path before hashing; if the stage layout changes,
-use the dependency path shown by `otool -L zig-out/bin/mlx-serve`.
-Record dirty diffs and hashes for locally rebuilt libraries/kernels, not just the
-top-level SHA. Do not reuse the baseline binary after changing source.
+Inspect `otool -L` when the stage layout changes. The candidate version root in
+`engine-bench/versions/<engine>/<tag>` must follow the existing adapter’s layout;
+record the actual launched executable’s commit, mtime and hashes, not just the
+checkout used to build it. Retain dirty diffs and rebuilt-library provenance.
 
-Set these values for each arm; the missing-value checks deliberately stop an
-unconfigured copy/paste:
+All benchmark launches, plans, summaries and comparisons run from
+`~/experiments/engine-bench` using the commands in the linked protocol. Pin its
+revision and client/scenario configuration; do not substitute a guessed llmprobe
+invocation. This supplied campaign protocol overrides the repository’s default
+benchmark recipe for these measurements. Supporting standalone diagnostics keep
+separate methodology labels and cannot populate the campaign’s comparison cells.
 
-```bash
-: "${MODEL:?absolute path to a memory-fitting checkpoint}"
-: "${LLMPROBE_VERSION:?exact installed/tested llmprobe version}"
-: "${RUN_TAG:?unique tag including chip, source, mode, experiment, arm and repeat}"
-RUN_DIR="$HOME/claude-tmp/bench-$RUN_TAG"
-mkdir -p "$RUN_DIR"
-export LLMPROBE="npx --offline llmprobe@$LLMPROBE_VERSION"
-export MLX_SERVE_ROUND_COST_PERSIST=0
-```
-
-Resolve/download that exact llmprobe package before the session, run its `--help`,
-and verify the report schema. `tests/bench.sh` otherwise defaults to `@latest`.
-Inspect its installed request payload/options: timing controls must not silently
-enable speculation, logprobs, penalties or grammar. If an intended control cannot
-be expressed, add a tested llmprobe scenario before measuring it; do not invent a
-probe flag. Prefix-cold and prefix-warm cases must be distinguished by reported
-`cached_tokens`.
-
-Record checkpoint revision, shard hashes, config, tokenizer/template hashes,
-quant mode/bits/group sizes and sidecar revision. Inspect the relevant entry in
-`~/.mlx-serve/model-settings.json`: per-model overrides can outrank launch
-settings. Record the effective load log and `/props`; make a deliberate,
-reversible correction to that entry if needed. Do not assume CLI spelling proves
-the effective KV, MTP acceptance, drafter or int8-prefill state.
+Inspect per-model settings: overrides can outrank launch flags. Preserve effective
+KV, MTP acceptance, drafter, int8-prefill and thinking settings in each arm. Disable
+round-cost persistence equally for an explicitly fresh-learning experiment; do
+not silently change it when reproducing an existing harness baseline. Record
+cache state and reported cached tokens. Inspect adapter forwarding and route logs
+before attributing a new environment control to a measured result.
 
 ## Measurement and telemetry
 
-Keep four kinds of run distinct:
+The [engine-bench protocol](low-power-engine-bench.md#energy-and-validity) defines
+both the energy domain and run validity. Primary arms use the battery controller’s
+system-load counters, settled before/after idle readings and the supplied 0.918 W
+harness-overhead calibration. Pair added J/token with speed from the **same step**;
+keep prefill J/1K prompt tokens, short replies and long replies separate.
 
-| Run | Purpose | Exclusions |
+| Run | Purpose | Boundary |
 | --- | --- | --- |
-| Uninstrumented llmprobe | Primary TTFT, prefill/decode rate, context ladder and task time | No Metal capture or barrier-inserting profiler |
-| Energy pass with identical scenarios | Task joules, average power, sustained behavior | No shader trace; compare collector-on/off overhead first |
-| Metal / phase trace | Kernel routes, gaps, dispatches, memory and CPU submission attribution | Never quote its tok/s as the performance result |
-| Correctness / quality run | Kernel/state equivalence and task acceptance | Not a throughput sample |
+| Standard engine-bench arm | Primary speed and added-energy result | Quiet Mac on AC, valid counts and energy verdicts; no added profiler/sampler |
+| Kernel / phase trace | Routes, gaps, dispatches, memory and CPU attribution | Outside primary arms; never quote its rate or chip watts as the campaign result |
+| Correctness / transition / memory-stress diagnostic | Numerical/state checks and behavior outside steady conditions | Not a valid primary arm when it sleeps, uses battery, incurs user input or violates thermal criteria |
+| Idle-burst diagnostic | Request latency after a pause | No short-burst energy claim from minute-scale counters |
 
-Log time-stamped mode, source, charge, thermal state and process identity before,
-during and after a block. `pmset -g custom` records configured policies;
-`pmset -g batt` records source/charge; neither replaces a Foundation active-state
-sample. The branch includes a native state sampler with wall and boot-relative
-monotonic timestamps. Compile it before timed runs:
+The controller needs at least 55 seconds of steady load; the harness repeats steps
+shorter than 150 seconds. Its settled-idle and drift criteria decide whether energy
+is computed. Do not interpolate a short burst into an energy estimate or replace
+missing energy with `22 W / tok/s`. Keep raw counter/idle/overhead data. Chip-only
+`powermetrics` or GPU telemetry can attribute a bottleneck, not supply the energy
+number. Loaded-idle noise alone cannot establish a gain.
 
-```bash
-bash tests/test_low_power_state.sh
-swiftc -O -parse-as-library scripts/low-power-state.swift -o /tmp/mlx-low-power-state
-: "${POWER_MODE:?operator-selected low, high or auto}"
-/tmp/mlx-low-power-state --mode "$POWER_MODE" --samples 120 --interval-ms 1000 \
-  > "$RUN_DIR/power-state.jsonl"
-```
+The branch’s native `scripts/low-power-state.swift` sampler remains a diagnostic
+for declared mode, low-power flag, source and thermal state. It is not an energy
+meter and must not be added to a calibrated primary arm without harness integration
+and overhead validation. Compile/test it between arms. A false low-power flag
+cannot distinguish High from Automatic; verify the actual AC policy as well.
 
-Run that last command in a second terminal so samples bracket the workload;
-choose enough samples for the entire block. `--mode` declares the setting; it
-does not change it. Low flag false yields `low_flag_clear_only` for High/Auto:
-verify those choices in OS settings and archive configured policies separately.
-`mismatch`, source changes, missing coverage or thermal changes invalidate a
-steady-state block. The sampler does not record battery charge, task phase markers,
-server identity or joules; collect those separately. Polling can miss brief mode
-changes, so retain explicit operator transition markers and settling windows.
-
-Inspect `powermetrics --help` and the target's available samplers/units first.
-Collect only supported CPU/GPU/ANE/thermal counters with the needed permission;
-keep raw output and sample timestamps. Missing/empty ANE samples mean unknown,
-not zero. Use a sufficiently long repeated-work window (initially 60+ seconds)
-for coarse power sampling, and compare a second sampling interval for overhead.
-Short request phase joules need synchronized phase markers; until available,
-report whole-block/task energy instead of assigning samples to guessed phases.
-
-For a power series in watts, integrate over the measured task interval:
-`E = sum(0.5 * (P[i] + P[i+1]) * (t[i+1] - t[i]))` in joules. Trim/interpolate
-the boundary samples and retain gaps as invalid data, not zeros. Sum only
-non-overlapping domains; do not add package power to its CPU/GPU components.
-Record gross energy and `E - idle_power * duration` separately. Divide by actual
-committed output tokens only for comparable decode workloads; task joules is the
-primary metric when output lengths differ. Never divide full request energy by
-decode tokens and call it decode-only energy.
-
-For AC wall measurements, use a stable charged battery and report charging state,
-adapter losses and background/display load. On battery use battery energy
-telemetry or a suitable external measurement; percentage drops over short runs
-are too coarse. If only SoC-domain power is usable, label that limit in every
-energy claim. Do not project hours of battery life from one short kernel run.
-
-Capture `vm_stat`, `sysctl vm.swapusage`, `/props` active/cache memory and process
-physical footprint during the workload, not only after it. Retain counter deltas
-for compression, swap and faults. Capacity stress is a separate experiment from
-a no-swap kernel comparison. Do not disable memory preflight or the OS reserve.
+Record physical footprint and compression/swap through existing harness telemetry
+or a separate diagnostic. Do not add interactive polling to idle windows. Keep
+capacity stress separate from the no-swap comparison and preserve admission,
+OS reserve and allocator safety constraints.
 
 ## Workload ladder
+
+The primary M5 Max campaign starts with the harness’s existing 27B and Flash-Next
+workloads and standard four-step suite; the table below extends coverage after
+those reproduce. Small models remain useful for portability and attribution,
+not a replacement for the supplied comparison workloads.
 
 | Tier | Checkpoint / workload | Coverage |
 | --- | --- | --- |
@@ -195,12 +164,11 @@ the checkpoint and hardware fit. Record the measured token count, not a word or
 character estimate. For E1, the actual forwarded prefix/tail widths matter, not
 just total prompt tokens.
 
-Use three fixed prompt classes: novel prose/reasoning, code/structured output,
-and copying/editing with a repeated prefix. Keep tool/thinking settings explicit.
-Use 256 committed output tokens as the initial decode target where the model
-does not end early; save EOS/stop reasons and actual lengths. Do not suppress EOS
-or change requested content just to make a flattering denominator. Use separate
-matched diagnostic token replays for forward attribution.
+For extended diagnostics, use fixed novel-prose, code/structured-output and
+copy/edit prompts. Keep them separate from the standard harness requests. Preserve
+the harness’s reply-length settings for primary comparisons; save actual output
+counts and EOS/stop reasons. Never suppress EOS, add thinking or change content
+to improve the denominator. Token replays are attribution diagnostics only.
 
 Cover these scenarios in the staged campaign:
 
@@ -210,51 +178,48 @@ Cover these scenarios in the staged campaign:
 - One stream decoding while another starts an 8k/32k cold prefill; then N=2/4
   steady streams. Measure per-stream latency and aggregate completion work.
 - First-use loading/compile and warm steady state as separate energy budgets.
-- Sustained 10–15 minute workload on both modes, allowing ordinary thermal
-  evolution. Record it rather than discarding thermal effects that belong to use.
+- Sustained 10–15 minute diagnostics in each mode, recording thermal evolution.
+  Primary arms that reach thermal state 2 or above do not count; retain those
+  traces as stress observations instead of using them in the accepted comparison.
 
 ## Repeat order and controls
 
-Use at least three counterbalanced blocks per shortlisted A/B comparison: ABBA,
-BAAB, ABBA, with a saved prompt/seed order. Each cell still uses llmprobe's warmup
-and median-of-3 protocol. Estimate uncertainty from paired **blocks**, not
-individual tokens or correlated inner repetitions. Retest the selected result
-in a second session; use a separate prompt set to confirm it.
+Follow the harness’s ABBA or mirrored order: **at least two arms per side in one
+sitting within about three hours**. A claim requires a difference at least 3% and
+larger than 2.5 standard errors of measured run-to-run noise, as computed by the
+harness’s comparison/standings implementation. Otherwise call it a tie. Review
+counts and energy validity per run before interpreting a grouped comparison.
 
-For first E0 runs on the M5 Max, A/B means High/Low with identical software (Auto
-optional); on the base M5 it means Automatic/Low. On M2 Max use High/Low if
-available, otherwise Automatic/Low; record which comparison actually ran.
-For optimization runs, A/B means baseline/candidate **inside the same power mode and source**;
-repeat in the other mode. This prevents a mode change from being mistaken for a
-software gain. Include a baseline return to detect drift. Let charge and idle
-thermal state settle between cold-start blocks; use a predeclared charge band
-and stop/recharge when leaving it. Do not cool only the preferred arm. Warm each
-geometry before measuring; exclude JIT separately, but include controller learning
-in a distinct first-request result.
+A/B always means baseline/candidate **within one Energy Mode, source and request
+configuration**. Low Power optimizations must be measured in Low Power. Separate
+High/Automatic campaigns can test portability of a candidate, but their cells
+cannot serve as its Low baseline. If independently repeating in another session,
+rerun both sides there; never import the earlier baseline or pool drifting raw
+runs. Do not mix modes when estimating the noise threshold.
 
-Restart the server for controls cached at initialization, with persistence off
-on both arms. E2's in-process mode transition is the deliberate exception. A
-cached environment-variable value cannot be changed by editing another shell.
-For intentionally content-varying repetitions use a fixed nonce per pair, reused
-by both arms; do not compare different cache states or different prompts.
+Restart for process-cached controls, and make persistent timing/cache state equal
+within each pair. Mode transitions, sleep/wake and unplugging are separate
+correctness/attribution tests outside primary arms. Their samples cannot establish
+a steady-state performance or energy gain. Let the chain handle settling, locks,
+quiet-Mac setup and caffeinate. No frequency caps or finer power controls.
 
-Apply the plan's gates to each scenario, not just a pooled average. Save paired
-ratios and intervals for energy, TTFT and rate, plus p50/p95/max streaming gaps.
-With too few repetitions to resolve the threshold, collect more independent
-blocks or call the result inconclusive. No selection of only the best width,
-prompt or boot without a held-out confirmation.
+Apply the plan’s latency/memory/quality guardrails to every scenario. In particular,
+inspect short and long DFlash2 behavior separately: a gate may disable drafting
+mid-request, so an arm-level mode label alone is insufficient. No selecting only
+an appealing width, prompt, engine or boot; confirm a selected candidate with a
+fresh same-sitting baseline.
 
 ## Experiment cards
 
 | ID | Arms / measurements | Proof, guard and stopping rule |
 | --- | --- | --- |
-| E0 | High/Low (Auto optionally) × AC/battery on the same binary; plain then shipping auto speculation; external collector off/on | Active-state samples agree across the block; label energy domain; quantify collector overhead. Resolve missing telemetry before energy claims. |
+| E0 | Reproduce valid engine-bench Low Power arms on AC, with fresh baseline/candidate; separate High/Auto campaigns later | Honor counts and settled-idle energy verdicts, same-step rates, quiet periods and the existing calibration. Do not add a collector to primary arms or compare across modes. |
 | E1 | Actual chunks 512/1024/2048/4096/8192 as allowed; `MLX_SERVE_PREFILL_DQ_GEMM=0` vs default, then the bounded DQ controls below. On 2-bit add 256/384/512 near the crossover. | `[prefill-trace]` shows actual widths/tails. `[prefill-dq]` proves the first experimental selection; use a separate kernel trace for per-layer reachability. Tiled weights require a separate lane-prefill experiment. |
-| E2 | Plain; shipping auto; supported fixed MTP depths 1/2/4/6/8; DFlash blocks 2/4/5/8/16 up to config/hardware support; PLD alone for copying. Run fixed-width controls before adaptive comparisons. | `[spec-stats]`, attempted/accepted drafts, mode, width and serial fallback; exact acceptance only. Compare no-sidecar deployment cost separately from same-loaded-layout request-level drafter-off. Reject unengaged arms. |
-| E2 transition | Warm auto in one mode, toggle to the other with model resident, return; compare against fresh server in each final mode | Measure first 32/128/512 committed-token windows, time to stabilize and total task energy. Test persistence off first. Propose epochs only if current adaptation loses materially. |
+| E2 | First reproduce DFlash2 short/long gate behavior against plain/MTP controls in Low Power; then supported MTP depths 1/2/4/6/8, DFlash blocks 2/4/5/8/16 and PLD copy cases. | `[spec-stats]`, attempted/accepted drafts, mode, width and serial fallback; exact acceptance only. Compare no-sidecar deployment cost separately from same-loaded-layout request-level drafter-off. Reject unengaged arms. |
+| E2 transition | Separate diagnostic outside primary arms: warm auto speculation in one mode, toggle with model resident, return; compare against fresh server in each final mode | Measure latency/acceptance over first 32/128/512 committed-token windows and time to stabilize. No energy inference across a transition or from short windows. Test persistence off first; propose epochs only for material adaptation loss. |
 | E3 | N=1/2/4; default share 0 vs 0.25/0.5; safe chunk caps 512/1024/2048; interleave-off diagnostic control | Real streams and `[interleave]`/`[batched]` evidence. Require output/state correctness, useful per-stream rate and bounded gap; stop any unfair or memory-unsafe arm. |
 | E4 | KV off/8, then 4; contexts around 2k/8k/16k; cold vs warm prefix; 0/1/4 RAM cache entries within budget; SSD tier only for a capacity-use case | Packed attention/fallback evidence, cached/forwarded tokens, restore time, physical memory, disk writes. Fixed request transcript and quality checks. No switching KV format inside a live cache. |
-| E5 | Selected hotspot only: rows per simdgroup 1/2/4, legal SIMD-group/split counts around the shipped choice; matmul/attention crossover shapes; blocked vs pipelined GDN | Some geometry arms require future prototype code. Query per-pipeline limits; finite outputs, truth oracle, exact rows/states where promised, multi-seed tails. Stop if isolated improvement disappears in dependent full-forward and llmprobe runs. |
+| E5 | Selected hotspot only: rows per simdgroup 1/2/4, legal SIMD-group/split counts around the shipped choice; matmul/attention crossover shapes; blocked vs pipelined GDN | Some geometry arms require future prototype code. Query per-pipeline limits; finite outputs, truth oracle, exact rows/states where promised, multi-seed tails. Stop if isolated improvement disappears in dependent full-forward and valid engine-bench arms. |
 | E6 | Existing `MLX_SERVE_DECODE_ASYNC_LADDER` default/0/4/8; command-buffer op/MB caps around chip defaults, one dimension at a time | Only if trace shows exposed build/submit/gap cost. MLX defaults are 40/40 for base/Pro and 50/50 for Max/Ultra at the reviewed pin. Record actual buffers and traces; do not remove dependency barriers. |
 | E7 | GPU-only vs `--ane-prefill`; supported model and sufficient RAM; warm shares e.g. 0.25/0.35/0.45, one compiled variant at a time | Actual MLP/GDN engagement, ready/total coverage and eval-failure counters, warm/cold energy and quality. Existing refusal stays authoritative; no forced M5 trial until a separate justified campaign. |
 | E8 | Current policy vs proposed mode-specific timing/profile handling; mode/source changes during prefill, serial, spec and batch; unknown-state control | Future code. No mode-switch data corruption, false exactness claim, restart requirement or per-token notification overhead. Compare bounded relearning against existing EMA; retain current fallback. |
@@ -300,76 +265,36 @@ checkpoint-level quality at the newly selected widths.
 
 ## Existing commands and the limits of the harness
 
-Use `tests/bench.sh --url` to measure a server launched with the exact arm. The
-automatic model loop chooses fast speculative settings and separate sidecars;
-it is not a plain-decode control. Example, after auditing per-model settings and
-choosing a free port (run in bash, stop only this PID):
+Primary launch, detached-chain, summary and comparison commands are in the
+[engine-bench protocol](low-power-engine-bench.md#builds-and-arms). Run them from
+that harness directory, preserving its locks, watchdog and quiet periods. Stage
+the baseline and candidate version roots first; launch-setting text does not
+prove the executable, method or DQ route actually used.
 
-```bash
-PORT=11490
-lsof -nP -iTCP:"$PORT" -sTCP:LISTEN
-# Continue only if this port has no listener.
-MLX_SERVE_ROUND_COST_PERSIST=0 zig-out/bin/mlx-serve \
-  --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
-  --no-mtp --no-drafter --no-pld --kv-quant off \
-  --prefix-cache-entries 0 --log-level info >"$RUN_DIR/server.log" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
-```
-
-Wait for `/health`, confirm `/v1/models` and `/props`, then use the advertised
-model ID (not an assumed path or alias). Set `MODEL_ID` from that response:
-
-```bash
-: "${MODEL_ID:?advertised model ID from /v1/models}"
-curl --fail --silent "http://127.0.0.1:$PORT/props" >"$RUN_DIR/props.json"
-LLMPROBE="$LLMPROBE" bash tests/bench.sh \
-  --url "127.0.0.1:$PORT" -m "$MODEL_ID" --tag "$RUN_TAG"
-kill "$SERVER_PID"
-wait "$SERVER_PID" || true
-trap - EXIT
-```
-
-The script can finish despite a failed probe; require an actual valid report with
-usage and intended scenarios before accepting a cell. In URL mode its summary
-does not automatically find `server.log`, so retain the log and annotate the
-engaged spec mode yourself. Add `--full` only after the larger context ladder fits.
-Audit all inherited `MLX_SERVE_*`/`MLX_*` values before a run; use explicit bash
-argument arrays for multi-switch arms, not `env $CONFIG` under zsh.
+The new prefill controls belong on the server arm via its environment or plan
+line. Audit forwarding. Tiled weights can bypass the ordinary DQ route entirely;
+prove reachability in a separate diagnostic before spending four long arms on it.
 
 For DFlash method correctness on row-exact models, load the same sidecar on both
 arms and use request `enable_drafter:false`, `enable_mtp:false`, `enable_pld:false`
 for the serial reference. A `--no-drafter` boot changes `rowExactDecode` and can
-change weight layout. That different boot is still a useful **deployment**
-comparison, but not the exact-row oracle. If llmprobe cannot express these body
-fields, extend its scenario support first and pin the changed version.
+change weight layout. That is a useful deployment comparison, not the exact-row
+oracle. Verify the harness can express these controls; extend its scenario adapter
+with tests if necessary rather than inventing flags or changing request semantics.
 
-Attribution helpers already present:
+The repository’s `tests/bench.sh`, `tests/fwd_ubench.sh`, kernel microbenchmarks
+and phase traces remain supporting tools outside the primary arm schedule.
+`fwd_ubench.sh` can kill matching processes on its port; never run it during an
+arm. A standalone llmprobe result has a different methodology label and does not
+replace an engine-bench speed/energy cell. Microbenchmarks need warm JIT and cannot
+establish full-request or energy wins by themselves.
 
-```bash
-MLX_SERVE_DECODE_FWD_UBENCH_S=1 MLX_SERVE_DECODE_FWD_UBENCH_KV=8192 \
-  bash tests/fwd_ubench.sh "$MODEL" 30 --no-mtp --no-drafter --no-pld
-MLX_SERVE_KVQ_UBENCH=1 zig build test -Doptimize=ReleaseFast \
-  -Dtest-filter="qkv packed-attention surface"
-MLX_SERVE_VQMM_UBENCH=1 zig build test -Doptimize=ReleaseFast \
-  -Dtest-filter="verifyQmm µbench"
-```
-
-`fwd_ubench.sh` kills matching processes on its chosen port: reserve a dedicated
-unused `PORT` before using it. Use `MLX_SERVE_PREFILL_TRACE=1` and
-`MLX_SERVE_STEP_TRACE=1` only in diagnostic passes. Follow
-[metal-tracing.md](metal-tracing.md) for short phase-windowed captures. Verify
-that kernel-name tables actually exist on this Xcode/OS; server attach recipes
-have mixed historical results. Sampled shader times identify candidates, not
-precise per-kernel wall-time totals. Hardware occupancy counters are usable only
-if the counter names/units can be resolved on the target.
-
-`tests/bench_concurrency_ladder.sh` is a useful diagnostic, but its client wall
-rates include prefill and its log is temporary. It is not a drop-in source of
-decode-only rates, p95 gaps or energy windows. E3 needs a tested llmprobe streaming
-scenario/extension with per-request timestamps, counts and durable logs. Likewise,
-phase-aligned energy collection and mode-transition orchestration are explicit
-E0/E2 harness work, not existing bench.sh features.
+Follow [metal-tracing.md](metal-tracing.md) for separate short captures. Check
+kernel tables/counter availability before attribution. Existing concurrency
+helpers do not supply every per-stream gap or phase-energy marker we want; any
+harness extension must preserve validity gates and revalidate measurement overhead.
+Do not add extra shell activity or per-round logging to a calibrated arm without
+accounting for its effect.
 
 ## Tests required before adopting a candidate
 
@@ -441,11 +366,13 @@ work. No checkpoint was downloaded for these prototypes.
 
 ## Results to bring back
 
-Keep raw reports, logs and telemetry under `~/claude-tmp/bench-<tag>/` per the
-project benchmark skill. Commit the concise result table and provenance after
-measurement; do not fill `benchmarks.md` with projections or unreleased columns.
+Keep primary raw reports, logs, power events and summaries in the engine-bench
+`runs/<date>/<label>` directories. Supporting repo diagnostics retain their own
+artifacts/methodology labels. Commit a concise provenance/result table after
+measurement; do not fill `benchmarks.md` with projections or mixed-method cells.
 
-Each result needs: E-ID, baseline/candidate commits and binary/library hashes,
+Each result needs: E-ID, baseline/candidate run labels, commits, binary mtimes and
+binary/library hashes, harness revision, counts and energy-validity verdicts,
 chip/RAM/OS, source/mode/thermal/charge, model/sidecar hashes, effective flags and
 settings, prompt/seed hashes, cache state, actual token counts and stop reason,
 engaged routes, repeats/order, TTFT/prefill/decode/task time, stream gaps, energy

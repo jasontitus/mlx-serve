@@ -1,21 +1,30 @@
 # Low-power inference: review and optimization plan
 
-Status: **review, experiment plan and opt-in prototypes; no low-power results**.
+Status: **review, opt-in prototypes and supplied laptop evidence; no branch power measurements**.
 Reviewed 2026-10-04 at `0f01d299d3d7759a7222b2117567053b6d350b89`.
 Companion: [laptop experiment runbook](low-power-inference-experiments.md).
 
-Start with power-state attribution, then measure speculation and prefill dispatch
+Start with a fresh Low Power baseline in the supplied engine-bench harness, then
+reproduce DFlash2's reported long-reply fallback and measure prefill dispatch
 crossovers. Optimize the kernels that remain on the laptop's critical path.
 There is no evidence yet for a universal low-power chunk size, draft depth,
 threadgroup size, or ANE split. Smaller work units can increase total work and
 energy; faster completion can reduce energy even at higher instantaneous power.
-The main hardware comparison is **Low Power versus High Power**, with Automatic
-optional. We will use these OS modes, not finer-grained frequency/power controls.
-The primary target is the **M5 Max MacBook Pro**. Use the base M5 MacBook for
-portability within the generation and the **M2 Max MacBook Pro** for older-GPU
-fallback coverage. Compare Low versus High where available, otherwise Low versus
-Automatic. Choose candidates on the M5 Max, then check the shortlisted changes
+Use **Low Power and High Power**, with Automatic optional, as separate campaigns:
+compare each candidate with its baseline inside the same mode. We will use these
+OS modes, not finer-grained frequency/power controls.
+The primary target is the **M5 Max 128 GB MacBook Pro**, on AC throughout primary
+arms. Use the base M5 MacBook for portability within the generation and the
+**M2 Max MacBook Pro** for older-GPU fallback coverage. Test candidates separately
+in Low and High where available, otherwise Low and Automatic. Choose candidates
+on the M5 Max, then check the shortlisted changes
 on the other machines; do not pool results or assume dispatch thresholds match.
+
+The supplied [engine-bench protocol and reference results](low-power-engine-bench.md)
+supersede the earlier generic energy plan for this campaign. The harness files
+are absent on the review host; the pasted protocol is the source of the machine
+constraints and measurements, not an independently verified result of this branch.
+No GPU work or power-state change was performed while incorporating it.
 
 ## Scope and evidence
 
@@ -37,8 +46,8 @@ Engine routing must be recorded: findings about `qmatmulBits` do not establish
 anything about an embedded GGUF engine. Large-model kernels are secondary targets
 only if a laptop has enough memory for their real checkpoints. Synthetic geometry
 tests establish kernel correctness, not model throughput.
-Record the Max's actual RAM, GPU core count and chassis size before selecting
-large checkpoints; the chip name alone does not establish a memory budget.
+The primary Max has 128 GB RAM; still record GPU core count, chassis, OS and actual
+headroom before selecting checkpoints. Other machines' memory budgets are separate.
 The runbook's [hardware allocation and M5 follow-ups](low-power-inference-experiments.md#hardware-allocation-and-m5-follow-ups)
 cover NAX qualification, idle bursts, memory pressure and resume behavior.
 
@@ -159,31 +168,40 @@ committed tokens` with plain decode. Rejected drafts are work, not output. The
 maximum end-to-end benefit of a kernel occupying fraction f is bounded by
 `1 / ((1 - f) + f / kernel_speedup)` before secondary effects.
 
-Proposed acceptance gates, fixed before collecting candidate results:
+Acceptance gates for the supplied campaign:
 
-- Energy candidate: at least 10% lower task energy, no more than 5% worse TTFT
-  or p95 per-stream gap, unchanged correctness/quality bar.
-- Speed candidate: at least 5% better target phase latency/throughput, no more
-  than 3% greater task energy and no more than 5% worse p95 stream gap.
-- Require a paired confidence interval excluding no improvement on the primary
-  metric, repeat in a second session, and pass a sustained-load run. These
-  thresholds are engineering choices, not measurements or statistical guarantees.
+- A speed or energy difference counts only at **at least 3% and greater than
+  2.5 standard errors** of measured run-to-run noise, using the harness's own
+  comparison implementation. Otherwise report a tie. This replaces the earlier
+  provisional percentage thresholds; it is not a guarantee against overfitting.
+- Run at least two arms per side, ABBA or mirrored in one sitting within about
+  three hours. Every run must count; an energy claim additionally requires valid
+  settled-idle energy on both sides. Never use a baseline from another mode or
+  earlier session. Independent confirmation reruns both arms in its own sitting.
+- Pair speed and added J/token from the same step. Require unchanged correctness
+  and quality, no more than 5% worse TTFT/p95 stream gap, and no more than 3%
+  greater task energy for a speed-focused candidate. Keep short/long reply and
+  prefill results separate. Capture missing latency metrics through validated
+  harness extensions, not interactive polling inside an arm.
 - No unexplained swap growth, memory-cap bypass, starvation, High Power Mode
   regression above 3%, or unsupported-shape regression. A useful tradeoff that
   misses these gates stays explicitly optional; inconclusive means do not ship.
 
-Whole-system task energy is the preferred endpoint. CPU+GPU(+ANE) telemetry is a
-named partial-domain proxy when total energy is unavailable. It cannot establish
-a battery-life improvement. Report both gross and idle-adjusted energy; do not
-hide longer wall time behind idle subtraction.
+This campaign uses battery-controller whole-machine system-load counters and
+reports added energy after settled idle and calibrated harness overhead. Preserve
+raw power and both subtractions. It is not a wall-outlet meter or a battery-life
+projection. The reported roughly 21–23 W added during Low Power generation makes
+throughput useful for ranking hypotheses, not a substitute for measured J/token.
+Never impute missing energy with 22 W, GPU/chip power or a short burst. The coarse
+counters require steady long steps; the existing harness supplies them.
 
 ## Prioritized plan, with adversarial review of every proposal
 
 | ID / priority | Proposal and concrete experiment | Strongest objection / falsifier | Decision and implementation gate |
 | --- | --- | --- | --- |
-| E0 / first | Record mode/source/thermal state, actual dispatch, memory, phase timings and energy; establish High/Low baselines on AC and battery, Automatic optionally. | Telemetry perturbs small models; GPU-only power misses CPU/ANE/DRAM; AC charging confounds wall power. | Measure instrumentation overhead. Reject invalid mode changes and incomplete samples; do not optimize against an unlabelled energy domain. |
+| E0 / first | Reproduce valid Low Power engine-bench arms on the M5 Max, AC only, then fresh candidate/baseline pairs. High/Auto are separate within-mode campaigns. | Extra tools/input disturb idle; mode/source drift and thinking preambles invalidate comparisons; the energy counters cannot resolve short bursts. | Honor locks, quiet periods, counts and energy-validity verdicts. Use the existing calibration and same-step energy; never replace a missing value with an estimate. |
 | E1 / high | Sweep existing chunk sizes and dequant+GEMM on/off jointly, separately for tiled/NAX and ordinary affine trunks. | Small chunks repeat weight reads/graph work and may fall below fast matmul thresholds; large chunks worsen live-stream gaps or memory. | Use actual chunk/route evidence. Retain a Pareto winner within admission limits; only then change a shape-specific crossover or chunk policy. |
-| E2 / high | Compare shipping auto, fixed MTP depths, DFlash block sizes, PLD, and plain decode in each mode; include a mode transition with the model resident. | Extra draft math can cost more joules than it saves; width changes output/acceptance; fresh tables and tiled weights invalidate naive controls. | Measure accepted tokens, round time, task energy and convergence. Keep exact acceptance. Separate method effect from loaded-layout effect. |
+| E2 / first after E0 | Reproduce DFlash2's reported short/long divergence and disable event against plain/MTP controls, then sweep supported draft widths. Mode transitions are separate diagnostics. | Lowering the gate can retain losing drafts; longer warmup can hurt short replies; request thresholds, cost-table exceptions and tiled layouts complicate a blanket gate=2 explanation. | Pin executable/settings, prove engagement and disable timing, pair long speed with long energy. Test any controller change first; preserve acceptance and valid assistant context. |
 | E3 / high | At N=2/4, combine a long prefill with an existing stream; sweep chunk cap and decode share. | More batching improves aggregate rate while making each user wait; tiny chunks lose GEMM efficiency. | Require per-stream TTFT, p95/max gap, fairness and completion energy. Add a time-budget cap only if the current policy misses a predeclared latency target. |
 | E4 / high | Sweep KV off/8 first, then 4 as a separate quality tradeoff, across packed-attention crossover contexts and warm-prefix workloads. | Quantization/restore overhead dominates short context; hybrid state is not compressed by KV quantization; int4 can move output. | Measure active/cache/physical memory, actual packed/fallback route, useful prefix tokens and task quality. No unconditional low-power KV4 default. |
 | E5 / medium | For a traced hotspot, sweep existing matmul/MoE/QSA/GDN tile and split choices, then prototype a narrow new geometry. | A microbenchmark fits in cache; more live accumulators spill; a new reduction order breaks exact-row verification or recurrent state. | Use production shapes and working sets, isolated plus dependent-chain timings, fp32/fp64 truth and existing bit-exact contracts; require full-forward and request wins. |
@@ -193,9 +211,10 @@ hide longer wall time behind idle subtraction.
 
 ### Implementation seams after the measurements
 
-E0 initially needs only external measurement. A later engine bridge can read
-Foundation's power/thermal state and publish a small atomic snapshot. Foundation
-is already linked by [build.zig](../build.zig). Notification callbacks must never
+E0 uses the existing external engine-bench measurement. Do not add the branch's
+diagnostic sampler to calibrated arms without overhead validation. A later bridge
+can read Foundation's power/thermal state and publish a small atomic snapshot.
+Foundation is already linked by [build.zig](../build.zig). Notification callbacks must never
 call MLX, free arrays, resize caches, or mutate active model state. The inference
 thread consumes a changed epoch at a chunk/round boundary. Unknown is a real
 state, not a synonym for Low or Automatic.
@@ -249,10 +268,12 @@ Source takes precedence where historical notes describe superseded routes.
 
 ## Correctness and delivery sequence
 
-1. Run E0 plus the minimal laptop matrix in the runbook. Save manifests and raw
-   data. Stop if the bottleneck or energy domain is not attributable.
-2. Run E1–E4 with existing controls. These establish the largest avoidable work
-   and distinguish policy problems from kernel problems. Report nulls too.
+1. Read the laptop's current engine-bench protocol. Respect the active chain,
+   locks, watchdog and idle quiet periods. Run fresh E0 arms and save raw manifests,
+   counts and energy verdicts. Invalid energy is a rerun, never an estimate.
+2. Start E2 with the reported DFlash2 long-tail fallback, then E1/E3/E4 with
+   existing controls. These distinguish policy problems from kernel problems.
+   Keep all comparisons inside one mode and sitting. Report ties and nulls too.
 3. Choose E5/E6 from the phase trace and Amdahl bound. E7 is a separate optional
    lossy campaign. Implement one measured change per PR, UI and engine together
    only where the feature needs both.
@@ -269,7 +290,8 @@ Source takes precedence where historical notes describe superseded routes.
    gates and relevant integration scripts from [tests/CLAUDE.md](../tests/CLAUDE.md).
    Rebuild the ReleaseFast executable before live A/B. Mark skipped hardware and
    fixture gates explicitly; a compiled env-gated test is not a passing oracle.
-7. Validate the chosen change in both modes and a second session. Add E8 only if
+7. Validate with separate within-mode campaigns and a fresh pair in any second
+   session; do not reuse its earlier baseline. Add E8 only if
    different modes demonstrably need different choices. Keep the original path
    recoverable until the hardware/shape coverage supports a default change.
 

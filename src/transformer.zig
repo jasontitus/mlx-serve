@@ -26,6 +26,7 @@ const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
 const kv_quant = @import("kv_quant.zig");
+const prefill_dq_policy = @import("prefill_dq_policy.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantScheme = kv_quant.Scheme;
@@ -43078,18 +43079,34 @@ fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: mlx.
 // by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
 // Decode (M=1) and spec-verify widths never route. Kill switch:
 // MLX_SERVE_PREFILL_DQ_GEMM=0.
-pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
+pub const PREFILL_DQ_GEMM_MIN_M = prefill_dq_policy.default_min_rows;
 
 /// Rows from which `prefillDqGemm` takes over from stock qmm. 2-bit qmm loses
 /// from 384 rows (M4 Max, 5120x17408: +5% at 384, +10% at 1024); other widths
 /// keep the 2048 they were tuned on.
 pub fn prefillDqGemmMinRows(bits: u32) usize {
-    return if (bits == 2) 384 else PREFILL_DQ_GEMM_MIN_M;
+    return prefill_dq_policy.defaultMinRows(bits);
 }
 
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
+var prefill_dq_policy_override: ?prefill_dq_policy.Policy = null;
 var prefill_dq_gemm_env_cached: ?bool = null;
+var prefill_dq_policy_cached: ?prefill_dq_policy.Policy = null;
+var prefill_dq_experiment_logged = false;
+
+fn prefillDqPolicy() !prefill_dq_policy.Policy {
+    if (prefill_dq_policy_override) |p| return p;
+    if (prefill_dq_policy_cached) |p| return p;
+    const rows = std.c.getenv("MLX_SERVE_PREFILL_DQ_MIN_ROWS");
+    const bytes = std.c.getenv("MLX_SERVE_PREFILL_DQ_MAX_BYTES");
+    const p = try prefill_dq_policy.Policy.parse(
+        if (rows) |raw| std.mem.span(raw) else null,
+        if (bytes) |raw| std.mem.span(raw) else null,
+    );
+    prefill_dq_policy_cached = p;
+    return p;
+}
 
 pub fn prefillDqGemmEnabled() bool {
     if (prefill_dq_gemm_override) |v| return v;
@@ -44194,9 +44211,14 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     const last = lastDim(x) orelse return null;
     if (last == 0) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
-    if (rows < prefillDqGemmMinRows(bits)) return null;
+    // Experimental thresholds cannot reach decode or small verify widths.
+    if (rows < 256) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
+    if (mlx.mlx_array_ndim(w) != 2) return null;
+    const n: usize = @intCast(mlx.mlx_array_shape(w)[0]);
+    const policy = try prefillDqPolicy();
+    if (!policy.allows(bits, rows, n, @intCast(last), 2)) return null;
 
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
@@ -44208,6 +44230,10 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
     prefill_dq_gemm_engaged += 1;
+    if (!prefill_dq_experiment_logged and (policy.min_rows != null or policy.max_dense_bytes != null)) {
+        log.info("[prefill-dq] experimental route engaged: M={d} N={d} K={d} bits={d} dtype={s} min_rows={d} max_weight_bytes={?d}\n", .{ rows, n, last, bits, @tagName(xd), policy.min_rows orelse prefillDqGemmMinRows(bits), policy.max_dense_bytes });
+        prefill_dq_experiment_logged = true;
+    }
     return out;
 }
 
@@ -52664,15 +52690,30 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
 }
 
 test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engaged + no worse than stock)" {
+    prefill_dq_policy_override = .{};
+    defer prefill_dq_policy_override = null;
+    try testPrefillDqNumerics(@intCast(PREFILL_DQ_GEMM_MIN_M), .bfloat16, 4);
+}
+
+test "qmatmulBits: experimental prefill crossover and byte cap preserve numerical bounds" {
+    prefill_dq_policy_override = .{ .min_rows = 512, .max_dense_bytes = 384 * 256 * 2 };
+    defer prefill_dq_policy_override = null;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |dtype| {
+        for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+            try testPrefillDqNumerics(512, dtype, bits);
+        }
+    }
+}
+
+fn testPrefillDqNumerics(M: c_int, dtype: mlx.mlx_dtype, bits: u32) !void {
     const s = mlx.gpuStream();
     const al = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xD0DE);
     const rnd = prng.random();
     const K: c_int = 256;
     const N: c_int = 384;
-    const M: c_int = @intCast(PREFILL_DQ_GEMM_MIN_M);
 
-    // Random bf16 weight quantized to affine q4 gs64 (the 27B trunk class).
+    // Both routes use the same quantized weights and fp32 reference.
     const wn: usize = @intCast(N * K);
     const wbuf = try al.alloc(f32, wn);
     for (wbuf) |*v| v.* = bf16Trunc(rnd.float(f32) - 0.5);
@@ -52682,10 +52723,10 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     defer _ = mlx.mlx_array_free(w32);
     var wb = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wb);
-    try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&wb, w32, dtype, s));
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
     var wq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wq);
     var wsc = mlx.mlx_array_new();
@@ -52705,12 +52746,12 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     defer _ = mlx.mlx_array_free(x32);
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&x, x32, dtype, s));
 
     // f32 ground truth: fp32 dequant + fp32 GEMM.
     var wdq32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wdq32);
-    try mlx.check(mlx.mlx_dequantize(&wdq32, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wdq32, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
     var wdq32_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wdq32_t);
     try mlx.check(mlx.mlx_transpose(&wdq32_t, wdq32, s));
@@ -52723,16 +52764,16 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
 
     // Stock qmm (route forced off).
     prefill_dq_gemm_override = false;
-    const stock = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    defer prefill_dq_gemm_override = null;
+    const stock = try qmatmulBits(x, wq, wsc, wbi, bits, 64, .affine, s);
     defer _ = mlx.mlx_array_free(stock);
     const stock_f = try evalToF32(al, stock, on, s);
     defer al.free(stock_f);
 
     // Routed (default on): engagement must be COUNTED.
     prefill_dq_gemm_override = true;
-    defer prefill_dq_gemm_override = null;
     const before = prefill_dq_gemm_engaged;
-    const routed = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    const routed = try qmatmulBits(x, wq, wsc, wbi, bits, 64, .affine, s);
     defer _ = mlx.mlx_array_free(routed);
     try testing.expectEqual(before + 1, prefill_dq_gemm_engaged);
     const routed_f = try evalToF32(al, routed, on, s);
@@ -52741,12 +52782,25 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     var stock_err: f32 = 0;
     var routed_err: f32 = 0;
     for (0..on) |i| {
+        try testing.expect(std.math.isFinite(gtd[i]) and std.math.isFinite(stock_f[i]) and std.math.isFinite(routed_f[i]));
         stock_err = @max(stock_err, @abs(stock_f[i] - gtd[i]));
         routed_err = @max(routed_err, @abs(routed_f[i] - gtd[i]));
     }
     // bf16-weight-rounding is the only extra error source — same magnitude
     // class as the stock kernel's own bf16 output rounding.
     try testing.expect(routed_err <= 1.5 * stock_err + 5e-3);
+
+    const saved_policy = prefill_dq_policy_override;
+    prefill_dq_policy_override = .{ .min_rows = 512, .max_dense_bytes = N * K * 2 - 1 };
+    defer prefill_dq_policy_override = saved_policy;
+    const cap_before = prefill_dq_gemm_engaged;
+    const capped = try qmatmulBits(x, wq, wsc, wbi, bits, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(capped);
+    const capped_f = try evalToF32(al, capped, on, s);
+    defer al.free(capped_f);
+    try testing.expectEqual(cap_before, prefill_dq_gemm_engaged);
+    try testing.expectEqualSlices(f32, stock_f, capped_f);
+    prefill_dq_policy_override = saved_policy;
 
     // Decode/verify widths never route (M below the floor).
     var x8 = mlx.mlx_array_new();
@@ -52758,10 +52812,10 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
         const e8 = [_]c_int{ 1, 8, K };
         const st8 = [_]c_int{ 1, 1, 1 };
         try mlx.check(mlx.mlx_slice(&x8_32, x32, &s8, 3, &e8, 3, &st8, 3, s));
-        try mlx.check(mlx.mlx_astype(&x8, x8_32, .bfloat16, s));
+        try mlx.check(mlx.mlx_astype(&x8, x8_32, dtype, s));
     }
     const small_before = prefill_dq_gemm_engaged;
-    const small = try qmatmulBits(x8, wq, wsc, wbi, 4, 64, .affine, s);
+    const small = try qmatmulBits(x8, wq, wsc, wbi, bits, 64, .affine, s);
     defer _ = mlx.mlx_array_free(small);
     try mlx.check(mlx.mlx_array_eval(small));
     try testing.expectEqual(small_before, prefill_dq_gemm_engaged);

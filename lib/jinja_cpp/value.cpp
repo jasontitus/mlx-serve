@@ -1250,7 +1250,15 @@ const func_builtins & value_undefined_t::get_builtins() const {
 //////////////////////////////////
 
 
-static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
+// Hard cap on JSON nesting for both ingestion and serialisation. Without it a
+// deeply nested or circular value recurses until the process stack overflows
+// (ASAN: stack-overflow in value_to_json_internal at value.cpp:1363).
+constexpr int MAX_JSON_DEPTH = 512;
+
+static value from_json(const nlohmann::ordered_json & j, bool mark_input, int depth = 0) {
+    if (depth > MAX_JSON_DEPTH) {
+        throw std::runtime_error("from_json: JSON nesting too deep (max " + std::to_string(MAX_JSON_DEPTH) + ")");
+    }
     if (j.is_null()) {
         return mk_val<value_none>();
     } else if (j.is_boolean()) {
@@ -1268,13 +1276,13 @@ static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
     } else if (j.is_array()) {
         auto arr = mk_val<value_array>();
         for (const auto & item : j) {
-            arr->push_back(from_json(item, mark_input));
+            arr->push_back(from_json(item, mark_input, depth + 1));
         }
         return arr;
     } else if (j.is_object()) {
         auto obj = mk_val<value_object>();
         for (auto it = j.begin(); it != j.end(); ++it) {
-            obj->insert(it.key(), from_json(it.value(), mark_input));
+            obj->insert(it.key(), from_json(it.value(), mark_input, depth + 1));
         }
         return obj;
     } else {
@@ -1361,6 +1369,9 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
 // recursively convert value to JSON string
 // TODO: avoid circular references
 static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
+    if (curr_lvl > MAX_JSON_DEPTH) {
+        throw std::runtime_error("value_to_json: value nesting too deep (max " + std::to_string(MAX_JSON_DEPTH) + "); possible circular reference");
+    }
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };

@@ -1030,20 +1030,28 @@ const func_builtins & value_array_t::get_builtins() const {
             if (!is_val<value_array>(args.get_pos(0))) {
                 throw raised_exception("append: first argument must be an array");
             }
-            const value_array_t * arr = cast_val<value_array>(args.get_pos(0));
-            // need to use const_cast here to modify the array
-            value_array_t * arr_editable = const_cast<value_array_t *>(arr);
-            arr_editable->push_back(args.get_pos(1));
-            return args.get_pos(0);
+            value val = args.get_pos(0);
+            // Copy (not const_cast-mutate) the array, like sort/reverse already
+            // do. Mutating the shared array in place silently corrupts any other
+            // value that aliases the same shared_ptr in the evaluation context.
+            std::vector<value> arr = val->as_array();
+            arr.push_back(args.get_pos(1));
+            return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
         {"pop", [](const func_args & args) -> value {
             args.ensure_count(1, 2);
             args.ensure_vals<value_array, value_int>(true, false);
             int64_t index = args.count() == 2 ? args.get_pos(1)->as_int() : -1;
-            const value_array_t * arr = cast_val<value_array>(args.get_pos(0));
-            // need to use const_cast here to modify the array
-            value_array_t * arr_editable = const_cast<value_array_t *>(arr);
-            return arr_editable->pop_at(index);
+            value val = args.get_pos(0);
+            // Copy (not const_cast-mutate) the array; see append above.
+            std::vector<value> arr = val->as_array();
+            if (index < 0) {
+                index += static_cast<int64_t>(arr.size());
+            }
+            if (index < 0 || index >= static_cast<int64_t>(arr.size())) {
+                throw std::runtime_error("Index " + std::to_string(index) + " out of bounds for array of size " + std::to_string(arr.size()));
+            }
+            return arr.at(static_cast<size_t>(index));
         }},
         {"sort", [](const func_args & args) -> value {
             args.ensure_count(1, 4);

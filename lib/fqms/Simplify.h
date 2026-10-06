@@ -180,13 +180,16 @@ struct vec3f
 	inline vec3f normalize( double desired_length = 1 )
 	{
 		double square = sqrt(x*x + y*y + z*z);
-		/*
-		if (square <= 0.00001f )
+		// A zero-length (or near-zero) direction is degenerate: a collapse point
+		// that coincides with a vertex would otherwise produce NaN/Inf here, and
+		// NaN comparisons are always false, so `flipped()` never rejects the
+		// collapse and the mesh is silently corrupted. Give the degenerate
+		// direction a fixed arbitrary unit vector instead of dividing by zero.
+		if (square <= 0.00001f)
 		{
 			x=1;y=0;z=0;
 			return *this;
-		}*/
-		//double len = desired_length / square;
+		}
 		x/=square;y/=square;z/=square;
 
 		return *this;

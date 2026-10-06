@@ -747,7 +747,11 @@ struct value_kwarg_t : public value_t {
 protected:
     virtual bool equivalent(const value_t & other) const override {
         const value_kwarg_t & other_val = static_cast<const value_kwarg_t &>(other);
-        return typeid(*this) == typeid(other) && key == other_val.key && val == other_val.val;
+        // `val == other_val.val` compares shared_ptr identity, not the pointed-to
+        // value, so two equal-but-distinct kwargs compare unequal (breaking the
+        // value_equivalence / value_t::operator== contract). Compare pointees.
+        return typeid(*this) == typeid(other) && key == other_val.key &&
+            val && other_val.val && *val == *other_val.val;
     }
 };
 using value_kwarg = std::shared_ptr<value_kwarg_t>;

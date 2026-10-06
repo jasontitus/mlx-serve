@@ -123,14 +123,19 @@ static string apply_transform(string & self, const transform_fn & fn) {
 string string::uppercase() {
     return apply_transform(*this, [](const std::string & s) {
         std::string res = s;
-        std::transform(res.begin(), res.end(), res.begin(), ::toupper);
+        // ::toupper/::tolower require an `unsigned char` (or EOF) argument;
+        // passing a negative `char` (bytes >= 0x80 on signed-char platforms)
+        // is undefined behaviour. Cast like capitalize()/titlecase() already do.
+        std::transform(res.begin(), res.end(), res.begin(),
+            [](char c) { return ::toupper(static_cast<unsigned char>(c)); });
         return res;
     });
 }
 string string::lowercase() {
     return apply_transform(*this, [](const std::string & s) {
         std::string res = s;
-        std::transform(res.begin(), res.end(), res.begin(), ::tolower);
+        std::transform(res.begin(), res.end(), res.begin(),
+            [](char c) { return ::tolower(static_cast<unsigned char>(c)); });
         return res;
     });
 }

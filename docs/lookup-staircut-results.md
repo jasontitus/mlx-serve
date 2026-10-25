@@ -160,6 +160,12 @@ An attempted second launch of slot 0 was refused before inference. CPU aggregati
 
 This new within-boot workload sequence also exposes a remaining regression: MTP first/repeat prose latency was **10.37% / 5.94% worse** than native MTP. First exposure used 55 native rounds versus 49; repeats used 48 each. Related configuration first/repeat latency improved 37.45% / 41.31%, and related code 19.87% / 23.97%. These are single-pair descriptive effects, not replacements for the two-pair tables or proof that the regressions are resolved.
 
+## Storage portability follow-up
+
+Remote macOS Zig/Swift and Linux CUDA x64/arm64 checks passed on `fbc59b0f`. Windows compilation found POSIX-only permission conversions in the history store. The follow-up uses the host's inherited-ACL convention on Windows, preserves Windows attributes, and leaves POSIX `0700`/`0600` enforcement intact. Static adversarial review found no new blocking issue; Windows requires a protected parent ACL and is not certified by a compile check.
+
+After the fix, the history module and its tests cross-compiled for `x86_64-windows-gnu`; all **20 native history tests passed**. A standalone macOS program created a real store, appended a document, reopened it read-only and verified exact persisted IDs plus directory/payload/lock modes **0700/0600/0600**. The temporary program was removed. This storage-only follow-up has no new model-throughput measurement; the v6 performance tables retain their original binary identity.
+
 ## Separate v2 canonical timeout
 
 `runs/independent-v2-canonical-mtp-0` failed after 252.78 seconds when llmprobe reached its **240-second subprocess timeout**, not the outer 290-second bound. The full 34-request protocol remained incomplete: zero accepted summary samples, one invalid sample. Logs reached three decode runs, prefill warmup and the first of three prefill runs. Partial rates are not promoted. The protocol was not silently shortened to obtain a pass. This is not a current-binary canonical measurement.

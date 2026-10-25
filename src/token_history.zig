@@ -2,6 +2,7 @@
 //! public NumPy format specification. No GPU or unverified-token publication.
 //! See the external authoring read-set note for provenance, not legal assurance.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const File = Io.File;
@@ -20,6 +21,11 @@ const no_position = std.math.maxInt(u64);
 const magic = "MLXLOOK1";
 const header_size = 40;
 const default_order = 12;
+
+// Follow the host's private-file convention: POSIX owner-only modes; Windows
+// inherits the containing directory ACL, which must already protect user data.
+const store_file_permissions: File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+const store_dir_permissions: File.Permissions = if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
 
 pub const VoteNode = struct {
     token: u32,
@@ -597,17 +603,17 @@ const StoreGuard = struct {
             try Dir.cwd().openDir(io, path, .{})
         else
             try Dir.cwd().createDirPathOpen(io, path, .{
-                .permissions = .fromMode(0o700), .open_options = .{ .iterate = true },
+                .permissions = store_dir_permissions, .open_options = .{ .iterate = true },
             });
         errdefer dir.close(io);
-        if (!read_only) try dir.setPermissions(io, .fromMode(0o700));
+        if (!read_only and builtin.os.tag != .windows) try dir.setPermissions(io, store_dir_permissions);
         const lock = dir.openFile(io, "store.lock", .{
             .mode = if (read_only) .read_only else .read_write,
             .follow_symlinks = false, .allow_directory = false,
         }) catch |err| blk: {
             if (err != error.FileNotFound or read_only) return err;
             break :blk dir.createFile(io, "store.lock", .{
-                .read = true, .exclusive = true, .permissions = .fromMode(0o600),
+                .read = true, .exclusive = true, .permissions = store_file_permissions,
             }) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => try dir.openFile(io, "store.lock", .{
                     .mode = .read_write, .follow_symlinks = false, .allow_directory = false,
@@ -620,7 +626,7 @@ const StoreGuard = struct {
         errdefer lock.unlock(io);
         const original_stat = try lock.stat(io);
         if (original_stat.kind != .file or original_stat.nlink != 1 or original_stat.size != 0) return error.UnsafeLockFile;
-        if (!read_only) try lock.setPermissions(io, .fromMode(0o600));
+        if (!read_only and builtin.os.tag != .windows) try lock.setPermissions(io, store_file_permissions);
         const stat = try lock.stat(io);
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -722,11 +728,11 @@ fn replaceLog(guard: *const StoreGuard, identity: [32]u8, tokens: []const u32, c
     try recoverPending(guard);
     const name = pending_log;
     const file = try guard.dir.createFile(guard.io, name, .{
-        .read = true, .exclusive = true, .permissions = .fromMode(0o600),
+        .read = true, .exclusive = true, .permissions = store_file_permissions,
     });
     errdefer file.close(guard.io);
     defer if (!committed.*) guard.dir.deleteFile(guard.io, name) catch {};
-    try file.setPermissions(guard.io, .fromMode(0o600));
+    if (builtin.os.tag != .windows) try file.setPermissions(guard.io, store_file_permissions);
     try file.writePositionalAll(guard.io, &makeHeader(identity), 0);
     try writeTokens(file, guard.io, tokens, header_size);
     try file.sync(guard.io);
@@ -774,7 +780,7 @@ pub const PersistentStore = struct {
         errdefer file.close(io);
         const original_stat = try file.stat(io);
         if (original_stat.kind != .file or original_stat.nlink != 1) return error.UnsafeFile;
-        if (!read_only) try file.setPermissions(io, .fromMode(0o600));
+        if (!read_only and builtin.os.tag != .windows) try file.setPermissions(io, store_file_permissions);
         const before = Stamp.from(try file.stat(io));
         var index = try loadPersistent(&guard, allocator, identity);
         errdefer index.deinit();
@@ -1147,7 +1153,7 @@ test "independent index agrees with exhaustive small-document occurrences" {
 }
 
 fn testWrite(dir: Dir, name: []const u8, bytes: []const u8) !void {
-    const file = try dir.createFile(std.testing.io, name, .{ .permissions = .fromMode(0o600) });
+    const file = try dir.createFile(std.testing.io, name, .{ .permissions = store_file_permissions });
     defer file.close(std.testing.io);
     try file.writePositionalAll(std.testing.io, bytes, 0);
 }
@@ -1277,8 +1283,10 @@ test "read-only store preserves bytes metadata and never creates absent paths" {
     const bytes_after = try readBounded(tmp.dir, io, a, "tokens.bin", 1024);
     defer a.free(bytes_after);
     try std.testing.expectEqualSlices(u8, bytes_before, bytes_after);
-    const permissions = (try tmp.dir.statFile(io, "tokens.bin", .{})).permissions.toMode();
-    try std.testing.expectEqual(@as(@TypeOf(permissions), 0o600), permissions & 0o777);
+    if (builtin.os.tag != .windows) {
+        const permissions = (try tmp.dir.statFile(io, "tokens.bin", .{})).permissions.toMode();
+        try std.testing.expectEqual(@as(@TypeOf(permissions), 0o600), permissions & 0o777);
+    }
 }
 
 test "persistent cache releases locks between requests and invalidates on append" {
@@ -1595,7 +1603,7 @@ test "unsafe hard links are rejected without changing the other inode permission
         store.deinit();
         const file = try tmp.dir.openFile(io, name, .{ .mode = .read_write });
         defer file.close(io);
-        try file.setPermissions(io, .fromMode(0o640));
+        if (builtin.os.tag != .windows) try file.setPermissions(io, .fromMode(0o640));
         try Dir.hardLink(tmp.dir, name, tmp.dir, "unrelated", io, .{});
         const before = try tmp.dir.statFile(io, "unrelated", .{});
         const expected_error = if (std.mem.eql(u8, name, "store.lock")) error.UnsafeLockFile else error.UnsafeFile;

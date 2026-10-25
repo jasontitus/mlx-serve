@@ -141,7 +141,7 @@ Defined sequential metric requests require exact token replay. Setup/batching di
 - `MLX_SERVE_LOOKUP_RECEIPTS=1` exposes publication and round evidence; `[lookup-setup]` identifies index-cache reuse, and `[lookup-native-cost]` counts clean MTP calibration opportunities/gaps.
 - `MLX_SERVE_LOOKUP_PRICE_TRACE=1` is timing-perturbing and reports only evaluated widths. It does not measure unchosen actions.
 - Price files require schema two and `floor-power-of-two-2048` context labeling. Historical class tables must not be relabeled as new priors.
-- Raw text, token IDs, environment captures and temporary diagnostic API keys are private. Keep 0700/0600 output permissions; publish only redacted reports. Token IDs are reversible, not anonymized.
+- Raw text, token IDs, environment captures and temporary diagnostic API keys are private. Keep POSIX output permissions at 0700/0600. Windows stores require an already protected parent with a restrictive inheritable ACL; existing ACLs are not tightened or validated. Publish only redacted reports. Token IDs are reversible, not anonymized.
 - The drivers ignore proxies and set offline variables. For enforced nonlocal network denial on macOS, prefix an individual command with `sandbox-exec -p '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))'`. Loopback must remain allowed.
 
 ## Local model limits

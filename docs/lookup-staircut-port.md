@@ -56,6 +56,8 @@ Only published prompt/output documents are persisted, never rejected drafts. The
 
 Stable advisory locking protects append/trim. Trimming atomically replaces complete documents and syncs the directory. Partial append rolls back; failed rollback retires the store. Unsafe symlinks/hard links are rejected before permission changes. A reserved interrupted replacement is recovered under the stable lock. Read-only leases validate file identity and never chmod or rewrite the frozen fixture. Cooperative locking is required; metadata checks do not defend against an arbitrary malicious writer that ignores the protocol.
 
+POSIX writers enforce directory mode `0700` and file mode `0600`. Windows follows the host's inherited-ACL convention and does not tighten or validate ACLs: place the configurable store beneath a directory with an appropriately restrictive **inheritable ACL**. New replacement files inherit the directory ACL, not necessarily an old payload's explicit ACL. Windows compilation is not evidence of private ACLs or runtime locking/durability correctness.
+
 Token IDs are reversible data, **not anonymized text**. Enabling persistent storage retains prompts and answers across requests. Use private directories separated by tokenizer and trust boundary. Raw diagnostic logs can contain text, token IDs and temporary authentication credentials; do not publish them without redaction.
 
 ## Model and numerical boundaries

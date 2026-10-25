@@ -150,6 +150,16 @@ Historical observations are binary-specific and are not causal code-change estim
 
 The older v1 same-state experiment (`runs/independent-cf-*`, binary `51110940f7e9e6dddbf669f489df428f963a441dcc2c48495e71ad25f3c8c668`) remains historical. Its receipts lack the now-required request-trust identity and are not current-protocol evidence. They were not upgraded or relabeled.
 
+## Bounded confirmation runner smoke
+
+The new confirmation wrapper freezes four pair slots before execution; each separately launched slot keeps all four workloads within each native/feature boot. Runtime code and the v6 binary are unchanged.
+
+`runs/independent-v6-mtp-cohort-20261025/pair-0` completed **24 exact-valid requests in 137.81 seconds**, with zero invalid samples. It adds to the previous 125 scoped runtime checks: **149 current-binary requests checked in total**. The full Python helper suite passed 137 tests, including 16 new schedule/declaration/aggregation regressions. Adversarial review found no blocking wrapper issue.
+
+An attempted second launch of slot 0 was refused before inference. CPU aggregation recomputed its sealed evidence without changing artifact hashes and correctly failed with missing slots `[1, 2, 3]`; no four-pair confirmation is claimed. Isolation was undeclared. The remaining slots were not automatically launched.
+
+This new within-boot workload sequence also exposes a remaining regression: MTP first/repeat prose latency was **10.37% / 5.94% worse** than native MTP. First exposure used 55 native rounds versus 49; repeats used 48 each. Related configuration first/repeat latency improved 37.45% / 41.31%, and related code 19.87% / 23.97%. These are single-pair descriptive effects, not replacements for the two-pair tables or proof that the regressions are resolved.
+
 ## Separate v2 canonical timeout
 
 `runs/independent-v2-canonical-mtp-0` failed after 252.78 seconds when llmprobe reached its **240-second subprocess timeout**, not the outer 290-second bound. The full 34-request protocol remained incomplete: zero accepted summary samples, one invalid sample. Logs reached three decode runs, prefill warmup and the first of three prefill runs. Partial rates are not promoted. The protocol was not silently shortened to obtain a pass. This is not a current-binary canonical measurement.

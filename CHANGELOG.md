@@ -13,6 +13,7 @@
 - Retained host-native row-exact projection coverage through 16 rows and the guarded linear GDN specialization above eight rows; branching and narrow trees stay generic. Verification/commit semantics remain host-owned.
 - Added strict-authenticated same-state first-offer diagnostics with complete learner reset, actual state/offer/dispatch fingerprints and serial publication checks. Readback-perturbed verification timings are not throughput evidence.
 - Added reproducible bounded benchmark helpers, frozen-history unseen related requests, conflict/miss controls, both native MTP and DFlash references, and separate family-improvement/fastest-decoder gates. Confirmation requires explicit isolation and stable machine evidence; incomplete windows and historical schemas cannot pass.
+- Added predeclared four-pair held-out confirmation with independently launched 24-request full-workload slots. Each slot retains both native baselines and cross-request learner history under the 290-second bound. Fixed-slot aggregation revalidates sealed evidence, rejects missing/reassigned schedules, and separates execution completeness from cross-window measurement qualification.
 - Replacement measurements and earlier diagnostic evidence are separated by binary identity in `docs/lookup-staircut-results.md`. Related-request gains do not establish a universal or canonical throughput improvement; conflict and unrelated-request regressions remain promotion blockers.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster

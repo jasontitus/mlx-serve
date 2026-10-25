@@ -20,12 +20,13 @@ Compilation is not a GPU benchmark. The integrated tests include short real hybr
 The repository owns the authoritative drivers:
 
 - `tests/lookup_similar_requests.py`: unseen related requests and conflict/miss controls; both native baselines; optional serial correctness oracle.
+- `tests/lookup_confirmation_window.py`: predeclared four-pair confirmation split into independently launched full-workload windows.
 - `tests/lookup_counterfactual_window.py`: first-offer same-state width/action diagnostics, with full learner reset and strict-authenticated owned server.
 - `tests/lookup_canonical_window.py`: one complete pinned canonical arm, or its separate exact replay.
 - `tests/lookup_route_diagnostic.py`: existing exact-reuse/route mechanism controls.
 - `tests/lookup_transfer_contract.json`: predeclared training/evaluation request contract.
 
-Each window has a **290-second process-group bound**, owns its server, and never automatically starts another window. A deadline-truncated schedule fails; completed subsets are not silently promoted. Use a new output directory for every run. `--plan-only` prepares a declaration without loading a model. Inspect the result before selecting another action.
+Each window has a **290-second process-group bound**, owns its server, and never automatically starts another window. A deadline-truncated schedule fails; completed subsets are not silently promoted. Use a new output directory for every run. The existing drivers support `--plan-only`; the confirmation wrapper instead has a CPU-only `--declare` operation and fixed, non-reusable output slots. Inspect the result before selecting another action.
 
 Private `tools/lookup-transfer` launchers on the prepared machine delegate to these repository files. `MLX_SERVE_REPO` can select another checkout for those launchers. Neither historical run artifacts nor frozen seeds are rewritten by the migration.
 
@@ -49,6 +50,39 @@ All arms use explicit row-exact arithmetic, not unchanged stock MTP arithmetic. 
 Default isolation is `contended`. Only use `--isolation declared` when the operator actually knows other GPU inference has stopped. Free memory is not isolation evidence. Confirmation requires complete unchanged power/settings, thermal limits, normal pressure and swap counters/usage. Two pairs remain diagnostic; four qualified pairs are needed for transfer confirmation. Cold and timed-repeat gates remain separate. Schema-three aggregation refuses historical schema-two evidence rather than relabeling it.
 
 For a correctness-only reference window, use `--row-exact --serial-oracle --cases related-config` (or `related-code`) instead of `--both-native-baselines`. It executes eight requests spanning serial, both native families and one feature. `--feature-selection cut|fixed:8|fixed:16` is restricted to that oracle; forced-control timings are not adaptive performance evidence.
+
+## Confirmation without a long GPU sweep
+
+Do not put four full-workload pairs into one five-minute invocation. Declare a new cohort on CPU:
+
+```sh
+python3 tests/lookup_confirmation_window.py \
+  --declare "$kit/runs/mtp-confirmation" \
+  --seed "$kit/runs/20261025-transfer-training-literal" --family mtp
+```
+
+Default isolation remains `contended`. Add `--isolation declared` **at declaration only** if exclusive inference is actually known. Each slot keeps all four cases in their declared order within each server boot, both native references, and first exposure plus repeat: 24 requests. This preserves cross-request learner state; splitting into isolated single-case runs would test a different workload.
+
+Launch just one slot:
+
+```sh
+python3 tests/lookup_confirmation_window.py \
+  --cohort "$kit/runs/mtp-confirmation" --pair 0
+```
+
+Later, explicitly invoke slots `1`, `2`, and `3` individually; do not use an automatic loop. Their forward/reverse arm orders were frozen before any results. An existing slot is refused, including a failed or interrupted one; do not replace a failed slot with a more favorable run. A changed binary, helper, tokenizer, seed or declaration rejects the cohort. To evaluate a revised implementation, declare a new cohort and retain the old result.
+
+CPU-only aggregation reads exactly the four fixed slots:
+
+```sh
+python3 tests/lookup_confirmation_window.py \
+  --aggregate "$kit/runs/mtp-confirmation" \
+  --output "$kit/runs/mtp-confirmation-summary"
+```
+
+Missing slots fail closed. Complete execution and measurement qualification are separate: a complete contended cohort is still not performance evidence. Every cold/repeat, related/miss, source-activation and exactness gate remains; machine stability must also hold across slots. A family win does not imply beating native DFlash. Artifact hashes detect accidental changes, not deliberate receipt forgery. Aggregation recomputes summaries without modifying original evidence.
+
+Use a separately declared `--family dflash` cohort for DFlash feature confirmation. This protocol fixes the held-out confirmation scheduling problem; it does **not** shorten or certify the separate canonical benchmark.
 
 ## Same-state first-offer diagnostic
 

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "seeds": [7, 19, 103],
+  "context_boundaries": [2048, 4096],
+  "max_tokens": 48,
+  "overlap_tokens": 512,
+  "prompt": "Continue the sequence, preserving its exact spelling and punctuation.\nlookup validation amber cedar maple birch willow\nlookup validation amber cedar maple birch willow\nlookup validation amber cedar maple birch",
+  "context_unit": " amber cedar maple birch willow validation context",
+  "contexts_note": "The CLI tokenizes real text and selects prompt lengths immediately below/above each boundary. It requires receipts proving both reached classes; capacity alone never passes.",
+  "storage_note": "Negative stores are private output-directory copies. Append failure is injected by changing the live owned log length after a settled round, then restoring the original bytes only after request teardown."
+}

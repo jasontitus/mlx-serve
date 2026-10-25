@@ -595,6 +595,8 @@ pub const ModelConfig = struct {
     drafter_override: ?[]const u8 = null,
     /// Every quantized projection fits the row-exact kernels (`Transformer.init`).
     row_exact_covered: bool = false,
+    /// Explicit numerical mode, frozen at Transformer.init before any prefill.
+    row_exact_requested: bool = false,
     /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
     dflash_bound: bool = false,
 
@@ -1204,31 +1206,45 @@ pub const ModelConfig = struct {
         return configured;
     }
 
-    /// SSD prefix-cache layout marker (`kv_disk_cache.modelFingerprintWithLayout`).
-    /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
-    /// marker gives it a fresh root. Null keeps every other arch's root.
+    /// SSD prefix-cache layout and numerical-mode marker. Stock loads retain
+    /// their roots; explicit and DFlash row-exact loads share a separate root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
-        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
-        if (self.rope_llama3 != null) return "llama3-rope-v1";
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return self.cacheNumericalNamespace("nemotron-h-nope-v1");
+        if (self.rope_llama3 != null) return self.cacheNumericalNamespace("llama3-rope-v1");
         // A pool's completing indexer row stores the pool's key in its gate half; v2: the KDA q/k norm epsilon.
-        if (self.isGlm5()) return "glm5-pooled-keys-v2";
+        if (self.isGlm5()) return self.cacheNumericalNamespace("glm5-pooled-keys-v2");
         // A restored bf16 state would keep running bf16: every GDN kernel takes its state's dtype.
-        if (self.ssm_state_f32) return "gdn-f32-state-v1";
-        return null;
+        if (self.ssm_state_f32) return self.cacheNumericalNamespace("gdn-f32-state-v1");
+        return if (self.rowExactDecode()) "row-exact-v1" else null;
+    }
+
+    fn cacheNumericalNamespace(self: *const ModelConfig, comptime layout: []const u8) []const u8 {
+        return if (self.rowExactDecode()) layout ++ "/row-exact-v1" else layout;
+    }
+
+    pub fn rowExactRequestedFromEnv(value: ?[]const u8) bool {
+        return if (value) |v| std.mem.eql(u8, v, "1") else false;
+    }
+
+    /// Called once after kernel coverage is known; never silently downgrade an opt-in.
+    pub fn validateRowExactRequest(self: *const ModelConfig) !void {
+        if (!self.row_exact_requested) return;
+        if (!self.rowExactArch()) return error.RowExactUnsupportedArchitecture;
+        if (!self.row_exact_covered) return error.RowExactUncoveredProjections;
     }
 
     /// Decode-width projections go through the row-exact kernels, whose rows
     /// get the same bits at any window width: a verify row reproduces serial
-    /// decoding. Only where every projection fits them AND a DFlash drafter is
-    /// bound: serial and MTP keep the faster stock paths otherwise.
+    /// decoding. Requires full projection coverage and either an explicit
+    /// model-lifetime request or a real DFlash binding; defaults stay stock.
     pub fn rowExactDecode(self: *const ModelConfig) bool {
-        return self.row_exact_covered and self.dflash_bound and self.rowExactArch();
+        return self.row_exact_covered and (self.row_exact_requested or self.dflash_bound) and self.rowExactArch();
     }
 
-    /// MTP acceptance for this load: exact while a DFlash drafter is bound, so
-    /// the MTP rounds it yields to stay byte-exact too.
+    /// Exact acceptance accompanies either exact-mode opt-in or DFlash binding.
+    /// Otherwise the per-model setting and launch default remain unchanged.
     pub fn mtpAcceptance(self: *const ModelConfig, default: mtp_acceptance_mod.Mode) mtp_acceptance_mod.Mode {
-        if (self.dflash_bound) return .exact;
+        if (self.row_exact_requested or self.dflash_bound) return .exact;
         return self.mtp_acceptance_override orelse default;
     }
 
@@ -10877,26 +10893,84 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.has_pre_ff_norm);
 }
 
-test "rowExactDecode: a covered trunk decodes exact only while a DFlash drafter is bound" {
-    var cfg = ModelConfig{};
-    cfg.model_type = "qwen3_5";
-    cfg.row_exact_covered = true;
-    // Serial and MTP keep the stock paths: exact mode costs MTP ~30%.
-    try std.testing.expect(!cfg.rowExactDecode());
-    cfg.dflash_bound = true;
-    try std.testing.expect(cfg.rowExactDecode());
+test "lookup rowExactDecode: default, explicit and DFlash modes retain architecture and coverage gates" {
+    var cfg = ModelConfig{ .model_type = "qwen3_5", .row_exact_covered = true };
+    try testing.expect(!cfg.row_exact_requested);
+    try testing.expect(!cfg.rowExactDecode());
+    try cfg.validateRowExactRequest();
+    cfg.row_exact_requested = true;
+    try testing.expect(cfg.rowExactDecode());
+    try testing.expect(!cfg.dflash_bound);
+    try cfg.validateRowExactRequest();
     cfg.row_exact_covered = false;
-    try std.testing.expect(!cfg.rowExactDecode());
+    try testing.expect(!cfg.rowExactDecode());
+    try testing.expectError(error.RowExactUncoveredProjections, cfg.validateRowExactRequest());
+    cfg.row_exact_covered = true;
+    cfg.hadamard_block = 32;
+    try testing.expect(!cfg.rowExactDecode());
+    try testing.expectError(error.RowExactUnsupportedArchitecture, cfg.validateRowExactRequest());
+    cfg.hadamard_block = 0;
+    cfg.model_type = "qwen3_5_moe";
+    cfg.num_experts = 8;
+    try testing.expect(!cfg.rowExactDecode());
+    try testing.expectError(error.RowExactUnsupportedArchitecture, cfg.validateRowExactRequest());
+    cfg.model_type = "llama";
+    cfg.num_experts = 0;
+    try testing.expect(!cfg.rowExactDecode());
+    try testing.expectError(error.RowExactUnsupportedArchitecture, cfg.validateRowExactRequest());
+    cfg.model_type = "nemotron_h";
+    try testing.expect(cfg.rowExactDecode());
+    try cfg.validateRowExactRequest();
+    cfg.row_exact_requested = false;
+    cfg.dflash_bound = true;
+    try testing.expect(cfg.rowExactDecode());
+    cfg.row_exact_covered = false;
+    try testing.expect(!cfg.rowExactDecode());
+    // Coverage only fails closed for an explicit request; DFlash keeps its own binding rules.
+    try cfg.validateRowExactRequest();
 }
 
-test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setting, else the launch default" {
+test "lookup row-exact env opt-in requires exactly 1" {
+    try testing.expect(ModelConfig.rowExactRequestedFromEnv("1"));
+    for ([_]?[]const u8{ null, "", "0", "true", "10" }) |value|
+        try testing.expect(!ModelConfig.rowExactRequestedFromEnv(value));
+}
+
+test "lookup mtpAcceptance: explicit and DFlash exact acceptance override model and launch defaults" {
     var cfg = ModelConfig{};
     const typical: mtp_acceptance_mod.Mode = .{ .typical = .{ .delta = 0.2 } };
-    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .typical);
+    try testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .typical);
     cfg.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
+    try testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
+    cfg.row_exact_requested = true;
+    try testing.expect(cfg.mtpAcceptance(typical) == .exact);
+    cfg.row_exact_requested = false;
+    try testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
     cfg.dflash_bound = true;
-    try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
+    try testing.expect(cfg.mtpAcceptance(typical) == .exact);
+}
+
+test "lookup cache identity separates actual row-exact numerics and preserves state layouts" {
+    var cfg = ModelConfig{ .model_type = "qwen3_5", .row_exact_covered = true };
+    try testing.expect(cfg.cacheLayoutNamespace() == null);
+    cfg.row_exact_requested = true;
+    try testing.expectEqualStrings("row-exact-v1", cfg.cacheLayoutNamespace().?);
+    const explicit = cfg.cacheLayoutNamespace().?;
+    cfg.row_exact_requested = false;
+    cfg.dflash_bound = true;
+    try testing.expectEqualStrings(explicit, cfg.cacheLayoutNamespace().?);
+    cfg.ssm_state_f32 = true;
+    try testing.expectEqualStrings("gdn-f32-state-v1/row-exact-v1", cfg.cacheLayoutNamespace().?);
+    cfg.dflash_bound = false;
+    try testing.expectEqualStrings("gdn-f32-state-v1", cfg.cacheLayoutNamespace().?);
+    cfg.model_type = "nemotron_h";
+    try testing.expectEqualStrings("nemotron-h-nope-v1", cfg.cacheLayoutNamespace().?);
+    cfg.row_exact_requested = true;
+    try testing.expectEqualStrings("nemotron-h-nope-v1/row-exact-v1", cfg.cacheLayoutNamespace().?);
+    cfg.row_exact_covered = false;
+    try testing.expectEqualStrings("nemotron-h-nope-v1", cfg.cacheLayoutNamespace().?);
+    cfg.model_type = "glm5_next";
+    try testing.expectEqualStrings("glm5-pooled-keys-v2", cfg.cacheLayoutNamespace().?);
 }
 
 test "parseConfigFromJson rejects invalid field types and ranges" {

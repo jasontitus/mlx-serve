@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — opt-in token-history speculation
+
+- Added independently authored local, corpus and persistent token-history drafting, plus verification-width selection inspired by [TandemLLM](https://github.com/0xBakeer/TandemLLM). Retired local source-derived implementations are not part of the feature branch. See `docs/lookup-staircut-port.md` for authoring provenance, attribution and legal limitations.
+- Integrated bounded chain selection with MTP/PLD and source-aware tree selection with supported row-exact DFlash2. Unknown native economics retain the incumbent; this is not a universal router between model families.
+- Added model-owned immutable read-only history caches, request-scoped validated leases, tokenizer-bound storage, publication-aware persistence, safe append rollback and atomic whole-document trimming. Persistent history is private retained user data, not anonymized tokens.
+- Corrected paid-preparation accounting using paired remaining native duration/yield, query-excluded DFlash clocks, bounded clean MTP calibration, censored acceptance and per-kernel-shape warmup. Forced controls and lookup-disabled native requests do not incur calibration pipeline gaps.
+- Separated lookup calibration by matched suffix order and actual per-edge evidence. Greedy row-exact MTP and DFlash learn offered lookup outcomes from already reached target decisions without extra GPU work for that feedback. Request-local trust prevents pooled template success from immediately admitting unsupported lookup on unrelated requests. Conditional continuation evidence survives merging with neural parents. Group-capped MTP chains censor unverified tails and report their actual execution width.
+- Added bounded executable-width exploration to reduce cold-price starvation. Reservations are consumed before execution; unsuccessful or unmatched calibration can leave wider actions unpriced. Exploration neither synthesizes prices nor affects forced diagnostic controls.
+- During the same bounded Qwen MTP calibration opportunities, explicitly settle existing head work before measuring target verification/commit. Native remaining-duration accounting includes this synchronization; target prices still exclude cold shapes and may remain incomplete. Other head architectures and prepared/grouped flights are excluded.
+- Preserved native MTP acceptance during timing-excluded head recovery after lookup, and rearmed pricing at recovery completion so the next clean interval is not discarded. Added native-depth decision traces; these are host-side diagnostics, not timing-neutral execution records.
+- Retained host-native row-exact projection coverage through 16 rows and the guarded linear GDN specialization above eight rows; branching and narrow trees stay generic. Verification/commit semantics remain host-owned.
+- Added strict-authenticated same-state first-offer diagnostics with complete learner reset, actual state/offer/dispatch fingerprints and serial publication checks. Readback-perturbed verification timings are not throughput evidence.
+- Added reproducible bounded benchmark helpers, frozen-history unseen related requests, conflict/miss controls, both native MTP and DFlash references, and separate family-improvement/fastest-decoder gates. Confirmation requires explicit isolation and stable machine evidence; incomplete windows and historical schemas cannot pass.
+- Replacement measurements and earlier diagnostic evidence are separated by binary identity in `docs/lookup-staircut-results.md`. Related-request gains do not establish a universal or canonical throughput improvement; conflict and unrelated-request regressions remain promotion blockers.
+
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights

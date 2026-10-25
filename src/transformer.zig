@@ -32,6 +32,49 @@ const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
 const kv_quant = @import("kv_quant.zig");
+const counterfactual = @import("lookup_counterfactual.zig");
+
+/// Inference-thread diagnostic stream; installed only around the measured target call.
+/// Records executed branch identities and logical geometry without evaluating arrays.
+pub const DiagnosticDispatch = struct {
+    hash: counterfactual.Hasher = .{},
+    variant: speculation_mod.Variant = .generic,
+    layers: usize = 0,
+    events: usize = 0,
+    overhead_ns: u64 = 0,
+    io: std.Io,
+
+    fn record(self: *DiagnosticDispatch, implementation: []const u8, arrays: []const mlx.mlx_array, specialization: []const i64) void {
+        const watch = @import("io_util.zig").Stopwatch.init(self.io);
+        self.hash.bytes(implementation);
+        self.hash.integer(self.events);
+        self.events += 1;
+        for (arrays) |arr| {
+            self.hash.flag(arr.ctx != null);
+            if (arr.ctx == null) continue;
+            self.hash.integer(@intFromEnum(mlx.mlx_array_dtype(arr)));
+            const shape = mlx.getShape(arr);
+            self.hash.integer(shape.len);
+            for (shape) |dim| self.hash.integer(dim);
+        }
+        for (specialization) |value| self.hash.integer(value);
+        self.overhead_ns += watch.read();
+    }
+};
+threadlocal var diagnostic_dispatch: ?*DiagnosticDispatch = null;
+
+inline fn diagnosticDispatch(implementation: []const u8, arrays: []const mlx.mlx_array, specialization: []const i64) void {
+    if (diagnostic_dispatch) |trace| trace.record(implementation, arrays, specialization);
+}
+
+pub fn beginDiagnosticDispatch(trace: *DiagnosticDispatch) void {
+    std.debug.assert(diagnostic_dispatch == null);
+    diagnostic_dispatch = trace;
+}
+
+pub fn endDiagnosticDispatch() void {
+    diagnostic_dispatch = null;
+}
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantScheme = kv_quant.Scheme;
@@ -8447,6 +8490,8 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
 const round_cost_mod = @import("round_cost.zig");
+const speculation_mod = @import("speculation_policy.zig");
+const token_history = @import("token_history.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 // NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
 // module-owned ARCH state (the dsv4 class — single-flight + spec-off); the
@@ -8716,6 +8761,13 @@ pub const SpecTree = struct {
     /// row's conv-input sources.
     parents: mlx.mlx_array,
     attn: row_attn.Tree,
+    /// Host-proven parents[t] == t - 1. Explicit constructors stay on the generic path.
+    linear: bool = false,
+
+    /// Shared by dispatch and cold-price exclusion, so they name the same kernel.
+    pub fn usesLinearGdn(self: *const SpecTree, rows: usize) bool {
+        return self.linear and rows > 8;
+    }
 
     pub fn deinit(self: *const SpecTree) void {
         for ([_]mlx.mlx_array{ self.parents, self.attn.depth, self.attn.path }) |a| _ = mlx.mlx_array_free(a);
@@ -17435,6 +17487,12 @@ pub const Transformer = struct {
     /// two measured widths. Lives on the model, not the request — a request
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
+    /// Inference-thread policies survive requests. Keep assistant economics separate
+    /// from lookup-only chain rounds; one cannot re-enable the other.
+    lookup_policy: ?speculation_mod.Policy = null,
+    lookup_tree_policy: ?speculation_mod.Policy = null,
+    lookup_history_cache: ?token_history.HistoryCache = null,
+    lookup_counterfactual: ?counterfactual.Probe = null,
     mtp_group_cost: group_cost_mod.Table = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
@@ -17655,6 +17713,35 @@ pub const Transformer = struct {
     mtp_oqe_affine_trunk: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !Transformer {
+        var cfg = config;
+        // Read the opt-in once for this load, not while a request owns recurrent state.
+        cfg.row_exact_requested = cfg.row_exact_requested or ModelConfig.rowExactRequestedFromEnv(
+            if (std.c.getenv("MLX_SERVE_ROW_EXACT")) |value| std.mem.span(value) else null,
+        );
+        if (cfg.row_exact_requested) {
+            if (!cfg.rowExactArch()) {
+                log.err("[row-exact] MLX_SERVE_ROW_EXACT=1 unsupported for architecture {s}\n", .{cfg.model_type});
+                return error.RowExactUnsupportedArchitecture;
+            }
+            if (!mlx.metalKernelsAvailable()) {
+                log.err("[row-exact] MLX_SERVE_ROW_EXACT=1 requires Metal row kernels\n", .{});
+                return error.RowExactUnsupportedBackend;
+            }
+        }
+        var result = try initConfigured(io, allocator, cfg, weights);
+        // Coverage is known only after the pack is loaded. A rejected explicit
+        // mode releases the fully initialized transformer, not partial locals.
+        errdefer result.deinit();
+        result.config.validateRowExactRequest() catch |err| {
+            log.err("[row-exact] MLX_SERVE_ROW_EXACT=1 rejected: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        if (result.config.row_exact_requested)
+            log.info("[row-exact] explicit numerical mode enabled\n", .{});
+        return result;
+    }
+
+    fn initConfigured(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !Transformer {
         // Use the current thread's default GPU stream rather than a dedicated stream.
         // mlx 0.31.2 made streams thread-local — a stream created on one thread isn't
         // visible to other threads, so a long-lived dedicated stream stored on Transformer
@@ -18374,6 +18461,8 @@ pub const Transformer = struct {
         };
 
         var cfg = config;
+        // An explicit reload must prove coverage again, not inherit an earlier pack's verdict.
+        if (cfg.row_exact_requested) cfg.row_exact_covered = false;
         if (cfg.rowExactArch()) {
             const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
             if (firstRowExactMiss(&cfg, weights, gather_only)) |key| {
@@ -19151,6 +19240,10 @@ pub const Transformer = struct {
     }
 
     pub fn deinit(self: *Transformer) void {
+        if (self.lookup_policy) |*policy| policy.deinit();
+        if (self.lookup_tree_policy) |*policy| policy.deinit();
+        if (self.lookup_history_cache) |*cache| cache.deinit() catch unreachable;
+        if (self.lookup_counterfactual) |*probe| probe.deinit();
         self.releaseJoinedVerifyLogits();
         lane_qmm.release(@intFromPtr(self));
         if (self.ane_prefill) |eng| {
@@ -19920,6 +20013,7 @@ pub const Transformer = struct {
     inline fn rmsNormEps(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, eps: f32) !mlx.mlx_array {
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, eps, self.s));
+        diagnosticDispatch("mlx_fast_rms_norm", &.{ x, w, result }, &.{ @as(u32, @bitCast(eps)) });
         return result;
     }
 
@@ -19995,6 +20089,7 @@ pub const Transformer = struct {
         }
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
+        diagnosticDispatch("mlx_fast_rms_norm", &.{ x, w, result }, &.{ @as(u32, @bitCast(self.config.rms_norm_eps)) });
         return result;
     }
 
@@ -20541,11 +20636,15 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            diagnosticDispatch("compiled_geglu", &.{ gate, up, result }, &.{ @intFromEnum(self.config.hidden_act) });
             return result;
         }
         // silu / exact gelu: one bit-exact fused kernel (see fusedSwiGLU).
         if (self.config.hidden_act == .silu) {
-            if (try fusedSwiGLU(self.s, gate, up)) |fused| return fused;
+            if (try fusedSwiGLU(self.s, gate, up)) |fused| {
+                diagnosticDispatch("fusedSwiGLU", &.{ gate, up, fused }, &.{});
+                return fused;
+            }
         } else if (self.config.hidden_act == .gelu) {
             if (try fusedGeluErfMul(self.s, gate, up, self.one, self.half)) |fused| return fused;
         }
@@ -20554,6 +20653,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(activated);
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
+        diagnosticDispatch("mlpActivation.multiply", &.{ gate, up, result }, &.{ @intFromEnum(self.config.hidden_act) });
         return result;
     }
 
@@ -27127,6 +27227,7 @@ pub const Transformer = struct {
         var pclk: ProfClock = if (prof_on) ProfClock.init() else undefined;
 
         var h = try self.embedding(token_ids);
+        diagnosticDispatch("forwardMoeWith.embedding", &.{ token_ids, h }, &.{});
         {
             errdefer _ = mlx.mlx_array_free(h);
 
@@ -27222,6 +27323,10 @@ pub const Transformer = struct {
         for (0..n_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
+            if (diagnostic_dispatch) |trace| {
+                trace.record("forwardMoeWith.layer", &.{h}, &.{ @intCast(layer_idx), @intCast(offset), @intFromEnum(std.meta.activeTag(lw.attn)), @intFromEnum(std.meta.activeTag(lw.mlp)) });
+                trace.layers += 1;
+            }
 
             const normed = if (carried_normed) |c| c else try self.rmsNorm(h, lw.input_norm);
             carried_normed = null;
@@ -27373,11 +27478,13 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(ff_normed);
                     ff_normed = fused.normed;
                 } else if (try self.narrowAddNorm(h, attn_out, lw.post_attn_norm)) |fused| {
+                    diagnosticDispatch("narrowAddNorm.attention", &.{ h, attn_out, fused.h, fused.normed }, &.{});
                     _ = mlx.mlx_array_free(h);
                     h = fused.h;
                     _ = mlx.mlx_array_free(ff_normed);
                     ff_normed = fused.normed;
                 } else if (try fusedAddRmsNorm(self.s, h, attn_out, lw.post_attn_norm, self.rms_eps_arr)) |fused| {
+                    diagnosticDispatch("fusedAddRmsNorm.attention", &.{ h, attn_out, fused.sum, fused.normed }, &.{});
                     _ = mlx.mlx_array_free(h);
                     h = fused.sum;
                     _ = mlx.mlx_array_free(ff_normed);
@@ -27385,6 +27492,7 @@ pub const Transformer = struct {
                 } else {
                     var h_new = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_add(&h_new, h, attn_out, self.s));
+                    diagnosticDispatch("mlx_add.attention", &.{ h, attn_out, h_new }, &.{});
                     _ = mlx.mlx_array_free(h);
                     h = h_new;
                     _ = mlx.mlx_array_free(ff_normed);
@@ -27406,12 +27514,14 @@ pub const Transformer = struct {
                     h = fused.sum;
                     carried_normed = fused.normed;
                 } else if (try self.narrowAddNorm(h, mlp_out, next_norm)) |fused| {
+                    diagnosticDispatch("narrowAddNorm.mlp", &.{ h, mlp_out, fused.h, fused.normed }, &.{});
                     _ = mlx.mlx_array_free(h);
                     h = fused.h;
                     carried_normed = fused.normed;
                 } else {
                     var h_next = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
+                    diagnosticDispatch("mlx_add.mlp", &.{ h, mlp_out, h_next }, &.{});
                     _ = mlx.mlx_array_free(h);
                     h = h_next;
                 }
@@ -27490,6 +27600,7 @@ pub const Transformer = struct {
             return final_normed;
         }
         var logits = try self.lmHeadProject(final_normed);
+        diagnosticDispatch("forwardMoeWith.lmHeadProject", &.{ final_normed, logits }, &.{});
         _ = mlx.mlx_array_free(final_normed);
 
         // Inkling: slice the padded vocab rows off (201024 → 200058) so
@@ -29734,6 +29845,7 @@ pub const Transformer = struct {
             kv_fused_done = true;
         } else if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
             if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe, none_mask)) |fused| {
+                diagnosticDispatch("qkvAttnDecodeKernel", &.{ q_rope, full_k, full_v, fused }, &.{ seq_len, @as(u32, @bitCast(attn_scale)) });
                 logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
@@ -29743,6 +29855,7 @@ pub const Transformer = struct {
             // Spec-verify widths (Phase 2): is_prefill is seq_len > 1, so
             // sel_mode_moe is "causal" here — the mode the kernel serves.
             if (try qkvAttnVerifyKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe)) |fused| {
+                diagnosticDispatch("qkvAttnVerifyKernel", &.{ q_rope, full_k, full_v, fused }, &.{ seq_len, @as(u32, @bitCast(attn_scale)) });
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
                 kv_fused_done = true;
@@ -29751,8 +29864,18 @@ pub const Transformer = struct {
         if (kv_fused_done) {
             // packed kernel handled this layer
         } else if (self.config.rowExactDecode() and seq_len <= row_attn.MAX_ROWS and batch == 1 and
-            ((naxAvailable() and try lane_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s)) or
-                try row_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s)))
+            row_exact: {
+                const tree: ?row_attn.Tree = if (ctx.tree) |t| t.attn else null;
+                if (naxAvailable() and try lane_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, tree, self.s)) {
+                    diagnosticDispatch("lane_attn.sdpa", &.{ q_rope, full_k, full_v, attn_out }, &.{ @as(i64, @bitCast(@as(u64, @as(u32, @bitCast(attn_scale))))), @intFromBool(tree != null) });
+                    break :row_exact true;
+                }
+                if (try row_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, tree, self.s)) {
+                    diagnosticDispatch("row_attn.sdpa", &.{ q_rope, full_k, full_v, attn_out }, &.{ @as(i64, @bitCast(@as(u64, @as(u32, @bitCast(attn_scale))))), @intFromBool(tree != null) });
+                    break :row_exact true;
+                }
+                break :row_exact false;
+            })
         {
             // every row, serial steps included, through the one fixed arithmetic
         } else if (ctx.tree != null) {
@@ -31646,7 +31769,14 @@ pub const Transformer = struct {
             if (tree) |tab| {
                 const w = la.in.widths;
                 const joined: ?gdn_decode.Joined = if (in_all.ctx != null) .{ .all = in_all, .a_off = w[0] + w[1], .b_off = w[0] + w[1] + w[2] } else null;
-                const r = (try gdn_decode.recurTree(geo, seq_len, ins, joined, tab, self.s)) orelse return error.SpecTreeUnsupported;
+                // Use the no-restart kernel only above eight rows; paired
+                // profiling found no stable win at eight.
+                const linear_kernel = self.spec_tree.?.usesLinearGdn(@intCast(seq_len));
+                const r = (try gdn_decode.recurTree(geo, seq_len, ins, joined, tab, linear_kernel, self.s)) orelse return error.SpecTreeUnsupported;
+                if (diagnostic_dispatch) |trace| {
+                    trace.record(if (linear_kernel) "gdn_decode.recurTree.linear" else "gdn_decode.recurTree.generic", &.{ qkv, ssm.ssm_state, z_proj }, &.{ seq_len, geo.hk, geo.hv, geo.dk, geo.dv, @intFromBool(joined != null) });
+                    if (linear_kernel) trace.variant = .linear_gdn;
+                }
                 defer _ = mlx.mlx_array_free(r.y);
                 errdefer inline for (.{ r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |a| {
                     _ = mlx.mlx_array_free(a);
@@ -31655,6 +31785,7 @@ pub const Transformer = struct {
                 const z_off = if (joined != null) w[0] else 0;
                 const z_stride = if (joined) |j| mlx.getShape(j.all)[2] else value_dim;
                 const flat = (try gdnNormGateFused(self.s, r.y, z_src, z_off, z_stride, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse return error.SpecTreeUnsupported;
+                diagnosticDispatch("gdnNormGateFused", &.{ r.y, z_src, flat }, &.{ z_off, z_stride, num_v_heads, dv, seq_len, @intFromBool(!cfg.kda_sigmoid_out_gate) });
                 defer _ = mlx.mlx_array_free(flat);
                 // The states stay the round's input; the commit replays the kept path from it.
                 var state_in = mlx.mlx_array_new();
@@ -32239,6 +32370,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(both);
             if (self.config.hidden_act == .silu and dw.gu.widths[0] == dw.gu.widths[1]) {
                 if (try swigluJoined(self.s, both)) |act| {
+                    diagnosticDispatch("swigluJoined", &.{ both, act }, &.{});
                     defer _ = mlx.mlx_array_free(act);
                     return self.qmatmul(act, dw.down_w, dw.down_s, dw.down_b);
                 }
@@ -36691,10 +36823,18 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
         // The pick follows the weight and the GPU, never the row count: serial and verify rows share a kernel.
-        if (naxAvailable()) if (try lane_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
-        if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
+        if (naxAvailable()) if (try lane_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| {
+            diagnosticDispatch("lane_qmm.qmm", &.{ x, w, sc, bi, y }, &.{ bits, group_size });
+            return y;
+        };
+        if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| {
+            diagnosticDispatch("simd_qmm.qmm", &.{ x, w, sc, bi, y }, &.{ bits, group_size });
+            return y;
+        }
     }
-    return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
+    const result = try rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
+    if (result) |y| diagnosticDispatch("rowqmv.qmv", &.{ x, w, sc, bi, y }, &.{ bits, group_size });
+    return result;
 }
 
 /// q [1, H, S, hd] over k/v [1, KVH, L, hd] whose last S rows are the
@@ -44978,7 +45118,10 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, s);
     if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, s);
     // A weight re-ordered in place is read in its tiled layout only.
-    if (try lane_qmm.tiledQmm(x, w, s)) |y| return y;
+    if (try lane_qmm.tiledQmm(x, w, s)) |y| {
+        diagnosticDispatch("lane_qmm.tiledQmm", &.{ x, w, y }, &.{ bits, group_size });
+        return y;
+    }
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
     // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
     // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at
@@ -44987,6 +45130,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         var fp_result = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(fp_result);
         try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
+        diagnosticDispatch("mlx_matmul", &.{ x, w, fp_result }, &.{});
         return fp_result;
     }
 
@@ -44996,8 +45140,14 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // would misroute e.g. an nvfp4 weight to mxfp8.
     if (mode != .affine) {
         if (mode == .mxfp8) {
-            if (try mxfp8_qmv.linear(x, w, sc, s)) |y| return y;
-            if (try prefillDqGemm(x, w, sc, bi, bits, group_size, mode, s)) |py| return py;
+            if (try mxfp8_qmv.linear(x, w, sc, s)) |y| {
+                diagnosticDispatch("mxfp8_qmv.linear", &.{ x, w, sc, y }, &.{ bits, group_size });
+                return y;
+            }
+            if (try prefillDqGemm(x, w, sc, bi, bits, group_size, mode, s)) |py| {
+                diagnosticDispatch("prefillDqGemm", &.{ x, w, sc, bi, py }, &.{ bits, group_size, @intFromEnum(mode) });
+                return py;
+            }
         }
         var result = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(result);
@@ -45013,11 +45163,15 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
             mode.cstr(),
             s,
         ));
+        diagnosticDispatch("mlx_quantized_matmul", &.{ x, w, sc, result }, &.{ bits, group_size, @intFromEnum(mode) });
         return result;
     }
 
     if (bi.ctx != null) {
-        if (try simdQmmDecode(x, w, sc, bi, bits, group_size, s)) |y| return y;
+        if (try simdQmmDecode(x, w, sc, bi, bits, group_size, s)) |y| {
+            diagnosticDispatch("simdQmmDecode", &.{ x, w, sc, bi, y }, &.{ bits, group_size });
+            return y;
+        }
     }
 
     // Legacy heuristic for mixed checkpoints whose config declares affine but
@@ -45052,18 +45206,28 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
             "mxfp8",
             s,
         ));
+        diagnosticDispatch("mlx_quantized_matmul.mxfp8", &.{ x, w, sc, result }, &.{ mxfp_bits, mxfp_gs });
         return result;
     }
 
     // Spec-verify fast path: M=2..6-row activations (verify forwards, small
     // decode batches) route through the split-K verify kernel when eligible
     // (see VERIFY_QMM_SOURCE) — stock qmm's qmv/steel dead zone.
-    if (try verifyQmm(s, x, w, sc, bi, bits, group_size)) |vy| return vy;
-    if (mode == .affine) if (try qmv_cuda.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
+    if (try verifyQmm(s, x, w, sc, bi, bits, group_size)) |vy| {
+        diagnosticDispatch("verifyQmm", &.{ x, w, sc, bi, vy }, &.{ bits, group_size });
+        return vy;
+    }
+    if (mode == .affine) if (try qmv_cuda.qmm(x, w, sc, bi, bits, group_size, s)) |y| {
+        diagnosticDispatch("qmv_cuda.qmm", &.{ x, w, sc, bi, y }, &.{ bits, group_size });
+        return y;
+    };
 
     // Prefill-width fast path: M >= 2048 dequantizes + runs the steel bf16
     // GEMM (see prefillDqGemm) — stock qmm_t's 32x32x32 tile dead zone.
-    if (try prefillDqGemm(x, w, sc, bi, bits, group_size, .affine, s)) |py| return py;
+    if (try prefillDqGemm(x, w, sc, bi, bits, group_size, .affine, s)) |py| {
+        diagnosticDispatch("prefillDqGemm.affine", &.{ x, w, sc, bi, py }, &.{ bits, group_size });
+        return py;
+    }
 
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
@@ -45079,6 +45243,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         "affine",
         s,
     ));
+    diagnosticDispatch("mlx_quantized_matmul.affine", &.{ x, w, sc, bi, result }, &.{ bits, group_size });
     return result;
 }
 
@@ -45214,6 +45379,12 @@ fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_stream
 /// (not 4-bit affine in their geometry), or null when they cover the pack.
 /// Vision towers, the MTP head and a gather-only embedding never reach a verify row.
 fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
+    // The historical DFlash gate inventories quantized tensors. Explicit mode
+    // must additionally reject dense trunk matmuls: they otherwise pass that
+    // inventory vacuously and fall through to width-dependent mlx_matmul.
+    if (config.row_exact_requested) {
+        if (firstDenseRowExactProjection(config, weights, gather_only)) |key| return key;
+    }
     var it = weights.map.iterator();
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
@@ -45229,6 +45400,135 @@ fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, gather
         if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
     }
     return null;
+}
+
+/// Projection roles actually loaded by the two row-exact architectures. Scope
+/// them to the trunk, rather than treating every matrix as a matmul (conv taps,
+/// norms, vision weights and the draft head have different execution paths).
+fn rowExactProjectionRole(config: *const ModelConfig, key: []const u8) enum { other, projection, router } {
+    if (std.mem.eql(u8, key, "lm_head.weight") or
+        std.mem.eql(u8, key, "language_model.lm_head.weight")) return .projection;
+    if (!std.mem.startsWith(u8, key, config.weight_prefix)) return .other;
+    const relative = key[config.weight_prefix.len..];
+    if (std.mem.eql(u8, relative, ".lm_head.weight") or
+        std.mem.eql(u8, relative, ".embed_tokens.weight") or
+        std.mem.eql(u8, relative, ".embeddings.weight")) return .projection;
+    const layer_prefix = ".layers.";
+    if (!std.mem.startsWith(u8, relative, layer_prefix)) return .other;
+    const layer = relative[layer_prefix.len..];
+    const dot = std.mem.indexOfScalar(u8, layer, '.') orelse return .other;
+    _ = std.fmt.parseInt(u32, layer[0..dot], 10) catch return .other;
+    const role = layer[dot + 1 ..];
+    if (std.mem.eql(u8, config.model_type, "nemotron_h") and
+        std.mem.eql(u8, role, "mixer.gate.weight")) return .router;
+    inline for (.{
+        "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+        "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight", "linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight",
+        "linear_attn.in_proj_qkvz.weight", "linear_attn.in_proj_ba.weight", "linear_attn.out_proj.weight",
+        "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+        "mixer.q_proj.weight", "mixer.k_proj.weight", "mixer.v_proj.weight", "mixer.o_proj.weight",
+        "mixer.in_proj.weight", "mixer.out_proj.weight", "mixer.up_proj.weight", "mixer.down_proj.weight",
+        "mixer.switch_mlp.fc1.weight", "mixer.switch_mlp.fc2.weight",
+        "mixer.fc1_latent_proj.weight", "mixer.fc2_latent_proj.weight",
+        "mixer.shared_experts.up_proj.weight", "mixer.shared_experts.down_proj.weight",
+    }) |projection| {
+        if (std.mem.eql(u8, role, projection)) return .projection;
+    }
+    return .other;
+}
+
+fn firstDenseRowExactProjection(config: *const ModelConfig, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        const role = rowExactProjectionRole(config, key);
+        if (role == .other) continue;
+        const w = kv.value_ptr.*;
+        if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
+        var buf: [256]u8 = undefined;
+        const base = key[0 .. key.len - ".weight".len];
+        // Quantized projections are checked by the existing inventory below.
+        if (weights.get(std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch return key)) |sc| {
+            if (sc.ctx != null) continue;
+        }
+        if (role == .router) {
+            // Nemotron uses rowqmv.router, not mlx_matmul, for this dense
+            // projection. Match that kernel's weight dtype/alignment envelope.
+            const shape = mlx.getShape(w);
+            if (mlx.mlx_array_dtype(w) == .bfloat16 and shape.len == 2 and
+                shape[1] > 0 and @as(u32, @intCast(shape[1])) == config.hidden_size and @rem(shape[1], 32) == 0) continue;
+        }
+        return key;
+    }
+    return null;
+}
+
+test "lookup explicit row-exact inventory rejects dense and mixed trunk matmuls without rejecting non-projections" {
+    const Fixture = struct {
+        fn dense(weights: *Weights, name: []const u8, shape: []const c_int) !mlx.mlx_array {
+            const data: [512]u16 = @splat(0x3f80);
+            const array = mlx.mlx_array_new_data(&data, shape.ptr, @intCast(shape.len), .bfloat16);
+            errdefer _ = mlx.mlx_array_free(array);
+            try weights.put(name, array);
+            return array;
+        }
+
+        fn quantized(weights: *Weights) !void {
+            const data: [64]u32 = @splat(0);
+            const array = mlx.mlx_array_new_data(&data, &[_]c_int{ 8, 8 }, 2, .uint32);
+            weights.put("model.layers.0.self_attn.q_proj.weight", array) catch |err| {
+                _ = mlx.mlx_array_free(array);
+                return err;
+            };
+            _ = try dense(weights, "model.layers.0.self_attn.q_proj.scales", &.{ 8, 1 });
+            _ = try dense(weights, "model.layers.0.self_attn.q_proj.biases", &.{ 8, 1 });
+        }
+    };
+    // Array metadata and host-backed buffers only: no GPU dispatch or quantizer.
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    var cfg = ModelConfig{ .model_type = "qwen3_5", .weight_prefix = "model", .quant_bits = 4, .quant_group_size = 64, .hidden_size = 64 };
+    const embedding = try Fixture.dense(&weights, "model.embed_tokens.weight", &.{ 8, 64 });
+    _ = try Fixture.dense(&weights, "model.layers.0.input_layernorm.weight", &.{64});
+    _ = try Fixture.dense(&weights, "model.layers.0.linear_attn.norm.weight", &.{ 8, 8 });
+    _ = try Fixture.dense(&weights, "model.layers.0.linear_attn.conv1d.weight", &.{ 8, 4 });
+    _ = try Fixture.dense(&weights, "model.visual.proj.weight", &.{ 8, 64 });
+    _ = try Fixture.dense(&weights, "model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 64 });
+    cfg.row_exact_requested = true;
+    try testing.expect(firstRowExactMiss(&cfg, &weights, embedding) == null);
+    // The same table becomes a matmul when the output head is tied.
+    try testing.expectEqualStrings("model.embed_tokens.weight", firstRowExactMiss(&cfg, &weights, .{}).?);
+    for ([_][]const u8{
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.0.linear_attn.in_proj_a.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "lm_head.weight",
+    }) |name| {
+        _ = try Fixture.dense(&weights, name, &.{ 8, 64 });
+        cfg.row_exact_requested = false;
+        try testing.expect(firstRowExactMiss(&cfg, &weights, embedding) == null);
+        cfg.row_exact_requested = true;
+        try testing.expectEqualStrings(name, firstRowExactMiss(&cfg, &weights, embedding).?);
+        cfg.row_exact_covered = firstRowExactMiss(&cfg, &weights, embedding) == null;
+        try testing.expectError(error.RowExactUncoveredProjections, cfg.validateRowExactRequest());
+        weights.remove(name);
+    }
+    try Fixture.quantized(&weights);
+    try testing.expect(firstRowExactMiss(&cfg, &weights, embedding) == null);
+    _ = try Fixture.dense(&weights, "model.layers.0.linear_attn.in_proj_z.weight", &.{ 8, 64 });
+    try testing.expectEqualStrings("model.layers.0.linear_attn.in_proj_z.weight", firstRowExactMiss(&cfg, &weights, embedding).?);
+    weights.remove("model.layers.0.linear_attn.in_proj_z.weight");
+    cfg.model_type = "nemotron_h";
+    _ = try Fixture.dense(&weights, "model.layers.1.mixer.gate.weight", &.{ 8, 64 });
+    try testing.expect(firstRowExactMiss(&cfg, &weights, embedding) == null);
+    for ([_][]const u8{ "model.layers.1.mixer.in_proj.weight", "model.layers.1.mixer.switch_mlp.fc1.weight" }) |name| {
+        _ = try Fixture.dense(&weights, name, &.{ 2, 8, 32 });
+        try testing.expectEqualStrings(name, firstRowExactMiss(&cfg, &weights, embedding).?);
+        weights.remove(name);
+    }
+    _ = try Fixture.dense(&weights, "model.layers.1.mixer.gate.weight", &.{ 8, 63 });
+    try testing.expectEqualStrings("model.layers.1.mixer.gate.weight", firstRowExactMiss(&cfg, &weights, embedding).?);
 }
 
 fn ternaryKernelCandidate(config: *const ModelConfig) bool {
@@ -45265,6 +45565,19 @@ fn firstNonTernaryBias(weights: *const Weights, gather_only: mlx.mlx_array, s: m
         if (v != 0) return key;
     }
     return null;
+}
+
+test "lookup explicit row-exact load rejects unsupported architecture before allocating transformer state" {
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const cfg = ModelConfig{ .model_type = "llama", .row_exact_requested = true };
+    // No weights or GPU are required: rejecting the mode precedes all model initialization.
+    try testing.expectError(error.RowExactUnsupportedArchitecture, Transformer.init(
+        std.Io.Threaded.global_single_threaded.io(),
+        testing.allocator,
+        cfg,
+        &weights,
+    ));
 }
 
 test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embedding is exempt" {
@@ -65220,11 +65533,12 @@ test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at ver
     }
 }
 
-test "gdn_decode.recurSeq: a T-row window equals T one-row calls" {
+test "lookup gdn_decode.recurSeq: a 2 through 16-row window equals serial rows and states" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts| {
         var t: c_int = 2;
-        while (t <= 8) : (t += 1) try gdnDecodeRowsCase(s, dts[0], dts[1], t);
+        while (t <= 16) : (t += 1) try gdnDecodeRowsCase(s, dts[0], dts[1], t);
     }
 }
 
@@ -65519,29 +65833,47 @@ test "specTreeSupported follows the backend that runs the tree kernels" {
     try std.testing.expectEqual(gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable(), xfm.specTreeSupported());
 }
 
-test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
+test "lookup gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
     // A tree of 1 or 2 nodes has fewer rows than the conv window it commits.
     for ([_]usize{ 1, 2, 8 }) |nodes| {
-        try gdnDecodeTreeCase(.bfloat16, nodes);
-        try gdnDecodeTreeCase(.float32, nodes);
+        try gdnDecodeTreeCase(.bfloat16, nodes, false);
+        try gdnDecodeTreeCase(.float32, nodes, false);
     }
 }
 
-fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
+test "lookup gdn_decode.recurTree: specialized chains match generic rows and every commit prefix" {
+    // Activations are bf16; the supported recurrent state dtypes are bf16 and f32.
+    for ([_]usize{ 1, 2, 8, 9, 15, 16 }) |nodes| {
+        try gdnDecodeTreeCase(.bfloat16, nodes, true);
+        try gdnDecodeTreeCase(.float32, nodes, true);
+    }
+}
+
+fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize, linear: bool) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x7EE);
     const rnd = prng.random();
     const dt: mlx.mlx_dtype = .bfloat16;
-    const hk: c_int = 2;
-    const hv: c_int = 8;
+    // Cover the real 27B geometry at the widest chain, in both state dtypes.
+    const hk: c_int = if (nodes == 16) 16 else 2;
+    const hv: c_int = if (nodes == 16) 48 else 8;
     const c_dim: c_int = hk * 128 * 2 + hv * 128;
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     // Rows 1 and 2 follow the root, 3 and 4 follow row 1, 5 follows 2, 6 and 7 follow 3;
     // every prefix is a tree of its own.
-    const all_parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
-    const all_paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
-    const parents = all_parents[0..nodes];
-    const paths = all_paths[0..nodes];
+    const branch_parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
+    const branch_paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
+    var chain_parents: [16]i32 = undefined;
+    var chain_rows: [16]i32 = undefined;
+    var chain_paths: [16][]const i32 = undefined;
+    for (0..16) |i| {
+        chain_parents[i] = @as(i32, @intCast(i)) - 1;
+        chain_rows[i] = @intCast(i);
+        chain_paths[i] = chain_rows[0 .. i + 1];
+    }
+    const parents = if (linear) chain_parents[0..nodes] else branch_parents[0..nodes];
+    const paths = if (linear) chain_paths[0..nodes] else branch_paths[0..nodes];
+    try std.testing.expectEqual(linear or nodes <= 2, gdn_decode.linearParents(parents));
     const w: c_int = @intCast(nodes);
     const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, w, c_dim }, 1.0, dt, s);
     defer _ = mlx.mlx_array_free(qkv);
@@ -65564,14 +65896,27 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
             return .{ .qkv = q, .z = f[6], .a = aa, .b = bb, .conv_state = f[0], .ssm_state = f[1], .conv_w = f[2], .A_log = f[3], .dt_bias = f[4], .q_scale = qs, .k_scale = qs, .norm_w = f[5], .eps = e, .signs = .{ .ctx = null } };
         }
     }.of;
-    var table: [6 * all_parents.len]i32 = undefined;
+    var table: [6 * 16]i32 = undefined;
     gdn_decode.treeTable(parents, table[0 .. 6 * nodes]);
     const tab = mlx.mlx_array_new_data(&table, &[_]c_int{6 * w}, 1, .int32);
     defer _ = mlx.mlx_array_free(tab);
-    const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, s)) orelse return error.TreeDeclined;
+    const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, false, s)) orelse return error.TreeDeclined;
     defer inline for (.{ tree.y, tree.conv_input, tree.prework.k, tree.prework.v, tree.prework.gb }) |x| {
         _ = mlx.mlx_array_free(x);
     };
+    const specialized: ?gdn_decode.RecurTree = if (linear)
+        (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, true, s)) orelse return error.ChainDeclined
+    else
+        null;
+    defer if (specialized) |r| {
+        inline for (.{ r.y, r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |x| _ = mlx.mlx_array_free(x);
+    };
+    if (specialized) |r| {
+        // Whole-array equality covers every row, not only the last accepted row.
+        inline for (.{ .{ tree.y, r.y }, .{ tree.conv_input, r.conv_input }, .{ tree.prework.k, r.prework.k }, .{ tree.prework.v, r.prework.v }, .{ tree.prework.gb, r.prework.gb } }) |pair|
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pair[0], pair[1], s));
+    }
+    const verified = specialized orelse tree;
     // Read in place from a joined [qkv | z | a | b] projection, the same bits.
     {
         var all = mlx.mlx_array_new();
@@ -65588,7 +65933,7 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
         try sliceQkvPart(&parts[0], all, 0, c_dim, s);
         try sliceQkvPart(&parts[1], all, a_off, hv, s);
         try sliceQkvPart(&parts[2], all, a_off + hv, hv, s);
-        const j = (try gdn_decode.recurTree(g, w, inputs(parts[0], parts[1], parts[2], fixed, q_scale, eps_arr), .{ .all = all, .a_off = a_off, .b_off = a_off + hv }, tab, s)) orelse return error.JoinedDeclined;
+        const j = (try gdn_decode.recurTree(g, w, inputs(parts[0], parts[1], parts[2], fixed, q_scale, eps_arr), .{ .all = all, .a_off = a_off, .b_off = a_off + hv }, tab, linear, s)) orelse return error.JoinedDeclined;
         defer inline for (.{ j.y, j.conv_input, j.prework.k, j.prework.v, j.prework.gb }) |x| {
             _ = mlx.mlx_array_free(x);
         };
@@ -65645,12 +65990,46 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
             const dd: i32 = n - 3 + @as(i32, @intCast(i));
             conv_rows[i] = if (dd < 0) dd + 3 else 3 + path[@intCast(dd)];
         }
-        const replayed = (try gdn_decode.replay(g, fixed[1], tree.prework, path, tree.conv_input, conv_rows, s)) orelse return error.ReplayDeclined;
+        const replayed = (try gdn_decode.replay(g, fixed[1], verified.prework, path, verified.conv_input, conv_rows, s)) orelse return error.ReplayDeclined;
         defer inline for (.{ replayed.ssm_state, replayed.conv_state }) |x| {
             _ = mlx.mlx_array_free(x);
         };
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_state, replayed.ssm_state, s));
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_out[1], replayed.conv_state, s));
+        if (linear) {
+            const generic_commit = (try gdn_decode.replay(g, fixed[1], tree.prework, path, tree.conv_input, conv_rows, s)) orelse return error.ReplayDeclined;
+            defer inline for (.{ generic_commit.ssm_state, generic_commit.conv_state }) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(generic_commit.ssm_state, replayed.ssm_state, s));
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(generic_commit.conv_state, replayed.conv_state, s));
+            // Follow every partial/full commit with the same fresh serial token.
+            // Use row zero as that token, independent of the accepted prefix.
+            var next_rows: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+            defer for (next_rows) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            for (srcs, &next_rows) |src, *dst| {
+                const width = mlx.getShape(src)[2];
+                try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, 1, width }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            }
+            var want_fixed = fixed;
+            want_fixed[0] = chain_out[1];
+            want_fixed[1] = chain_state;
+            var got_fixed = fixed;
+            got_fixed[0] = replayed.conv_state;
+            got_fixed[1] = replayed.ssm_state;
+            const want_next = (try gdn_decode.recur(g, inputs(next_rows[0], next_rows[1], next_rows[2], want_fixed, q_scale, eps_arr), s)) orelse return error.ChainDeclined;
+            defer inline for (.{ want_next.y, want_next.conv_state, want_next.ssm_state }) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            const got_next = (try gdn_decode.recur(g, inputs(next_rows[0], next_rows[1], next_rows[2], got_fixed, q_scale, eps_arr), s)) orelse return error.ChainDeclined;
+            defer inline for (.{ got_next.y, got_next.conv_state, got_next.ssm_state }) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            inline for (.{ .{ want_next.y, got_next.y }, .{ want_next.conv_state, got_next.conv_state }, .{ want_next.ssm_state, got_next.ssm_state } }) |pair|
+                try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pair[0], pair[1], s));
+        }
     }
 }
 
@@ -65738,6 +66117,7 @@ const Qwen4GdnRig = struct {
         const tab = mlx.mlx_array_new_data(&table, &[_]c_int{table.len}, 1, .int32);
         defer _ = mlx.mlx_array_free(tab);
         const tree = SpecTree{ .parents = tab, .attn = .{ .depth = .{ .ctx = null }, .path = .{ .ctx = null }, .max_depth = 0 } };
+        try std.testing.expect(!tree.linear);
         if (arm == .tree) rig.xfm.spec_tree = &tree;
         defer rig.xfm.spec_tree = null;
 
@@ -75674,4 +76054,20 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+test "counterfactual dispatch fingerprints the complete ordered execution stream" {
+    var original = DiagnosticDispatch{ .io = testing.io };
+    original.record("projection", &.{}, &.{ 0, 8, 256, 4, 64 });
+    original.record("recurrence.generic", &.{}, &.{ 1, 8, 16, 48, 128, 128 });
+    var repeated = DiagnosticDispatch{ .io = testing.io };
+    repeated.record("projection", &.{}, &.{ 0, 8, 256, 4, 64 });
+    repeated.record("recurrence.generic", &.{}, &.{ 1, 8, 16, 48, 128, 128 });
+    var earlier_geometry_changed = DiagnosticDispatch{ .io = testing.io };
+    earlier_geometry_changed.record("projection", &.{}, &.{ 0, 8, 512, 4, 64 });
+    earlier_geometry_changed.record("recurrence.generic", &.{}, &.{ 1, 8, 16, 48, 128, 128 });
+    const identity = original.hash.finish();
+    try testing.expectEqualDeep(identity, repeated.hash.finish());
+    try testing.expect(!std.mem.eql(u8, &identity, &earlier_geometry_changed.hash.finish()));
+    try testing.expectEqual(@as(usize, 2), original.events);
 }

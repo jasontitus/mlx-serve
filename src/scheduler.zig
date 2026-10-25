@@ -38,6 +38,7 @@ const ple_gpu = @import("ple_gpu.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const lookup_counterfactual = @import("lookup_counterfactual.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
@@ -270,6 +271,7 @@ pub const SubmitParams = struct {
     /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
+    diagnostic_request_sha256: ?[32]u8 = null,
     has_tools: bool = false,
     /// The server's final resolved thinking mode after request overrides and
     /// model defaults. DFlash economics key off this, not tool presence.
@@ -482,6 +484,8 @@ pub const Slot = struct {
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
+    diagnostic_owned_slot: bool = false,
+    diagnostic_request_sha256: ?[32]u8 = null,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
@@ -801,6 +805,7 @@ pub const Slot = struct {
             .prompt_logprobs = params.prompt_logprobs,
             .prompt_logprobs_buf = .empty,
             .skip_prefix_cache = params.prompt_logprobs,
+            .diagnostic_request_sha256 = params.diagnostic_request_sha256,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -839,6 +844,11 @@ pub const Slot = struct {
         }
         if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
+            // The generator may have verified a wider block than was published
+            // before cancellation/EOS. Teardown evidence and durable lookup
+            // history describe the authoritative publisher, not that hidden tail.
+            const reason = if (self.finished) self.finish_reason else if (self.error_code != null) "error" else if (self.cancelled.load(.acquire)) "cancelled" else self.finish_reason;
+            gen.setPublishedOutput(self.out_buf.items, reason);
             gen.deinit(self.allocator);
         }
         // Salvaged-but-never-consumed cancelled-prefill checkpoints.
@@ -1577,6 +1587,7 @@ pub const Scheduler = struct {
     requests_prefilling: std.atomic.Value(u64),
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
+    lookup_diagnostic_requests: u8 = 0,
     /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
     /// `cap = max_concurrent + queue_depth`. queue_depth = 32 hardcoded
     /// (matches the legacy `max_queue_size`).
@@ -1889,6 +1900,17 @@ pub const Scheduler = struct {
 
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
+        if (lookup_counterfactual.enabled()) {
+            if (params.diagnostic_request_sha256 == null or self.max_concurrent != 1 or
+                self.prefix_cache_capacity != 0 or self.prefix_cache_disk_bytes != 0 or
+                params.model.prefix_cache != null or params.cached_tokens != 0 or
+                params.media.len != 0 or params.vision_embeddings != null or
+                !params.enable_drafter or params.dflash == null or params.enable_mtp or params.enable_pld)
+                return error.DiagnosticPreconditions;
+            if (self.in_flight != 0 or self.lookup_diagnostic_requests >= 2)
+                return error.DiagnosticRequestOrder;
+            slot.diagnostic_owned_slot = true;
+        }
 
         while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
             self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
@@ -1933,6 +1955,7 @@ pub const Scheduler = struct {
             if (slot.holds_session) self.releaseSessionLocked(slot);
             return err;
         };
+        if (slot.diagnostic_owned_slot) self.lookup_diagnostic_requests += 1;
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
         return slot;
@@ -4735,6 +4758,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
+    params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
+    params.config.row_exact_requested = xfm_ptr.config.row_exact_requested;
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
@@ -4978,12 +5003,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             );
         }
     }
-    params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
     params.config.dflash_bound = xfm_ptr.config.dflash_bound;
     if (params.config.dflash_bound and std.meta.activeTag(params.config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default) != .exact)
         log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
 
-    // After the drafter binds: an exact-mode arch runs its row kernels only then.
+    // The numerical mode is frozen before probes, warmup or prefix-cache attachment.
     // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
     // cache bookkeeping around them. The server reports `predicted_ms` around
@@ -5922,6 +5946,7 @@ fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
                 if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                 emptySlotCache(slot);
                 if (slot.legacy_gen) |*g| {
+                    g.setPublishedOutput(slot.out_buf.items, "retry");
                     g.deinit(slot.allocator);
                     slot.legacy_gen = null;
                 }
@@ -8665,6 +8690,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
         .hc = if (slot.model.prefix_cache) |*p| p else null,
     };
+    const diagnostic_model_sha256 = if (slot.diagnostic_owned_slot)
+        try lookup_counterfactual.modelFingerprint(sch.io, slot.allocator, &.{ slot.model.path, slot.model.drafter_path })
+    else
+        null;
 
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
@@ -8716,6 +8745,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
+            .diagnostic_owned_slot = slot.diagnostic_owned_slot,
+            .diagnostic_cache_off = slot.diagnostic_owned_slot and slot.model.prefix_cache == null and
+                hot_matched == 0 and dflash_pass == null and mtp_pass == null and cp_stride == 0,
+            .diagnostic_model_sha256 = diagnostic_model_sha256,
+            .diagnostic_request_sha256 = slot.diagnostic_request_sha256,
             .ctx = slot.ctx,
             // Regular path: skip the lazy preforward so cache.step lands at
             // exactly prompt_len with t1 NOT in cache. Generator.next's
@@ -8773,6 +8807,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    slot.legacy_gen.?.managePublication();
     // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it
     // parks in MLX's pool up to the cap and the first decode tick allocates on top of
     // it. Returned once here, at the handover — long-context gate only.
@@ -9215,6 +9250,8 @@ fn publishFirstToken(slot: *Slot) void {
     const t1 = gen.next_token_id;
     if (t1 == 0 or generate_mod.isEosId(t1, slot.eos_token_ids)) return;
     slot.pushTokenWithLogprob(t1, null);
+    if (lookup_counterfactual.enabled() and slot.state != .errored)
+        gen.noteCounterfactualFirstPublished(t1);
     slot.early_first = t1;
 }
 
@@ -9229,9 +9266,11 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     for (tokens, 0..) |t, i| {
         if (slot.cancelled.load(.acquire)) {
             if (gen.mtp != null) log.debug("[mtp-publish] cancelled after round: discarded={d}\n", .{tokens.len - i});
+            gen.publishLookupReceipt(slot.allocator, slot.out_buf.items);
             return;
         }
         if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            gen.publishLookupReceipt(slot.allocator, slot.out_buf.items);
             finishSlot(sch, slot, "stop");
             return;
         }
@@ -9239,10 +9278,12 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
         slot.completion_tokens += 1;
         if (t != 0) slot.was_pad_only = false;
         if (slot.completion_tokens >= slot.max_tokens) {
+            gen.publishLookupReceipt(slot.allocator, slot.out_buf.items);
             finishSlot(sch, slot, "length");
             return;
         }
     }
+    gen.publishLookupReceipt(slot.allocator, slot.out_buf.items);
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
 }
 

@@ -2312,21 +2312,32 @@ pub const DraftTree = struct {
     tokens: []u32,
     parents: []i32,
     depth: []u32,
+    /// Root-to-node probability, not the sum of its conditional probabilities.
+    scores: []f32,
+    /// This edge's conditional probability before calibration.
+    confidence: []f32,
 
     pub fn deinit(self: *DraftTree, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
         allocator.free(self.parents);
         allocator.free(self.depth);
+        allocator.free(self.scores);
+        allocator.free(self.confidence);
     }
 };
 
 pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
     const k = lat.k;
-    const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
+    const Item = struct { value: f32, conditional_log: f32, parent: i32, depth: u32, cand: u32 };
     var queue: std.ArrayList(Item) = .empty;
     defer queue.deinit(allocator);
-    var tree = DraftTree{ .tokens = try allocator.alloc(u32, p.max_nodes), .parents = try allocator.alloc(i32, p.max_nodes), .depth = try allocator.alloc(u32, p.max_nodes) };
+    var tree = DraftTree{ .tokens = &.{}, .parents = &.{}, .depth = &.{}, .scores = &.{}, .confidence = &.{} };
     errdefer tree.deinit(allocator);
+    tree.tokens = try allocator.alloc(u32, p.max_nodes);
+    tree.parents = try allocator.alloc(i32, p.max_nodes);
+    tree.depth = try allocator.alloc(u32, p.max_nodes);
+    tree.scores = try allocator.alloc(f32, p.max_nodes);
+    tree.confidence = try allocator.alloc(f32, p.max_nodes);
     var scores: [64]f32 = undefined;
     std.debug.assert(k <= scores.len);
 
@@ -2355,7 +2366,8 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
                     best = j;
                 };
                 taken[best] = true;
-                try q.append(alloc, .{ .value = base + best_v - lse, .parent = parent, .depth = depth, .cand = @intCast(best) });
+                const conditional_log = best_v - lse;
+                try q.append(alloc, .{ .value = base + conditional_log, .conditional_log = conditional_log, .parent = parent, .depth = depth, .cand = @intCast(best) });
             }
         }
     };
@@ -2370,6 +2382,8 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
         tree.parents[n] = it.parent;
         tree.depth[n] = it.depth;
+        tree.scores[n] = @exp(it.value);
+        tree.confidence[n] = @exp(it.conditional_log);
         if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
         n += 1;
     }
@@ -2377,6 +2391,8 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens = try allocator.realloc(tree.tokens, n);
         tree.parents = try allocator.realloc(tree.parents, n);
         tree.depth = try allocator.realloc(tree.depth, n);
+        tree.scores = try allocator.realloc(tree.scores, n);
+        tree.confidence = try allocator.realloc(tree.confidence, n);
     }
     try preorder(allocator, &tree);
     return tree;
@@ -2417,10 +2433,16 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     defer allocator.free(parents);
     const depth = try allocator.dupe(u32, t.depth);
     defer allocator.free(depth);
+    const scores = try allocator.dupe(f32, t.scores);
+    defer allocator.free(scores);
+    const confidence = try allocator.dupe(f32, t.confidence);
+    defer allocator.free(confidence);
     for (order, 0..) |old, i| {
         t.tokens[i] = tokens[old];
         t.depth[i] = depth[old];
         t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
+        t.scores[i] = scores[old];
+        t.confidence[i] = confidence[old];
     }
 }
 
@@ -4966,6 +4988,18 @@ test "bestFirstTree: the confident chain comes first, then its likeliest sibling
     try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 11 }, t.tokens);
     try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1, -1 }, t.parents);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 0 }, t.depth);
+    const first = softmaxShare(unary[0..3], 0);
+    const child = softmaxShare(unary[3..6], 0);
+    const sibling = softmaxShare(unary[0..3], 1);
+    try std.testing.expectApproxEqAbs(first, t.confidence[0], 1e-6);
+    try std.testing.expectApproxEqAbs(child, t.confidence[1], 1e-6);
+    // Reordering must move both kinds of probabilities with their token.
+    try std.testing.expectApproxEqAbs(sibling, t.confidence[3], 1e-6);
+    try std.testing.expectApproxEqAbs(sibling, t.scores[3], 1e-6);
+    for (t.parents, t.confidence, t.scores) |parent, confidence, path_q| {
+        const base: f32 = if (parent < 0) 1 else t.scores[@intCast(parent)];
+        try std.testing.expectApproxEqAbs(base * confidence, path_q, 1e-6);
+    }
 }
 
 test "bestFirstTree: rows are depth-first, the best child's subtree before its siblings" {

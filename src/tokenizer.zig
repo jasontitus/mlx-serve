@@ -136,6 +136,8 @@ pub const Tokenizer = struct {
     /// borrowed directly from its arena instead of duped per entry — a 30×
     /// speedup on Gemma-class tokenizers (262k vocab + 514k merges).
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
+    /// Identity of the exact tokenizer document, shared with token-id corpus stores.
+    content_sha256: ?[32]u8 = null,
 
     /// Added tokens flagged `special: true` in tokenizer.json — the
     /// candidate set for reserved-output suppression. NOT the same as
@@ -1778,6 +1780,11 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .bos_id = bos_id,
         .eos_id = eos_id,
         .parsed_json = parsed,
+        .content_sha256 = blk: {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+            break :blk digest;
+        },
     };
     if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
     return built;

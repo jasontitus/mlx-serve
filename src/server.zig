@@ -34,6 +34,7 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const lookup_counterfactual = @import("lookup_counterfactual.zig");
 const ds4_ffi = if (@import("build_options").ds4_engine) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -12294,16 +12295,37 @@ fn handleStreamingGeneration(
     // `StreamingTokenStream.initFromSlot` adapter.
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
+    const diagnostic_request_sha256: ?[32]u8 = if (lookup_counterfactual.enabled()) blk: {
+        if (g_api_key == null or g_api_key.?.len == 0 or !g_api_key_strict)
+            return error.DiagnosticAuthenticationRequired;
+        var identity: lookup_counterfactual.Hasher = .{};
+        identity.bytes("chat-stream-output-controls-1");
+        identity.bytes(model_name);
+        identity.integer(stop_sequences.len);
+        for (stop_sequences) |stop| identity.bytes(stop);
+        identity.flag(include_usage);
+        identity.flag(has_tools);
+        identity.bytes(tools_json orelse "");
+        identity.flag(allow_parallel_tools);
+        identity.integer(logprobs_n);
+        identity.flag(enable_thinking);
+        identity.integer(reasoning_budget);
+        identity.integer(@intFromEnum(stream_mode));
+        identity.flag(allow_batch_mtp);
+        identity.flag(prompt_opened_think);
+        break :blk identity.finish();
+    } else null;
 
     // Transfer vision ownership into the slot.
     const slot_ve_s = ve_local;
     ve_local = null;
     const sch = global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    slot_handle = sch.submit(.{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
+        .diagnostic_request_sha256 = diagnostic_request_sha256,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
         .sampling = sampling,
@@ -12331,7 +12353,17 @@ fn handleStreamingGeneration(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
-    });
+    }) catch |err| switch (err) {
+        error.DiagnosticRequestOrder => {
+            try sendErrorResponse(allocator, stream, "409 Conflict", "diagnostic_request_limit", "Diagnostic requests must be sequential and are limited to two", 409);
+            return;
+        },
+        error.DiagnosticPreconditions => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "diagnostic_preconditions", "Request does not satisfy the exclusive diagnostic contract", 400);
+            return;
+        },
+        else => return err,
+    };
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 

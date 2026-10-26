@@ -8,9 +8,11 @@ hang safeguard and the request/startup timeouts. Only complete protocols count.
 Rebuild the independently implemented host before any GPU invocation.
 """
 import argparse
+from collections import Counter
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import sys
@@ -27,6 +29,14 @@ DRAFTER = str(Path.home() / '.mlx-serve/drafters/incoai/Qwen3.8-27B-DFlash2')
 PROTOCOL = {
     'client': 'llmprobe 0.6.17 full bench-only; all warmups, prefix, batch and drift retained',
     'numerical_mode': 'row-exact',
+    'coverage': {
+        'client_contract': 'llmprobe 0.6.17 chat; detectReasoning + resolveReasoning + complete runBenchmark',
+        'setup': ['detect', 'optional-opt-in', 'resolve-none', 'optional-vendor-disable'],
+        'benchmark_stages': [
+            ['decode', 5, 192], ['prefill', 4, 8], ['predictable', 4, 192],
+            ['novel', 4, 192], ['prefix', 2, 8], ['batch', 5, 96],
+            ['calibration', 1, 1], ['context', 6, 192], ['drift', 3, 192]],
+        'replay': 'every captured setup and benchmark request, including auxiliary/batch requests'},
     'server_args': {'ctx_size': 16384, 'ready_timeout': 35, 'request_timeout': 60,
                     'probe_timeout': 240, 'probe_rungs': '512', 'repetitions': 3,
                     'max_tokens': None, 'row_exact_tree': True, 'row_exact': True},
@@ -214,10 +224,148 @@ def prepare(args, out):
     return plan
 
 
+def benchmark_slots():
+    """Source-derived runBenchmark stages, not a total-capture magic number."""
+    groups = {'decode': list(METRICS[:2]), 'prefill': [METRICS[2]],
+              'predictable': [METRICS[3]], 'novel': [METRICS[4]],
+              'context': list(METRICS[5:])}
+    slots = []
+    for stage, count, tokens in PROTOCOL['coverage']['benchmark_stages']:
+        for index in range(count):
+            measured = (index >= 2 if stage == 'decode' else index % 2 == 0
+                        if stage == 'context' else index >= 1)
+            slots.append({'stage': stage, 'index': index, 'max_tokens': tokens,
+                          'metrics': groups.get(stage, []) if measured else []})
+    return slots
+
+
+def setup_thinking(capture):
+    """Pinned chat adapter's thought() predicate, used only to prove setup branching."""
+    raw = json.loads(capture['raw_response'])
+    message = raw['choices'][0]['message']
+    reasoning = message.get('reasoning_content')
+    if not isinstance(reasoning, str):
+        reasoning = message.get('reasoning')
+    tokens = (raw.get('usage', {}).get('completion_tokens_details') or {}).get('reasoning_tokens', 0)
+    return bool(tokens and tokens > 0 or isinstance(reasoning, str) and reasoning
+                or re.search(r'<think>|<\|thinking\|>', message.get('content') or '', re.I))
+
+
+def workload_coverage(probe):
+    """Validate setup branches separately from every fixed benchmark-body stage."""
+    errors = []
+    captures = probe.get('responses', [])
+    if not isinstance(captures, list) or any(not isinstance(c, dict) for c in captures):
+        return {'complete': False, 'errors': ['malformed_capture_list']}
+    indices = [c.get('request_index') for c in captures]
+    identities = [c.get('request_id') for c in captures]
+    sequence = probe.get('request_sequence', [])
+    if (any(type(i) is not int for i in indices) or len(set(indices)) != len(indices)
+            or indices != sorted(indices)):
+        errors.append('invalid_capture_indices')
+    if (any(not isinstance(i, str) for i in identities) or not isinstance(sequence, list)
+            or any(not isinstance(i, str) for i in sequence)
+            or Counter(identities) != Counter(sequence)):
+        errors.append('incomplete_request_sequence')
+    for capture in captures:
+        if (capture.get('path') != '/v1/chat/completions'
+                or capture.get('http_status') != 200
+                or not capture.get('response', {}).get('complete')
+                or not isinstance(capture.get('request'), dict)):
+            errors.append('unsupported_or_incomplete_capture')
+    if errors:
+        return {'complete': False, 'errors': sorted(set(errors))}
+    boundary = next((i for i, c in enumerate(captures) if c['request'].get('stream') is True), len(captures))
+    setup, body = captures[:boundary], captures[boundary:]
+    setup_roles = []
+    for capture in setup:
+        request = capture['request']
+        if (request.get('messages') != [{'role': 'user', 'content': 'What is 2 + 2? Reply with just the number.'}]
+                or request.get('stream') not in (None, False) or capture.get('metrics') != []
+                or request.get('temperature') != 0):
+            errors.append('unsupported_setup_request')
+        tokens, effort = request.get('max_completion_tokens'), request.get('reasoning_effort')
+        tools = request.get('tools', [])
+        vendor = request.get('chat_template_kwargs')
+        if tokens == 512 and effort is None and not tools and vendor is None:
+            setup_roles.append('detect')
+        elif (tokens == 2560 and effort == 'low' and vendor is None and isinstance(tools, list)
+              and len(tools) == 1 and tools[0].get('function', {}).get('name') == 'get_weather'):
+            setup_roles.append('opt-in')
+        elif tokens == 512 and effort == 'none' and not tools:
+            setup_roles.append('vendor-disable' if vendor == {'enable_thinking': False}
+                               else 'resolve-none' if vendor is None else 'unsupported')
+        else:
+            setup_roles.append('unsupported')
+    allowed = [('detect', *opt_in, 'resolve-none', *vendor)
+               for opt_in in ((), ('opt-in',)) for vendor in ((), ('vendor-disable',))]
+    if tuple(setup_roles) not in allowed:
+        errors.append('unsupported_setup_branch')
+    else:
+        try:
+            if ('opt-in' in setup_roles) == setup_thinking(setup[0]):
+                errors.append('setup_detection_branch_mismatch')
+            resolve = setup[setup_roles.index('resolve-none')]
+            if ('vendor-disable' in setup_roles) != setup_thinking(resolve):
+                errors.append('setup_disable_branch_mismatch')
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            errors.append('unreadable_setup_branch_evidence')
+    slots = benchmark_slots()
+    if len(body) != len(slots):
+        errors.append('incomplete_benchmark_stages')
+    texts = []
+    for capture, slot in zip(body, slots):
+        request = capture['request']
+        text = '\n'.join(m.get('content', '') for m in request.get('messages', [])
+                         if isinstance(m, dict) and isinstance(m.get('content'), str))
+        texts.append(text)
+        stage, index = slot['stage'], slot['index']
+        markers = {
+            'decode': 'retryWithBackoff<T>', 'drift': 'retryWithBackoff<T>',
+            'prefill': 'The archive records the following entry.',
+            'predictable': "You are a text normaliser. Output the user's text unchanged.",
+            'novel': 'Invent an original, surprising paragraph of stream-of-consciousness prose.',
+            'prefix': 'Operations handbook, section on shift handover.',
+            'batch': 'Write a short descriptive paragraph. Subject number ',
+            'calibration': 'withRetryBudget<T>',
+            'context': 'withRetryBudget<T>' if index % 2 == 0 else 'Count from 1 to 200, one number per line'}
+        if (request.get('stream') is not True or request.get('max_completion_tokens') != slot['max_tokens']
+                or capture.get('metrics') != slot['metrics']
+                or not re.search(r'\[probe [a-z0-9]+-[a-z0-9]+\]', text)
+                or markers[stage] not in text):
+            errors.append('invalid_benchmark_stage:' + stage + ':' + str(index))
+    for metric in METRICS:
+        if (probe.get('metric_request_counts', {}).get(metric) != 3
+                or sum(metric in c.get('metrics', []) for c in captures) != 3):
+            errors.append('incomplete_metric_requests:' + metric)
+    # Repeated IDs/tags are intentional: prefix cold/warm and context code/count.
+    prefix = [c['request'] for c, slot in zip(body, slots) if slot['stage'] == 'prefix']
+    if len(prefix) == 2 and prefix[0] != prefix[1]:
+        errors.append('prefix_cold_warm_request_mismatch')
+    batch_subjects = [re.search(r'Subject number ([0-4]):', text)
+                      for text, slot in zip(texts, slots) if slot['stage'] == 'batch']
+    if (len(batch_subjects) != 5 or any(match is None for match in batch_subjects)
+            or sorted(match[1] for match in batch_subjects if match) != list('01234')
+            or batch_subjects[0] is None or batch_subjects[0][1] != '0'):
+        errors.append('incomplete_batch_single_and_four_streams')
+    return {'complete': not errors, 'errors': sorted(set(errors)), 'setup_roles': setup_roles,
+            'setup_requests': len(setup), 'benchmark_requests': len(body), 'captured_requests': len(captures)}
+
+
+def saved_workload_coverage(out):
+    try:
+        return workload_coverage(d.load_json(out / 'probe.json'))
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        return {'complete': False, 'errors': ['unreadable_workload_coverage:' + type(exc).__name__]}
+
+
 def summarize(out, plan, final=False, supervisor=None):
     errors, parse_errors = d.read_rows(out / 'errors.jsonl')
     boots, boot_errors = d.read_rows(out / 'boots.jsonl')
     runtime_errors = runtime_receipt_errors(out, plan)
+    coverage = saved_workload_coverage(out) if plan['phase'] == 'measure' else None
+    if coverage is not None:
+        runtime_errors.extend(coverage['errors'])
     try:
         checked_runtime(plan['binary'], plan['runtime_identity'])
     except (r.BenchError, OSError, ValueError) as exc:
@@ -232,6 +380,7 @@ def summarize(out, plan, final=False, supervisor=None):
     result = {'complete': bool(complete), 'final': final, 'invalid_samples': len(errors) + len(parse_errors) + len(boot_errors) + len(runtime_errors),
               'samples': 1 if complete else 0, 'performance_pass': False, 'promotion_pass': False,
               'phase': plan['phase'], 'errors': errors + parse_errors + boot_errors + runtime_errors,
+              'workload_coverage': coverage,
               'supervisor': supervisor, 'scope': 'One complete canonical arm or separate exact replay; no standalone speed claim'}
     d.save(out / 'summary.json', result)
     return result
@@ -259,6 +408,10 @@ def worker(out):
                 d.save(folder / 'context-preflight.json', preflight)
                 probe = r.canonical_probe(server, args, plan['mode'], command, folder)
             d.save(out / 'probe.json', probe)
+            coverage = workload_coverage(probe)
+            d.save(out / 'workload-coverage.json', coverage)
+            if not coverage['complete']:
+                raise r.BenchError('canonical workload coverage failed: ' + ','.join(coverage['errors']))
         else:
             if replay_source_identity(Path(plan['source'])) != plan['source_identity']:
                 raise r.BenchError('replay source identity changed after preparation')
@@ -269,6 +422,9 @@ def worker(out):
                     or previous['reuse']['hashes'] != plan['reuse']['hashes']):
                 raise r.BenchError('replay source cohort/protocol/slot/seed changed after preparation')
             probe = d.load_json(Path(plan['source']) / 'probe.json')
+            coverage = workload_coverage(probe)
+            if not coverage['complete']:
+                raise r.BenchError('replay source workload coverage failed: ' + ','.join(coverage['errors']))
             evidence = r.replay_canonical(args, plan['binary'], plan['model'], plan['mode'], probe, out)
             d.save(out / 'replay.json', evidence)
             if replay_source_identity(Path(plan['source'])) != plan['source_identity']:
@@ -444,20 +600,16 @@ def aggregate(paths, output):
             errors.append('replay_source_slot_or_identity_mismatch:' + str(key))
         if not probe.get('successful') or not replay.get('successful') or not replay.get('supported'):
             errors.append('invalid_measurement_or_exactness:' + str(key))
+        coverage = workload_coverage(probe)
+        errors.extend(error + ':' + str(key) for error in coverage['errors'])
         captures = probe.get('responses', [])
-        if (len(captures) != 34 or len(probe.get('request_sequence', [])) != 34
-                or len({c.get('request_index') for c in captures}) != 34
-                or replay.get('captured_requests') != 34):
-            errors.append('incomplete_34_request_protocol:' + str(key))
         results = replay.get('results', [])
         references = replay.get('reference_modes', [])
-        if (not references or len(results) != 34 * len(references)
+        if (replay.get('captured_requests') != len(captures)
+                or not references or len(set(references)) != len(references)
+                or len(results) != len(captures) * len(references)
                 or any(not row.get('reference_matches') for row in results)):
             errors.append('incomplete_full_request_replay:' + str(key))
-        for metric in METRICS:
-            if (probe.get('metric_request_counts', {}).get(metric) != 3
-                    or sum(metric in c.get('metrics', []) for c in captures) != 3):
-                errors.append('incomplete_metric_requests:' + str(key) + ':' + metric)
         report = d.load_json(root / 'arm' / 'llmprobe.json')
         errors.extend(r.probe_report_errors(report, [512], 3))
         errors.extend(r.probe_stability_errors(report))

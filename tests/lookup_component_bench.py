@@ -5,8 +5,9 @@ Declare one family/component with --declare --config NEW.json --seed TRAINING_RU
 --family dflash --component neural-width --isolation declared. Inspect that frozen
 config, then explicitly execute --config NEW.json --output NEW_RUN. --plan-only
 never launches inference. All four held-out cases, first exposure AND repeat, are
-measured in every fresh boot. production-routing uses adjacent ABBA/BAAB quartets;
-the separate MTP lookup ablation retains all six three-arm permutations.
+measured in every fresh boot. production-routing and suffix-backoff use adjacent
+ABBA/BAAB primary quartets, as do *-fixed-cut and *-max-cut width contrasts.
+Native references stay outside component quartets. The MTP lookup ablation retains six permutations.
 There is no whole-run deadline. Per-request/boot hang safeguards remain.
 
 Components: dflash neural-width, combined-width, lookup-increment; mtp lookup;
@@ -36,6 +37,7 @@ UNSUPPORTED = {
     'mtp/neural-width': 'No neural-only MTP StairCut runtime control; native MTP versus lookup is not this ablation.',
     'ple': 'PLE is an embedding optimization, not a speculative drafter; measured separately.',
 }
+WIDTH_QUARTETS = ('neural-fixed-cut', 'neural-max-cut', 'combined-fixed-cut', 'combined-max-cut')
 PROTOCOL = {
     'version': 2, 'numerical_mode': 'row-exact', 'deadline_seconds': None,
     'worker_stop_seconds': None, 'server_args': {'ctx_size': 2048, 'ready_timeout': 120,
@@ -44,13 +46,20 @@ PROTOCOL = {
     'unit': 'independent fresh-boot paired block; never requests, tokens, or speculative rounds',
     'workload': list(CASES), 'exposures': list(EXPOSURES),
     'scope': 'Full held-out transfer workload only; not canonical throughput or default promotion.',
+    'cost_accounting': {
+        'endpoint': 'Complete measured HTTP request time, including preparation, selection, cold bootstrap and width trials; no round exclusions',
+        'offline_prior': 'Absent by default; supplied diagnostic verify/commit priors are not full-round training evidence',
+        'learning': 'Fresh controller per boot; calibration and bounded width trials inside evaluation are charged to that arm',
+        'selection': 'Included in endpoint and round timing, not separately inferred by subtracting kernel medians',
+        'native_references': 'Width-quartet native boots are descriptive and not pooled into the isolated primary',
+    },
 }
 
 
 def component_matrix(family, component, width):
     if type(width) is not int or not 2 <= width <= 32:
         raise r.BenchError('fixed width must be 2..32')
-    allowed = {'dflash': ('neural-width', 'combined-width', 'lookup-increment', 'production-routing'),
+    allowed = {'dflash': ('neural-width', 'combined-width', 'lookup-increment', 'production-routing') + WIDTH_QUARTETS,
                'mtp': ('lookup', 'production-routing'), 'pld': ('suffix-backoff',)}
     if component not in allowed.get(family, ()):
         raise r.BenchError(UNSUPPORTED.get(family + '/' + component, 'unsupported family/component'))
@@ -85,6 +94,21 @@ def component_matrix(family, component, width):
             definitions[base + '-repeat'] = replica
         contrast(native, adaptive, 'production lookup admission versus native family; paired ABBA/BAAB blocks')
         contrasts[-1]['role'] = 'production-primary'
+    elif component in WIDTH_QUARTETS:
+        source, control, _ = component.split('-')
+        baseline, cut = add(source, control), add(source, 'cut')
+        for base in (native, baseline, cut):
+            definitions[base]['comparison_arm'] = base
+            replica = dict(definitions[base])
+            if 'experiment' in replica:
+                replica['experiment'] = dict(replica['experiment'])
+            definitions[base + '-repeat'] = replica
+        contrast(baseline, cut, 'isolated adjacent ABBA/BAAB width selection; identical candidate source', primary=True)
+        for arm in (baseline, cut):
+            contrast(native, arm, 'native-family descriptive reference outside the width quartet')
+        definitions['serial'] = {'family': 'serial', 'mode': 'serial', 'tier': 'legacy',
+            'selection': 'adaptive', 'actual': 'legacy', 'candidate_source': 'native',
+            'meaning': 'Exact serial replay reference outside the timed width contrast; row-exact'}
     elif component in ('neural-width', 'combined-width'):
         source = 'neural' if component == 'neural-width' else 'combined'
         fixed, maximum, cut = [add(source, selection) for selection in ('fixed', 'max', 'cut')]
@@ -108,8 +132,14 @@ def component_matrix(family, component, width):
                 'selection': 'cut', 'actual': 'cut', 'candidate_source': 'combined', 'backoff': enabled,
                 'experiment': {'MLX_SERVE_LOOKUP_CANDIDATES': '1', 'MLX_SERVE_LOOKUP_BACKOFF': '1' if enabled else '0'},
                 'meaning': 'Standalone suffix lookup, identical frozen history and cut policy; bounded miss backoff ' + ('on' if enabled else 'off')}
-            contrast(native, arm, 'standalone PLD versus serial reference')
-        contrast('pld-backoff-off', 'pld-backoff-on', 'causal bounded suffix miss-backoff increment', primary=True)
+            contrast(native, arm, 'standalone PLD descriptive serial reference outside the backoff quartet')
+        contrast('pld-backoff-off', 'pld-backoff-on', 'adjacent ABBA/BAAB bounded suffix miss-backoff increment', primary=True)
+        for base in (native, 'pld-backoff-off', 'pld-backoff-on'):
+            definitions[base]['comparison_arm'] = base
+            replica = dict(definitions[base])
+            if 'experiment' in replica:
+                replica['experiment'] = dict(replica['experiment'])
+            definitions[base + '-repeat'] = replica
     else:
         cut, adaptive = add('combined', 'cut'), add('combined', 'adaptive')
         contrast(native, cut, 'lookup chain cut versus native MTP; NOT neural-only MTP StairCut')
@@ -129,6 +159,18 @@ def balanced_orders(arms, blocks):
 
 
 def component_orders(family, component, arms, blocks):
+    if component == 'suffix-backoff':
+        if type(blocks) is not int or blocks < 4 or blocks % 2 or len(arms) != 6:
+            raise r.BenchError('backoff ABBA requires six physical arms and at least four even-count blocks')
+        native, a0, b0, native_repeat, a1, b1 = arms
+        return [[native, a0, b0, b1, a1, native_repeat] if block % 2 == 0 else
+                [native_repeat, b0, a0, a1, b1, native] for block in range(blocks)]
+    if component in WIDTH_QUARTETS:
+        if type(blocks) is not int or blocks < 4 or blocks % 2 or len(arms) != 7:
+            raise r.BenchError('width ABBA requires seven physical arms and at least four even-count blocks')
+        native, a0, b0, native_repeat, a1, b1, serial = arms
+        return [[serial, native, a0, b0, b1, a1, native_repeat] if block % 2 == 0 else
+                [native_repeat, b0, a0, a1, b1, native, serial] for block in range(blocks)]
     if component == 'production-routing':
         if type(blocks) is not int or blocks < 4 or blocks % 2 or len(arms) != 4:
             raise r.BenchError('ABBA requires four physical arms and at least four even-count blocks')
@@ -205,8 +247,12 @@ def price_declaration(path, source=None):
 
 def bind_prices(definitions, prices):
     if prices is not None:
+        metadata = prices['source']['metadata']
         for spec in definitions.values():
             if spec['candidate_source'] != 'native':
+                if (spec['family'] != 'dflash' or
+                        metadata.get('preparation') != 'production-' + spec['candidate_source']):
+                    raise r.BenchError('offline price preparation does not match the arm candidate source/family')
                 spec['experiment']['MLX_SERVE_LOOKUP_PRICES'] = prices['path']
 
 
@@ -224,6 +270,8 @@ def validate_prices(plan):
     for key in ('binary_sha256', 'runtime_identity', 'model', 'model_content'):
         if metadata[key] != plan.get(key):
             raise r.BenchError('offline price source ' + key + ' differs from frozen experiment')
+    if metadata.get('seed_hashes') != plan.get('reuse', {}).get('hashes') or not metadata.get('seed_hashes'):
+        raise r.BenchError('offline price training seed_hashes differs from frozen experiment')
 
 
 def source_hashes():
@@ -306,7 +354,7 @@ def declare(args):
         'price_policy': ('Frozen schema3 offline prior plus online observations, identical file on every nonnative arm; native reference unchanged'
                          if prices else 'Online-only schema3 variant/width pricing; fresh controller each boot; no inherited price file'),
         'balance': ('Adjacent ABBA/BAAB quartets; fresh independent replicas, one statistical observation per complete quartet'
-                    if args.component == 'production-routing' else
+                    if args.component in ('production-routing', 'suffix-backoff') or args.component in WIDTH_QUARTETS else
                     'All six full permutations; each arm twice per position, each directed adjacency twice'
                     if args.family == 'mtp' else
                     'Adjacent forward/reverse blocks balance pairwise precedence; not position balance'),
@@ -415,6 +463,17 @@ def backoff_errors(row):
 def component_receipt_errors(row):
     spec = row['arm_definition']
     errors = backoff_errors(row)
+    for probe in row.get('width_probe_events', []):
+        if spec['candidate_source'] == 'native' or spec['selection'] not in ('cut', 'adaptive'):
+            errors.append('width_probe_in_nonlearning_control')
+        if (not isinstance(probe, dict) or probe.get('family') != row['family']
+                or probe.get('reason') != 'upper_width_learning'
+                or probe.get('reservation_consumed') is not True
+                or probe.get('max_forced_executions') != 2
+                or type(probe.get('rows')) is not int or not 2 <= probe['rows'] <= 32
+                or type(probe.get('class')) is not int
+                or row['family'] == 'dflash' and probe.get('variant') not in ('generic', 'linear_gdn')):
+            errors.append('invalid_width_learning_receipt')
     if spec['candidate_source'] == 'native':
         return errors
     controlled = 0
@@ -430,7 +489,14 @@ def component_receipt_errors(row):
             continue
         controlled += 1
         candidate, legal, actual = (receipt.get(key) for key in ('candidate_rows', 'legal_rows', 'rows'))
+        copy = receipt.get('native_copy')
+        native_copy = isinstance(copy, dict) and copy.get('selected') is True
         valid = all(type(value) is int for value in (candidate, legal, actual)) and 1 <= actual <= legal <= candidate
+        if native_copy:
+            errors.extend(prefix + error for error in d.native_copy_receipt_errors(receipt))
+            valid = (all(type(value) is int for value in (candidate, legal, actual))
+                     and 1 <= legal <= candidate <= 16 and 2 <= actual <= 16
+                     and actual == copy.get('rows'))
         if not valid:
             errors.append(prefix + 'illegal_width')
         selection = spec['selection']
@@ -504,7 +570,11 @@ def contrast_effects(plan, rows):
         guardrails = len(blocks) == plan['blocks'] and all(
             all(value >= 1 / 1.05 for value in values) for values in cells.values())
         results.append(dict(contrast, full_workload=effect, case_exposure=strata,
-                            statistical_unit='complete four-boot ABBA/BAAB quartet' if plan['component'] == 'production-routing' else 'complete component block',
+                            statistical_unit='complete four-boot ABBA/BAAB quartet' if
+                                plan['component'] == 'production-routing' or
+                                (plan['component'] in WIDTH_QUARTETS or plan['component'] == 'suffix-backoff') and contrast['role'] == 'primary'
+                                else 'complete component block',
+                            isolated_width_contrast=plan['component'] in WIDTH_QUARTETS and contrast['role'] == 'primary',
                             estimator='geometric mean of complete-block summed-duration ratios',
                             physical_boot_seconds=physical_boots,
                             every_cell_block_within_5pct=guardrails, performance_pass=False))
@@ -520,6 +590,9 @@ def mechanism_evidence(plan, rows):
                   if receipt.get('commit_scope') == 'published']
         reduced = {}
         for receipt in rounds:
+            copy = receipt.get('native_copy')
+            if isinstance(copy, dict) and copy.get('selected') is True:
+                continue
             if receipt.get('rows', 0) < receipt.get('legal_rows', 0):
                 selection = receipt.get('selection', 'unknown')
                 reduced[selection] = reduced.get(selection, 0) + 1
@@ -540,10 +613,14 @@ def mechanism_evidence(plan, rows):
             len(miss_cells) == plan['blocks'] * len(members) * 2 and
             all(cell.get('plain_tokens', 0) > 0 and cell.get('misses', 0) > 0 for cell in miss_cells))
         result[arm] = {'published_rounds': len(rounds),
+            'native_copy_selected_rounds': sum(isinstance(receipt.get('native_copy'), dict) and
+                                               receipt['native_copy'].get('selected') is True for receipt in rounds),
             'published_neural_acceptance_lower_bound': accepted,
             'width_reduced_rounds': sum(reduced.values()),
             'width_reduced_rounds_by_selection': reduced,
             'forced_cut_reduced_rounds': forced_cut,
+            'width_learning_executions': sum(len(row.get('width_probe_events', [])) for row in own),
+            'width_learning_cost': 'Included without subtraction in complete request durations; not a measured width win',
             'related_cell_persistent_training_output_lower_bounds': lookup_cells,
             'source_requirement_pass': (True if spec['candidate_source'] == 'native' else
                 accepted > 0 if spec['candidate_source'] == 'neural' else
@@ -633,7 +710,11 @@ def summarize(out, plan, final=False, supervisor=None):
     for effect in effects:
         treatment = mechanisms.get(effect['treatment'], {})
         baseline = mechanisms.get(effect['baseline'], {})
-        effect['performance_pass'] = bool(complete and not measurement and effect['every_cell_block_within_5pct']
+        # Multiarm forward/reverse blocks and out-of-quartet native references
+        # remain descriptive: do not promote them as isolated width evidence.
+        eligible = not (plan['component'] in ('neural-width', 'combined-width') or
+                        (plan['component'] in WIDTH_QUARTETS or plan['component'] == 'suffix-backoff') and effect['role'] != 'primary')
+        effect['performance_pass'] = bool(eligible and complete and not measurement and effect['every_cell_block_within_5pct']
             and effect['full_workload'].get('verdict') == 'win'
             and treatment.get('source_requirement_pass') and baseline.get('source_requirement_pass')
             and treatment.get('width_cut_requirement_pass') and treatment.get('backoff_requirement_pass')
@@ -648,6 +729,7 @@ def summarize(out, plan, final=False, supervisor=None):
         'forced_control_results': [item for item in effects if item['role'] == 'forced-control'],
         'native_reference_results': [item for item in effects if item['role'] == 'native-reference'],
         'claim_scope': PROTOCOL['scope'], 'uncertainty': plan['claim_policy'],
+        'cost_accounting': PROTOCOL['cost_accounting'],
         'unsupported_components': UNSUPPORTED, 'canonical_speedup_claim': False, 'promotion_pass': False,
         'supervisor': supervisor}
     d.save(out / 'summary.json', result)
@@ -675,7 +757,9 @@ def worker(out):
                             for rep in EXPOSURES:
                                 row = d.record_sample(out, folder, server, args, spec, block, arm, case, rep,
                                                       telemetry=collector)
-                                row['backoff_events'] = r.receipts((folder / (case['id'] + '-' + str(rep)) / 'receipts.log').read_text(), 'backoff')
+                                receipt_text = (folder / (case['id'] + '-' + str(rep)) / 'receipts.log').read_text()
+                                row['backoff_events'] = r.receipts(receipt_text, 'backoff')
+                                row['width_probe_events'] = r.receipts(receipt_text, 'width-probe')
                                 row['errors'] = validate_row(row, plan)
                                 row['phase'] = 'evaluation'
                                 row['exposure'] = 'first' if rep == -1 else 'repeat'
@@ -702,7 +786,7 @@ def main():
     parser.add_argument('--config', type=Path)
     parser.add_argument('--seed', type=Path)
     parser.add_argument('--family', choices=('dflash', 'mtp', 'pld'))
-    parser.add_argument('--component', choices=('neural-width', 'combined-width', 'lookup-increment', 'lookup', 'suffix-backoff', 'production-routing'))
+    parser.add_argument('--component', choices=('neural-width', 'combined-width', 'lookup-increment', 'lookup', 'suffix-backoff', 'production-routing') + WIDTH_QUARTETS)
     parser.add_argument('--blocks', type=int)
     parser.add_argument('--fixed-width', type=int)
     parser.add_argument('--isolation', choices=('declared', 'contended', 'unknown'))

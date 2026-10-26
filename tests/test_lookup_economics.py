@@ -372,14 +372,14 @@ class ControlledComparisonTests(unittest.TestCase):
         curves = economics.fit_curves(block("train"), WIDTHS)
         with tempfile.TemporaryDirectory() as directory:
             paths = economics.price_files(Path(directory), curves)
-            table = json.loads(paths["dflash-local"].read_text())
+            table = json.loads(paths["dflash-local/copy-ctx0"].read_text())
             self.assertEqual(table["schema"], 3)
             self.assertEqual(table["0"]["plain"], {"generic": {"1": 4.0}})
             self.assertEqual(table["0"]["tree"]["generic"]["2"], 5.0)
             paid_only = {key: cell for key, cell in curves.items()
                          if json.loads(key)[-1] != "no-assistant"}
             paths = economics.price_files(Path(directory), paid_only)
-            table = json.loads(paths["dflash-local"].read_text())
+            table = json.loads(paths["dflash-local/copy-ctx0"].read_text())
             self.assertNotIn("plain", table["0"])
 
     def test_historical_context_semantics_cannot_be_relabelled_as_new_prices(self):
@@ -407,7 +407,7 @@ class ControlledComparisonTests(unittest.TestCase):
         self.assertEqual(curves[economics.curve_key(linear[2])]["n"], 1)
         with tempfile.TemporaryDirectory() as directory:
             paths = economics.price_files(Path(directory), curves)
-            table = json.loads(paths["dflash-local"].read_text())
+            table = json.loads(paths["dflash-local/copy-ctx0"].read_text())
             self.assertEqual(table["0"]["tree"]["generic"]["3"], 9.0)
             self.assertEqual(table["0"]["tree"]["linear_gdn"], {"3": 18.0})
             self.assertEqual(table["0"]["plain"], {"generic": {"1": 4.0}})
@@ -445,6 +445,23 @@ class ControlledComparisonTests(unittest.TestCase):
                     with self.assertRaises(economics.runner.BenchError):
                         economics.price_files(Path(directory), {**current, **curves})
                     self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_prices_preserve_profile_binding_even_with_identical_context_and_variant(self):
+        original = block("train")
+        other = block("train")
+        for row in other:
+            row["profile"] = "prose-ctx0"
+            row["round"]["verify_commit_ms"] *= 3
+            row["round"]["round_ms"] *= 3
+        widths = dict(WIDTHS, **{"dflash-local/prose-ctx0": [1, 2, 3]})
+        curves = economics.fit_curves(original + other, widths)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = economics.price_files(Path(directory), curves)
+            self.assertEqual(set(paths), set(widths))
+            copy_prices = json.loads(paths["dflash-local/copy-ctx0"].read_text())
+            prose_prices = json.loads(paths["dflash-local/prose-ctx0"].read_text())
+            self.assertEqual(copy_prices["0"]["tree"]["generic"]["2"], 5)
+            self.assertEqual(prose_prices["0"]["tree"]["generic"]["2"], 15)
 
     def test_training_is_disjoint_and_complete(self):
         training = block("train")

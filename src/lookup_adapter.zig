@@ -143,8 +143,10 @@ pub fn lookupTree(anchor: u32, nodes: []const VoteNode, order: u32, calibration:
 }
 
 /// Native lattice: -1 means the anchor and depth zero means the first draft.
+/// Keep the host selector's raw edge probabilities; lookup learning does not
+/// recalibrate them. Mixed-source projection can still change path ranking.
 /// Misaligned input tails, forward references and inconsistent depths are ignored.
-pub fn neuralTree(anchor: u32, tokens: []const u32, parents: []const i32, depths: []const u32, confidence: []const f32, calibration: *const Calibration, depth_limit: u32) Tree {
+pub fn neuralTree(anchor: u32, tokens: []const u32, parents: []const i32, depths: []const u32, confidence: []const f32, depth_limit: u32) Tree {
     var proposals = Proposals.init();
     const len = @min(max_proposals, @min(@min(tokens.len, parents.len), @min(depths.len, confidence.len)));
     const depth_cap = @min(depth_limit, policy.MAX_TREE_ROWS - 1);
@@ -155,9 +157,29 @@ pub fn neuralTree(anchor: u32, tokens: []const u32, parents: []const i32, depths
             break :blk proposals.input_map[@intCast(parents[input])];
         };
         if (parent == absent or depths[input] != proposals.rows[parent].depth) continue;
-        proposals.insert(input, parent, tokens[input], depths[input] + 1, confidence[input], calibration.q(.neural, confidence[input], 0), 8);
+        proposals.insert(input, parent, tokens[input], depths[input] + 1, confidence[input], confidence[input], 8);
     }
     return proposals.finish(anchor, .draft, 0);
+}
+
+/// Original best-first admissions, not a preorder prefix or a second ranking.
+/// Match paths through the already-projected neural offer so excluded siblings
+/// never donate probability and repeated token IDs retain their ancestry.
+pub fn neuralAdmissionTree(neural: *const Tree, tokens: []const u32, parents: []const i32, admission_order: []const usize, count: usize) Tree {
+    std.debug.assert(tokens.len <= policy.MAX_TREE_ROWS - 1 and parents.len == tokens.len and admission_order.len >= tokens.len);
+    var remap: [policy.MAX_TREE_ROWS]u16 = @splat(absent);
+    var selected: u32 = 1;
+    for (tokens, parents, 0..) |token, parent, input| {
+        const mapped_parent: u16 = if (parent < 0) 0 else remap[@intCast(parent)];
+        if (mapped_parent == absent) continue;
+        for (1..neural.len) |row| {
+            if (neural.parents[row] != @as(i32, @intCast(mapped_parent)) or neural.tokens[row] != token) continue;
+            remap[input] = @intCast(row);
+            if (admission_order[input] < count) selected |= @as(u32, 1) << @as(u5, @intCast(row));
+            break;
+        }
+    }
+    return neural.subset(selected);
 }
 
 fn conditionals(tree: *const Tree) [policy.MAX_TREE_ROWS]f32 {
@@ -242,7 +264,7 @@ pub fn merge(target: *Tree, other: *const Tree) void {
     target.scores_calibrated = target_projected and (other.scores_calibrated or other.len == 1);
 }
 
-pub const Alternative = enum { plain, lookup };
+pub const Alternative = enum { plain, lookup, native_copy };
 pub const Route = struct {
     decision: policy.RouteDecision,
     source: Alternative,
@@ -271,8 +293,9 @@ pub const RouteEvaluation = struct {
 /// is already paid and appears once in each alternative's complete-round numerator.
 /// Assistant history retains native remaining work and yield, not a mixed cycle.
 /// Unknown exact widths do not become actionable merely from extrapolated prices.
-/// Prune only when bypassing the assistant; otherwise retain proposals for merging.
-pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f32, row_limit: u32, dispatch: policy.TreeDispatch, evaluation: ?*RouteEvaluation) Route {
+/// Prune only for a winning lookup/plain action. Native copy has separate runtime
+/// geometry; retain the original offer for merging, diagnostics, and path learning.
+pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f32, row_limit: u32, dispatch: policy.TreeDispatch, evaluation: ?*RouteEvaluation, native_copy_rows: ?u32) Route {
     if (evaluation) |log| log.len = 0;
     var plain: ?f32 = null;
     var lookup_cost: ?f32 = null;
@@ -315,11 +338,11 @@ pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f3
     }
     const source: Alternative = if (lookup_cost != null and (plain == null or lookup_cost.? < plain.?)) .lookup else .plain;
     const alternative = if (source == .lookup) lookup_cost else plain;
-    const decision = controller.routeAgainstPrepared(class, alternative, query_ms);
-    if (decision.skip) lookup.* = if (source == .lookup) best else Tree.init(lookup.tokens[0]);
+    const decision = controller.routeAgainstPrepared(class, alternative, query_ms, native_copy_rows);
+    if (decision.skip and !decision.native_copy) lookup.* = if (source == .lookup) best else Tree.init(lookup.tokens[0]);
     return .{
         .decision = decision,
-        .source = source,
+        .source = if (decision.native_copy) .native_copy else source,
         .plain_ms = plain,
         .lookup_ms = lookup_cost,
         .lookup_rows = if (lookup_cost != null) @intCast(best.len) else 0,
@@ -395,7 +418,7 @@ test "assistant retention preserves proposals and plain routing selects only roo
     _ = controller.observeSpecRemainingProbe(3, 3, 0, 0);
     var offer = Tree.chain(83, &.{ 41, 59, 26 }, 0.7, 0.8);
     const before = offer;
-    const assistant = route(&controller, &offer, 0, 0.2, 4, .generic, null);
+    const assistant = route(&controller, &offer, 0, 0.2, 4, .generic, null, null);
     try std.testing.expect(!assistant.decision.skip);
     try std.testing.expectEqual(before.len, offer.len);
     try std.testing.expectEqualSlices(u32, before.tokens[0..before.len], offer.tokens[0..offer.len]);
@@ -405,7 +428,7 @@ test "assistant retention preserves proposals and plain routing selects only roo
     plain_controller.prices.observe(2, 50, .tree, 0, .generic);
     plain_controller.observePlain(2, 0);
     _ = plain_controller.observeSpecRemainingProbe(80, 2, 0, 0);
-    const plain_route = route(&plain_controller, &offer, 0, 0.2, 4, .generic, null);
+    const plain_route = route(&plain_controller, &offer, 0, 0.2, 4, .generic, null, null);
     try std.testing.expect(plain_route.decision.skip);
     try std.testing.expectEqual(Alternative.plain, plain_route.source);
     try std.testing.expectEqual(@as(usize, 1), offer.len);
@@ -457,8 +480,7 @@ test "bounded pruning considers late alternatives and depth does not cap breadth
 }
 
 test "neural lattice retains siblings and rejects nonnative parent markers" {
-    const cal: Calibration = .{};
-    const tree = neuralTree(7, &.{ 41, 42, 43, 44, 45 }, &.{ -1, -1, 0, -2, 3 }, &.{ 0, 0, 1, 0, 1 }, &.{ 0.55, 0.35, 0.8, 1, 1 }, &cal, 1);
+    const tree = neuralTree(7, &.{ 41, 42, 43, 44, 45 }, &.{ -1, -1, 0, -2, 3 }, &.{ 0, 0, 1, 0, 1 }, &.{ 0.55, 0.35, 0.8, 1, 1 }, 1);
     try std.testing.expectEqual(@as(usize, 3), tree.len);
     try std.testing.expectEqual(@as(u8, 8), tree.origins[2]);
     try std.testing.expectEqual(@as(i32, 0), tree.parents[2]);
@@ -467,7 +489,7 @@ test "neural lattice retains siblings and rejects nonnative parent markers" {
 
 test "merge shares evidence without multiplying agreement and rescales descendants" {
     const cal: Calibration = .{};
-    var target = neuralTree(9, &.{ 51, 52 }, &.{ -1, 0 }, &.{ 0, 1 }, &.{ 0.7, 0.4 }, &cal, 3);
+    var target = neuralTree(9, &.{ 51, 52 }, &.{ -1, 0 }, &.{ 0, 1 }, &.{ 0.7, 0.4 }, 3);
     const nodes = [_]VoteNode{ vote(51, null, 1, 0.8, 4), vote(53, null, 1, 0.8, 2) };
     const other = lookupTree(9, &nodes, 17, &cal, 3);
     merge(&target, &other);
@@ -512,21 +534,21 @@ test "routing retains unknown assistant and accounts for paid query in both alte
     defer controller.deinit();
     const nodes = [_]VoteNode{vote(101, null, 1, 1, 1)};
     var tree = lookupTree(10, &nodes, 1, &controller.cal, 1);
-    var choice = route(&controller, &tree, 4096, 0, 2, .generic, null);
+    var choice = route(&controller, &tree, 4096, 0, 2, .generic, null, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.plain_ms == null and choice.lookup_ms == null);
     _ = controller.observeSpecRemainingProbe(8, 4, 4096, 0);
     controller.observePlain(2, 4096);
     controller.prices.observe(2, 3, .tree, 4096, .generic);
-    choice = route(&controller, &tree, 4096, 5, 2, .generic, null);
+    choice = route(&controller, &tree, 4096, 5, 2, .generic, null, null);
     try std.testing.expectApproxEqAbs(@as(f32, 7), choice.plain_ms.?, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 4), choice.lookup_ms.?, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.25), choice.decision.assistant_ms.?, 0.00001);
     try std.testing.expect(!choice.decision.skip);
-    choice = route(&controller, &tree, 4096, 0, 2, .generic, null);
+    choice = route(&controller, &tree, 4096, 0, 2, .generic, null, null);
     try std.testing.expectEqual(Alternative.lookup, choice.source);
     try std.testing.expect(choice.decision.skip);
-    choice = route(&controller, &tree, 8192, 0, 2, .generic, null);
+    choice = route(&controller, &tree, 8192, 0, 2, .generic, null, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.lookup_ms == null);
 }
@@ -537,7 +559,7 @@ test "routing rejects invalid preparation instead of silently making it free" {
     controller.observePlain(1, 0);
     _ = controller.observeSpecRemainingProbe(9, 1, 0, 0);
     var tree = Tree.init(3);
-    const choice = route(&controller, &tree, 0, std.math.nan(f32), 8, .generic, null);
+    const choice = route(&controller, &tree, 0, std.math.nan(f32), 8, .generic, null, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.plain_ms == null);
 }
@@ -581,7 +603,7 @@ test "chain pricing and learning use each offered edge rather than root unanimit
     const candidate = lookupChain(3, &.{ 31, 32, 33 }, &nodes, 2, &controller.cal, 4);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(std.testing.allocator);
-    const choice = try controller.chooseLookPreparedControlled(&candidate, 0, 0, &out, 4, .unknown);
+    const choice = try controller.chooseLookPreparedControlled(&candidate, 0, 0, &out, 4, .unknown, null);
     try std.testing.expectApproxEqAbs(@as(f32, 1.45), choice.expected, 0.00001);
     var receipt_expected: f32 = 0;
     for (candidate.scores[1..candidate.len]) |reach| receipt_expected += reach;
@@ -593,10 +615,42 @@ test "chain pricing and learning use each offered edge rather than root unanimit
     try std.testing.expectEqual(@as(f32, 0.25), controller.cal.q(.look_continuation, 0.25, 1));
 }
 
+test "adapter chain admission corrects measured preparation at each executed width" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    const nodes = [_]VoteNode{
+        vote(31, null, 1, 1, 4),
+        vote(32, 0, 2, 1, 4),
+        vote(33, 1, 3, 1, 4),
+    };
+    const candidate = lookupChain(3, &.{ 31, 32, 33 }, &nodes, 2, &controller.cal, 4);
+    const class = contextClass(5000);
+    controller.prices.observe(2, 10, .chain, class, .generic);
+    controller.prices.observe(4, 10, .chain, class, .generic);
+    const native: policy.LookFallback = .{ .measured = .{ .round_ms = 20, .expected_tokens = 2 } };
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const unknown = try controller.chooseLookPreparedControlled(&candidate, class, 2, &out, 0, native, .cold);
+    try std.testing.expectEqualSlices(u32, &.{ 31, 32, 33 }, unknown.tokens);
+    try std.testing.expect(controller.knownMtpPreparation(4, class, .cold) == null);
+    // A first real execution is excluded, not mistaken for a learned zero price.
+    try std.testing.expect(!controller.observeMtpPreparation(4, class, .cold, 100));
+    const first = try controller.chooseLookPreparedControlled(&candidate, class, 2, &out, 0, native, .cold);
+    try std.testing.expectEqualSlices(u32, &.{ 31, 32, 33 }, first.tokens);
+    try std.testing.expect(controller.observeMtpPreparation(4, class, .cold, 100));
+    const corrected = try controller.chooseLookPreparedControlled(&candidate, class, 2, &out, 0, native, .cold);
+    try std.testing.expectEqualSlices(u32, &.{31}, corrected.tokens);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 12.0), corrected.value, 0.000001);
+    const carried = try controller.chooseLookPreparedControlled(&candidate, class, 2, &out, 0, native, .carried);
+    try std.testing.expectEqualSlices(u32, &.{ 31, 32, 33 }, carried.tokens);
+    const forced = try controller.chooseLookPreparedControlled(&candidate, class, 2, &out, 4, native, .cold);
+    try std.testing.expectEqualSlices(u32, &.{ 31, 32, 33 }, forced.tokens);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0 / 112.0), forced.value, 0.000001);
+}
+
 test "reached neural path calibrates unselected lookup without rejected-branch evidence" {
     var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
     defer controller.deinit();
-    const selected = neuralTree(10, &.{ 20, 21, 99, 100 }, &.{ -1, 0, -1, 2 }, &.{ 0, 1, 0, 1 }, &.{ 0.8, 0.7, 0.2, 0.9 }, &controller.cal, 3);
     const nodes = [_]VoteNode{
         vote(20, null, 1, 0.9, 4),
         vote(22, 0, 2, 0.6, 4),
@@ -605,23 +659,18 @@ test "reached neural path calibrates unselected lookup without rejected-branch e
         vote(31, 3, 2, 0.3, 2),
     };
     const offered = lookupTree(10, &nodes, 2, &controller.cal, 3);
-    // No target decision survives a cancellation: neither offer gains observations.
-    controller.observeTree(&selected, &.{}, .neural, null);
-    controller.observeTree(&offered, &.{}, .lookup, null);
-    try std.testing.expectEqual(@as(f32, 0), controller.cal.samples(.neural));
+    // No target decision survives a cancellation: the offer gains no observations.
+    controller.observeLookupTree(&offered, &.{}, null);
     try std.testing.expectEqual(@as(f32, 0), controller.cal.samples(.look));
     // Native execution reaches 20, then 21, then the correction 24. In particular,
     // logits belonging to the rejected native row 99 are not a reached decision.
-    controller.observeTree(&selected, &.{ 20, 21, 24 }, .neural, null);
-    controller.observeTree(&offered, &.{ 20, 21, 24 }, .lookup, null);
-    try std.testing.expectEqual(@as(f32, 3), controller.cal.samples(.neural));
+    controller.observeLookupTree(&offered, &.{ 20, 21, 24 }, null);
     try std.testing.expectEqual(@as(f32, 2), controller.cal.samples(.look));
     try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look_continuation));
     try std.testing.expectApproxEqAbs(@as(f32, 0.32), controller.cal.q(.look, 0.4, 2), 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.48), controller.cal.q(.look_continuation, 0.6, 2), 0.00001);
     try std.testing.expectEqual(@as(f32, 0.7), controller.cal.q(.look_continuation, 0.7, 2));
     try std.testing.expectEqual(@as(f32, 0.3), controller.cal.q(.look_continuation, 0.3, 2));
-    try std.testing.expectEqual(@as(f32, 0.9), controller.cal.q(.neural, 0.9, 0));
     try std.testing.expectEqual(@as(f32, 0.6), controller.cal.q(.look_continuation, 0.6, 1));
 }
 
@@ -630,20 +679,17 @@ test "merged selected lookup success is learned once and missing next decision i
     defer controller.deinit();
     const nodes = [_]VoteNode{ vote(2, null, 1, 0.8, 4), vote(3, 0, 2, 0.6, 4) };
     const offered = lookupTree(1, &nodes, 1, &controller.cal, 2);
-    var merged = neuralTree(1, &.{2}, &.{-1}, &.{0}, &.{0.7}, &controller.cal, 1);
+    var merged = neuralTree(1, &.{2}, &.{-1}, &.{0}, &.{0.7}, 1);
     merge(&merged, &offered);
     const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null, .generic);
     try std.testing.expectEqual(policy.NodeSource.both, selected.sources[1]);
-    controller.observeTree(&selected, &.{2}, .neural, null);
-    controller.observeTree(&offered, &.{2}, .lookup, null);
-    try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.neural));
+    controller.observeLookupTree(&offered, &.{2}, null);
     try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look));
     try std.testing.expectEqual(@as(f32, 0), controller.cal.samples(.look_continuation));
     try std.testing.expectApproxEqAbs(@as(f32, 0.84), controller.cal.q(.look, 0.8, 1), 0.00001);
     // A separately reached bonus can label the unselected next edge, but nothing
     // after the first differing lookup edge is attributed as a failure.
-    controller.observeTree(&selected, &.{ 2, 4 }, .neural, null);
-    controller.observeTree(&offered, &.{ 2, 4 }, .lookup, null);
+    controller.observeLookupTree(&offered, &.{ 2, 4 }, null);
     try std.testing.expectEqual(@as(f32, 2), controller.cal.samples(.look));
     try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look_continuation));
 }
@@ -676,14 +722,13 @@ test "cold request lookup cannot displace neural selection but retains shadow co
     const offered = lookupTree(1, &nodes, 1, &controller.cal, 2);
     var trust: policy.RequestTrust = .{};
     const cold = controller.restrictLookup(&offered, &trust);
-    var merged = neuralTree(1, &.{11}, &.{-1}, &.{0}, &.{0.8}, &controller.cal, 1);
+    var merged = neuralTree(1, &.{11}, &.{-1}, &.{0}, &.{0.8}, 1);
     merge(&merged, &cold);
     const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null, .generic);
     try std.testing.expectEqualSlices(u32, &.{ 1, 11 }, selected.tokens[0..selected.len]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), selected.scores[1], 0.00001);
-    controller.observeTree(&selected, &.{ 11, 13 }, .neural, null);
     // The already known bonus teaches the unselected next lookup edge.
-    controller.observeTree(&offered, &.{ 11, 13 }, .lookup, &trust);
+    controller.observeLookupTree(&offered, &.{ 11, 13 }, &trust);
     try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look_continuation));
     try std.testing.expect(trust.q(.look, 1) > 0);
     try std.testing.expect(trust.q(.look_continuation, 1) > 0);
@@ -703,7 +748,7 @@ test "lookup supported continuation survives zero entry trust and neural parent 
     try std.testing.expectEqual(@as(f32, 0), restricted.scores[1]);
     try std.testing.expectEqual(@as(f32, 0), restricted.scores[2]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), restricted.conditional_reach[2], 0.00001);
-    var neural = neuralTree(10, &.{11}, &.{-1}, &.{0}, &.{0.7}, &controller.cal, 1);
+    var neural = neuralTree(10, &.{11}, &.{-1}, &.{0}, &.{0.7}, 1);
     merge(&neural, &restricted);
     try std.testing.expectApproxEqAbs(@as(f32, 0.42), neural.scores[2], 0.00001);
     const selected = controller.chooseTreeControlled(&neural, 0, 0, 3, 3, null, .generic);
@@ -732,13 +777,293 @@ test "lookup routing cannot bypass the assistant using another kernel variant pr
     _ = controller.observeSpecRemainingProbe(20, 1, 0, 0);
     controller.prices.observe(9, 1, .tree, 0, .generic);
     var offer = Tree.chain(10, &.{ 11, 12, 13, 14, 15, 16, 17, 18 }, 1, 1);
-    const unknown = route(&controller, &offer, 0, 0, 9, .linear_gdn, null);
+    const unknown = route(&controller, &offer, 0, 0, 9, .linear_gdn, null, null);
     try std.testing.expect(!unknown.decision.skip);
     try std.testing.expect(unknown.lookup_ms == null);
     try std.testing.expectEqual(@as(usize, 9), offer.len);
     controller.prices.observe(9, 1, .tree, 0, .linear_gdn);
-    const measured = route(&controller, &offer, 0, 0, 9, .linear_gdn, null);
+    const measured = route(&controller, &offer, 0, 0, 9, .linear_gdn, null, null);
     try std.testing.expect(measured.decision.skip);
     try std.testing.expectEqual(Alternative.lookup, measured.source);
     try std.testing.expectEqual(@as(u32, 9), measured.lookup_rows);
+}
+
+test "lookup learning cannot rerank a pure neural continuation" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    for (0..200) |i| {
+        controller.cal.learn(.look, 0.99, 0, i % 10 == 0);
+        controller.cal.learn(.look_continuation, 0.9, 0, false);
+    }
+    var candidate = neuralTree(99,
+        &.{ 1, 2, 3, 4, 5, 6, 7, 88 },
+        &.{ -1, 0, 1, 2, 3, 4, 5, -1 },
+        &.{ 0, 1, 2, 3, 4, 5, 6, 0 },
+        &.{ 0.58, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.42 },
+        8);
+    for ([_]bool{ true, false }) |projected| {
+        // Both the adapter and the generic unprojected input retain raw neural
+        // probabilities; neither may read lookup calibration by enum index.
+        candidate.scores_calibrated = projected;
+        const chosen = controller.chooseTreeControlled(&candidate, 0, 0, 8, 8, null, .generic);
+        try std.testing.expectEqualSlices(u32, &.{ 99, 1, 2, 3, 4, 5, 6, 7 }, chosen.tokens[0..chosen.len]);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.58) * std.math.pow(f32, 0.99, 6), chosen.scores[7], 0.00001);
+        for (chosen.parents[1..chosen.len], 0..) |parent, i| try std.testing.expectEqual(@as(i32, @intCast(i)), parent);
+    }
+}
+
+test "native admissions retain neural geometry against corroborated reranking" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    const tokens = [_]u32{ 10, 20, 11, 20 };
+    const parents = [_]i32{ -1, 0, -1, 2 };
+    const neural = neuralTree(99, &tokens, &parents, &.{ 0, 1, 0, 1 }, &.{ 0.55, 0.7, 0.45, 0.99 }, 2);
+    const native = neuralAdmissionTree(&neural, &tokens, &parents, &.{ 0, 3, 1, 2 }, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11 }, native.tokens[0..native.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, native.parents[0..native.len]);
+    const nodes = [_]VoteNode{ vote(11, null, 1, 0.99, 4), vote(20, 0, 2, 0.99, 4), vote(30, 1, 3, 0.8, 4) };
+    const offered = lookupTree(99, &nodes, 2, &controller.cal, 3);
+    var merged = neural;
+    merge(&merged, &offered);
+    const challenger = controller.chooseTreeControlled(&merged, 0, 0, 3, 3, null, .generic);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 11, 20 }, challenger.tokens[0..challenger.len]);
+    for (challenger.origins[1..challenger.len]) |origins| try std.testing.expectEqual(@as(u8, 12), origins);
+    var log: policy.TreeEvaluation = .{};
+    const retained = controller.chooseTreeBootstrapControlled(&merged, 0, 0, 3, 0, &native, &log, .generic);
+    try std.testing.expectEqualDeep(native, retained);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), log.entries[0].expected_tokens, 0.00001);
+    const retained_witness = if (log.entries[0].retained_native) native else merged.subset(log.entries[0].prefix_mask);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11 }, retained_witness.tokens[0..retained_witness.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, retained_witness.parents[0..retained_witness.len]);
+    try std.testing.expectEqual(@as(f32, 0.55), retained.scores[1]);
+    // Retention itself invents no target decisions. A real reached 11 labels
+    // its lookup edge, but does not claim the hypothetical continuation 20.
+    controller.observeLookupTree(&offered, &.{11}, null);
+    try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look));
+    try std.testing.expectEqual(@as(f32, 0), controller.cal.samples(.look_continuation));
+    controller.observeLookupTree(&offered, &.{ 11, 21 }, null);
+    try std.testing.expectEqual(@as(f32, 1), controller.cal.samples(.look_continuation));
+    try std.testing.expectEqual(@as(f32, 0.8), controller.cal.q(.look_continuation, 0.8, 2));
+    // Wider prefixes still compete and retain genuine lookup-only continuation.
+    const wider = controller.chooseTreeIncumbentControlled(&merged, &native, 0, 0, 4, 4, null, .generic);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 11, 20, 30 }, wider.tokens[0..wider.len]);
+    try std.testing.expectEqual(@as(u8, 4), wider.origins[3]);
+}
+
+test "native admission ties use recorded order and respect short horizon" {
+    const tokens = [_]u32{ 10, 20, 11, 20 };
+    const parents = [_]i32{ -1, 0, -1, 2 };
+    const neural = neuralTree(99, &tokens, &parents, &.{ 0, 1, 0, 1 }, &.{ 0.5, 1, 0.5, 1 }, 2);
+    const admissions = [_]usize{ 0, 3, 1, 2 };
+    const native = neuralAdmissionTree(&neural, &tokens, &parents, &admissions, 3);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11, 20 }, native.tokens[0..native.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0, 2 }, native.parents[0..native.len]);
+    try std.testing.expectEqual(@as(f32, 0.5), native.scores[3]);
+    const shallow = neuralTree(99, &tokens, &parents, &.{ 0, 1, 0, 1 }, &.{ 0.5, 1, 0.5, 1 }, 1);
+    const bounded = neuralAdmissionTree(&shallow, &tokens, &parents, &admissions, 1);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10 }, bounded.tokens[0..bounded.len]);
+    // Two remaining output tokens permit root plus multiple one-draft alternatives.
+    const branching = neuralAdmissionTree(&shallow, &tokens, &parents, &admissions, 4);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11 }, branching.tokens[0..branching.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, branching.parents[0..branching.len]);
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    const executable = controller.chooseTreeBootstrapControlled(&shallow, 0, 0, policy.MAX_TREE_ROWS, 0, &branching, null, .generic);
+    try std.testing.expectEqualDeep(branching, executable);
+    const root = neuralAdmissionTree(&neural, &tokens, &parents, &admissions, 0);
+    try std.testing.expectEqual(@as(usize, 1), root.len);
+}
+
+test "native incumbent permits same width lookup-only continuation and cold support" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    const neural = neuralTree(99, &.{ 10, 11 }, &.{ -1, -1 }, &.{ 0, 0 }, &.{ 0.7, 0.3 }, 1);
+    const native = neuralAdmissionTree(&neural, &.{ 10, 11 }, &.{ -1, -1 }, &.{ 0, 1 }, 2);
+    const nodes = [_]VoteNode{ vote(10, null, 1, 1, 4), vote(12, 0, 2, 1, 4) };
+    const offered = lookupTree(99, &nodes, 2, &controller.cal, 2);
+    var trust: policy.RequestTrust = .{};
+    const cold = controller.restrictLookup(&offered, &trust);
+    var merged = neural;
+    merge(&merged, &cold);
+    const retained = controller.chooseTreeIncumbentControlled(&merged, &native, 0, 0, 3, 3, null, .generic);
+    try std.testing.expectEqualDeep(native, retained);
+    const absent_support = controller.chooseTreeIncumbentControlled(&neural, &native, 0, 0, 3, 3, null, .generic);
+    try std.testing.expectEqualDeep(native, absent_support);
+    trust.learn(.look_continuation, 1, true);
+    const supported = controller.restrictLookup(&offered, &trust);
+    merged = neural;
+    merge(&merged, &supported);
+    var evaluation: policy.TreeEvaluation = .{};
+    const mixed = controller.chooseTreeIncumbentControlled(&merged, &native, 0, 0, 3, 3, &evaluation, .generic);
+    const mixed_witness = if (evaluation.entries[0].retained_native) native else merged.subset(evaluation.entries[0].prefix_mask);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 12 }, mixed_witness.tokens[0..mixed_witness.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1 }, mixed_witness.parents[0..mixed_witness.len]);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 12 }, mixed.tokens[0..mixed.len]);
+    try std.testing.expectEqual(@as(u8, 12), mixed.origins[1]);
+    try std.testing.expectEqual(@as(u8, 4), mixed.origins[2]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7 * 2.0 / 3.0), mixed.scores[2], 0.00001);
+}
+
+test "native incumbent geometry is priced before adaptive width competition" {
+    for ([_]bool{ false, true }) |native_linear| {
+        var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+        defer controller.deinit();
+        const tokens = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17, 18 };
+        const parents = [_]i32{ -1, -1, 1, 2, 3, 4, 5, 6, 7 };
+        const neural = neuralTree(99, &tokens, &parents, &.{ 0, 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 0.55, 0.45, 1, 1, 1, 1, 1, 1, 1 }, 8);
+        const native = neural.subset(if (native_linear) 0x3fd else 0x1ff);
+        const native_variant: policy.Variant = if (native_linear) .linear_gdn else .generic;
+        const challenger_variant: policy.Variant = if (native_linear) .generic else .linear_gdn;
+        const nodes = [_]VoteNode{vote(if (native_linear) 10 else 11, null, 1, 0.99, 4)};
+        const offered = lookupTree(99, &nodes, 2, &controller.cal, 1);
+        var merged = neural;
+        merge(&merged, &offered);
+        const challenger = controller.chooseTreeControlled(&merged, 0, 0, 10, 9, null, .linear_gdn);
+        try std.testing.expectEqual(challenger_variant, challenger.variant(.linear_gdn));
+        controller.prices.observe(1, 1, .tree, 0, .generic);
+        controller.prices.observe(9, 0.01, .tree, 0, challenger_variant);
+        var log: policy.TreeEvaluation = .{};
+        // Knowing the losing challenger's kernel cannot suppress native bootstrap.
+        const cold = controller.chooseTreeBootstrapControlled(&merged, 0, 0, 10, 0, &native, &log, .linear_gdn);
+        try std.testing.expectEqualDeep(native, cold);
+        try std.testing.expectEqual(native_variant, log.entries[0].variant);
+        controller.prices.observe(9, 100, .tree, 0, native_variant);
+        const adaptive = controller.chooseTreeBootstrapControlled(&merged, 0, 0, 10, 0, &native, &log, .linear_gdn);
+        try std.testing.expectEqual(@as(usize, 1), adaptive.len);
+        try std.testing.expectEqual(native_variant, log.entries[1].variant);
+        try std.testing.expectEqual(@as(f32, 100), log.entries[1].verify_ms);
+        const forced = controller.chooseTreeIncumbentControlled(&merged, &native, 0, 0, 10, 9, &log, .linear_gdn);
+        try std.testing.expectEqualDeep(native, forced);
+        var reward: f32 = 0;
+        for (native.scores[0..native.len]) |reach| reward += reach;
+        try std.testing.expectApproxEqAbs(reward, log.entries[0].expected_tokens, 0.00001);
+        const wider = controller.chooseTreeIncumbentControlled(&merged, &native, 0, 0, 10, 10, null, .linear_gdn);
+        try std.testing.expectEqual(@as(usize, 10), wider.len);
+        try std.testing.expectEqual(policy.Variant.generic, wider.variant(.linear_gdn));
+    }
+}
+
+test "native action remains eligible against a differently priced mixed kernel" {
+    const Scenario = enum { both_cold, native_only, dominated_mixed, faster_mixed };
+    for (std.enums.values(Scenario)) |scenario| {
+        var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+        defer controller.deinit();
+        const native = neuralTree(99, &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            &.{ -1, 0, 1, 2, 3, 4, 5, 6 }, &.{ 0, 1, 2, 3, 4, 5, 6, 7 },
+            &.{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 }, 8);
+        const offered = lookupTree(99, &.{vote(88, null, 1, 0.9, 4)}, 4, &controller.cal, 8);
+        var merged = native;
+        merge(&merged, &offered);
+        const mixed = controller.chooseTreeControlled(&merged, 0, 0, 9, 9, null, .linear_gdn);
+        try std.testing.expectEqual(policy.Variant.linear_gdn, native.variant(.linear_gdn));
+        try std.testing.expectEqual(policy.Variant.generic, mixed.variant(.linear_gdn));
+        if (scenario != .both_cold) controller.prices.observe(9, 10, .tree, 0, .linear_gdn);
+        if (scenario == .dominated_mixed or scenario == .faster_mixed)
+            controller.prices.observe(9, if (scenario == .faster_mixed) 1 else 20, .tree, 0, .generic);
+        var evaluation: policy.TreeEvaluation = .{};
+        const chosen = controller.chooseTreeBootstrapControlled(&merged, 0, 0, 9, 0, &native, &evaluation, .linear_gdn);
+        if (scenario == .faster_mixed) {
+            try std.testing.expectEqualDeep(mixed, chosen);
+            try std.testing.expect(!evaluation.entries[0].retained_native);
+        } else {
+            try std.testing.expectEqualDeep(native, chosen);
+            try std.testing.expect(evaluation.entries[0].retained_native);
+        }
+        try std.testing.expectEqual(chosen.variant(.linear_gdn), evaluation.entries[0].variant);
+    }
+}
+
+test "native action wins exact economic ties but not a better mixed action" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    const native = neuralTree(99, &.{10}, &.{-1}, &.{0}, &.{0.5}, 1);
+    const tied = lookupTree(99, &.{vote(11, null, 1, 0.5, 4)}, 4, &controller.cal, 1);
+    controller.prices.observe(2, 10, .tree, 0, .generic);
+    const retained = controller.chooseTreeBootstrapControlled(&tied, 0, 5, 2, 0, &native, null, .generic);
+    try std.testing.expectEqualDeep(native, retained);
+    const better = lookupTree(99, &.{vote(11, null, 1, 0.75, 4)}, 4, &controller.cal, 1);
+    const selected = controller.chooseTreeBootstrapControlled(&better, 0, 5, 2, 0, &native, null, .generic);
+    try std.testing.expectEqualDeep(better, selected);
+}
+
+test "native copy preserves actual incumbent without pruning lookup challenger metadata" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    _ = controller.observeSpecRemainingProbe(30, 3, 0, 0);
+    controller.observePlain(9, 0);
+    controller.prices.observe(2, 12, .tree, 0, .generic);
+    controller.prices.observe(4, 20, .tree, 0, .generic);
+    var offer = Tree.chain(10, &.{ 11, 12, 13 }, 1, 1);
+    const original = offer;
+    var evaluation: RouteEvaluation = .{};
+    const unknown = route(&controller, &offer, 0, 2, 4, .generic, &evaluation, 9);
+    try std.testing.expect(unknown.decision.skip and unknown.decision.native_copy);
+    try std.testing.expectEqual(Alternative.native_copy, unknown.source);
+    try std.testing.expectEqual(policy.RouteDecision.Reason.native_copy_unmeasured, unknown.decision.reason);
+    try std.testing.expect(unknown.decision.native_copy_ms == null and unknown.decision.native_copy_tokens == null);
+    try std.testing.expectEqual(@as(u32, 4), unknown.lookup_rows);
+    try std.testing.expectEqual(@as(f32, 4), unknown.lookup_expected_tokens);
+    try std.testing.expectEqual(@as(f32, 5.5), unknown.lookup_ms.?);
+    try std.testing.expectEqual(@as(f32, 20), unknown.lookup_verify_ms.?);
+    try std.testing.expectEqual(@as(usize, 3), evaluation.len);
+    try std.testing.expectEqualDeep(original, offer);
+    _ = controller.observeNativeCopyRemaining(100, 9, 9, 0);
+    _ = controller.observeNativeCopyRemaining(8, 4, 9, 0);
+    const known = route(&controller, &offer, 0, 2, 4, .generic, null, 9);
+    try std.testing.expect(known.decision.skip and known.decision.native_copy);
+    try std.testing.expectEqual(Alternative.native_copy, known.source);
+    try std.testing.expectEqual(@as(f32, 2.5), known.decision.native_copy_ms.?);
+    try std.testing.expectEqual(@as(f32, 4), known.decision.native_copy_tokens.?);
+    try std.testing.expectEqual(unknown.lookup_ms, known.lookup_ms);
+    try std.testing.expectEqual(unknown.lookup_rows, known.lookup_rows);
+    try std.testing.expectEqualDeep(original, offer);
+}
+
+test "strictly cheaper lookup and plain displace copy with their own executable geometry" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    _ = controller.observeSpecRemainingProbe(10, 1, 0, 0);
+    _ = controller.observeNativeCopyRemaining(6, 2, 4, 0);
+    _ = controller.observeNativeCopyRemaining(6, 2, 4, 0);
+    controller.prices.observe(2, 1, .tree, 0, .generic);
+    var offer = Tree.chain(10, &.{ 11, 12, 13 }, 1, 1);
+    const original = offer;
+    const lookup = route(&controller, &offer, 0, 0, 4, .generic, null, 4);
+    try std.testing.expect(lookup.decision.skip and !lookup.decision.native_copy);
+    try std.testing.expectEqual(Alternative.lookup, lookup.source);
+    try std.testing.expectEqual(@as(usize, 2), offer.len);
+    try std.testing.expectEqual(@as(f32, 0.5), lookup.lookup_ms.?);
+    try std.testing.expectEqual(@as(f32, 3), lookup.decision.native_copy_ms.?);
+    controller.observePlain(0.25, 0);
+    offer = original;
+    const plain = route(&controller, &offer, 0, 0, 4, .generic, null, 4);
+    try std.testing.expect(plain.decision.skip and !plain.decision.native_copy);
+    try std.testing.expectEqual(Alternative.plain, plain.source);
+    try std.testing.expectEqual(@as(usize, 1), offer.len);
+    try std.testing.expectEqual(lookup.lookup_ms, plain.lookup_ms);
+    try std.testing.expectEqual(lookup.decision.native_copy_ms, plain.decision.native_copy_ms);
+    try std.testing.expectEqual(@as(f32, 2), plain.decision.native_copy_tokens.?);
+}
+
+test "assistant victory and native copy exact tie retain unpruned lookup evidence" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    _ = controller.observeSpecRemainingProbe(6, 2, 0, 0);
+    _ = controller.observeNativeCopyRemaining(6, 2, 4, 0);
+    _ = controller.observeNativeCopyRemaining(6, 2, 4, 0);
+    controller.prices.observe(2, 6, .tree, 0, .generic);
+    var offer = Tree.chain(10, &.{ 11, 12, 13 }, 1, 1);
+    const original = offer;
+    const tie = route(&controller, &offer, 0, 0, 4, .generic, null, 4);
+    try std.testing.expect(tie.decision.skip and tie.decision.native_copy);
+    try std.testing.expectEqual(Alternative.native_copy, tie.source);
+    try std.testing.expectEqual(tie.decision.native_copy_ms, tie.lookup_ms);
+    try std.testing.expectEqual(tie.decision.native_copy_ms, tie.decision.assistant_ms);
+    try std.testing.expectEqualDeep(original, offer);
+    for (0..7) |_| _ = controller.observeSpecRemainingProbe(1, 2, 0, 0);
+    const assistant = route(&controller, &offer, 0, 0, 4, .generic, null, 4);
+    try std.testing.expect(!assistant.decision.skip and !assistant.decision.native_copy);
+    try std.testing.expectEqual(policy.RouteDecision.Reason.assistant, assistant.decision.reason);
+    try std.testing.expectEqual(tie.decision.native_copy_ms, assistant.decision.native_copy_ms);
+    try std.testing.expectEqualDeep(original, offer);
 }

@@ -27,6 +27,8 @@ import argparse
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import csv
+import ctypes
+import functools
 import hashlib
 import json
 import math
@@ -38,6 +40,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import threading
 import subprocess
 import sys
@@ -134,7 +137,8 @@ def runtime_identity(binary):
     if not executable.is_file():
         raise BenchError("runtime executable is missing: " + str(executable))
     environment = clean_environment("legacy")
-    architecture = os.uname().machine
+    kernel = os.uname()
+    architecture = kernel.machine
 
     def command(arguments):
         try:
@@ -232,9 +236,11 @@ def runtime_identity(binary):
                            "sha256": digest(path) if path.is_file() else None}
     if mlx_images and not any(asset["exists"] for asset in metal.values()):
         raise BenchError("linked MLX runtime has no identifiable Metal-library asset")
-    return {"version": 1, "executable": str(executable), "architecture": architecture,
+    return {"version": 2, "executable": str(executable), "architecture": architecture,
             "os_version": command(["/usr/bin/sw_vers"]).strip(),
-            "kernel": dict(zip(("system", "node", "release", "version", "machine"), os.uname())),
+            # DHCP/network changes can rename the host without changing any code.
+            "kernel": {"system": kernel.sysname, "release": kernel.release,
+                       "version": kernel.version, "machine": kernel.machine},
             "images": images, "load_edges": edges, "system_libraries": sorted(system_libraries),
             "metal_assets": metal, "metal_search_directories": sorted(str(path) for path in metal_directories),
             "loading_policy": {"DYLD_*": "removed", "LD_LIBRARY_PATH": "removed", "LD_PRELOAD": "removed",
@@ -258,7 +264,7 @@ BENCHMARK_EXPERIMENT_KEYS = {
     "MLX_SERVE_LOOKUP_RECEIPTS", "MLX_SERVE_LOOKUP_PRICES", "MLX_SERVE_ROW_EXACT",
     "MLX_SERVE_LOOKUP_PRICE_TRACE", "MLX_SERVE_LOOKUP_COUNTERFACTUAL",
     "MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION", "MLX_SERVE_LOOKUP_COUNTERFACTUAL_PREPARATION",
-    "MLX_SERVE_LOOKUP_CANDIDATES", "MLX_SERVE_LOOKUP_BACKOFF",
+    "MLX_SERVE_LOOKUP_CANDIDATES", "MLX_SERVE_LOOKUP_BACKOFF", "MLX_SERVE_LOOKUP_TRACE",
 }
 
 
@@ -295,9 +301,11 @@ def clean_environment(tier, corpus=None, store=None, experiment=None):
             value = str(value)
             if key == "MLX_SERVE_LOOKUP_SELECTION" and not re.fullmatch(r"adaptive|cut|max|fixed:[1-9][0-9]*", value):
                 raise BenchError("invalid lookup row selection")
-            if key in ("MLX_SERVE_LOOKUP_STORE_WRITE", "MLX_SERVE_LOOKUP_RECEIPTS",
+            if key in ("MLX_SERVE_LOOKUP_STORE_WRITE", "MLX_SERVE_LOOKUP_TRACE",
                        "MLX_SERVE_LOOKUP_CANDIDATES", "MLX_SERVE_LOOKUP_BACKOFF") and value not in ("0", "1"):
                 raise BenchError("invalid benchmark boolean")
+            if key == "MLX_SERVE_LOOKUP_RECEIPTS" and value not in ("0", "1", "commit"):
+                raise BenchError("invalid lookup receipt mode")
             if key == "MLX_SERVE_ROW_EXACT" and value != "1":
                 raise BenchError("row-exact mode requires an explicit value of 1")
             if key == "MLX_SERVE_LOOKUP_PRICE_TRACE" and value != "1":
@@ -344,13 +352,92 @@ def owners(port):
     return {int(pid) for pid in result.stdout.split()}
 
 
+class DarwinRusageV4(ctypes.Structure):
+    """SDK sys/resource.h rusage_info_v4; kernel-owned lifetime high-water mark."""
+    _fields_ = [('ri_uuid', ctypes.c_uint8 * 16)] + [(name, ctypes.c_uint64) for name in (
+        'ri_user_time ri_system_time ri_pkg_idle_wkups ri_interrupt_wkups ri_pageins '
+        'ri_wired_size ri_resident_size ri_phys_footprint ri_proc_start_abstime ri_proc_exit_abstime '
+        'ri_child_user_time ri_child_system_time ri_child_pkg_idle_wkups ri_child_interrupt_wkups '
+        'ri_child_pageins ri_child_elapsed_abstime ri_diskio_bytesread ri_diskio_byteswritten '
+        'ri_cpu_time_qos_default ri_cpu_time_qos_maintenance ri_cpu_time_qos_background '
+        'ri_cpu_time_qos_utility ri_cpu_time_qos_legacy ri_cpu_time_qos_user_initiated '
+        'ri_cpu_time_qos_user_interactive ri_billed_system_time ri_serviced_system_time '
+        'ri_logical_writes ri_lifetime_max_phys_footprint ri_instructions ri_cycles '
+        'ri_billed_energy ri_serviced_energy ri_interval_max_phys_footprint ri_runnable_time'
+    ).split()]
+
+
+@functools.cache
+def darwin_usage_api():
+    library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    fn = library.proc_pid_rusage
+    fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    fn.restype = ctypes.c_int
+    return fn
+
+
 def memory(pid):
+    if sys.platform == 'darwin':
+        try:
+            usage = DarwinRusageV4()
+            if darwin_usage_api()(pid, 4, ctypes.byref(usage)) != 0:
+                raise OSError(ctypes.get_errno(), 'proc_pid_rusage failed')
+            return {'child_rss_kib': usage.ri_resident_size / 1024,
+                    'physical_footprint_bytes': usage.ri_phys_footprint,
+                    'lifetime_peak_physical_footprint_bytes': usage.ri_lifetime_max_phys_footprint,
+                    'process_start_abstime': usage.ri_proc_start_abstime,
+                    'source': 'proc_pid_rusage_v4', 'scope': 'owned process; peak is lifetime, not per-request'}
+        except (OSError, AttributeError) as exc:
+            return {'child_rss_kib': None, 'source': 'proc_pid_rusage_v4', 'error': str(exc)}
     try:
         result = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
                                 capture_output=True, text=True, timeout=5)
         return {"child_rss_kib": int(result.stdout.strip())}
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return {"child_rss_kib": None}
+
+
+def allocator_memory(server):
+    """Existing read-only /props counters; never reset the model's peak or clear its cache."""
+    keys = ('active_bytes', 'cache_bytes', 'peak_bytes', 'weights_bytes', 'kv_cache_bytes')
+    try:
+        server.assert_owned()
+        request = urllib.request.Request(server.base + '/props', headers=getattr(server, 'auth_headers', {}))
+        with HTTP.open(request, timeout=5) as response:
+            value = json.load(response)['memory']
+        if any(type(value.get(key)) is not int or value[key] < 0 for key in keys):
+            raise ValueError('missing or invalid MLX memory counters')
+        return {'complete': True, 'source': 'owned_server_props',
+                'scope': 'MLX active/reclaimable/peak; not additive with process footprint',
+                **{key: value[key] for key in keys}}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, HTTPException) as exc:
+        return {'complete': False, 'error': type(exc).__name__ + ': ' + str(exc)}
+
+
+def storage_size(root):
+    """Cache files only; allocated bytes are filesystem accounting, not APFS-exclusive extents."""
+    seen, logical, allocated, files, links = set(), 0, 0, 0, 0
+    def failed(exc):
+        raise exc
+    try:
+        if not stat.S_ISDIR(Path(root).lstat().st_mode):
+            return {'complete': False, 'error': 'storage root must be a real directory, not a symlink or file'}
+        for base, dirs, names in os.walk(root, followlinks=False, onerror=failed):
+            for name in dirs + names:
+                info = (Path(base) / name).lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    links += 1
+                elif stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) not in seen:
+                    seen.add((info.st_dev, info.st_ino))
+                    files += 1
+                    logical += info.st_size
+                    allocated += info.st_blocks * 512
+        return {'logical_file_bytes': logical, 'allocated_file_bytes': allocated,
+                'unique_regular_files': files, 'symlinks_not_followed': links,
+                'complete': links == 0,
+                'scope': 'unique regular-file inodes; excludes directories; allocated is not exclusive APFS space'}
+    except OSError as exc:
+        return {'complete': False, 'error': str(exc)}
 
 
 def machine_state():

@@ -2,6 +2,8 @@
 import argparse
 from contextlib import ExitStack
 import copy
+import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +17,210 @@ import lookup_canonical_window as canonical
 def machine_state():
     return {'power_source': 'AC', 'power_settings': 'fixed', 'thermal': 'No thermal warning',
             'pressure_level': 1, 'swap_used_bytes': 0, 'swapins': 0, 'swapouts': 0}
+
+
+def canonical_probe_fixture(opt_in=True, vendor_disable=False):
+    captures = []
+    def append(request, metrics, identity, thinking=False):
+        captures.append({'request_index': len(captures) + 4, 'request_id': identity,
+                         'request': request, 'path': '/v1/chat/completions', 'http_status': 200,
+                         'metrics': metrics, 'response': {'complete': True, 'text': 'exact'},
+                         'raw_response': json.dumps({'choices': [{'message': {
+                             'content': '4', 'reasoning_content': 'reason' if thinking else ''}}]})})
+    setup = {'messages': [{'role': 'user', 'content': 'What is 2 + 2? Reply with just the number.'}],
+             'max_completion_tokens': 512, 'temperature': 0}
+    append(dict(setup), [], 'detect', thinking=not opt_in)
+    if opt_in:
+        append(dict(setup, max_completion_tokens=2560, reasoning_effort='low',
+                    tools=[{'function': {'name': 'get_weather'}}]), [], 'opt-in')
+    append(dict(setup, reasoning_effort='none'), [], 'resolve', thinking=vendor_disable)
+    if vendor_disable:
+        append(dict(setup, reasoning_effort='none', chat_template_kwargs={'enable_thinking': False}),
+               [], 'vendor')
+    prompts = {'decode': 'retryWithBackoff<T>', 'drift': 'retryWithBackoff<T>',
+               'prefill': 'The archive records the following entry.',
+               'predictable': "You are a text normaliser. Output the user's text unchanged.",
+               'novel': 'Invent an original, surprising paragraph of stream-of-consciousness prose.',
+               'prefix': 'Operations handbook, section on shift handover.',
+               'calibration': 'withRetryBudget<T>'}
+    for slot in canonical.benchmark_slots():
+        stage, index = slot['stage'], slot['index']
+        prompt = prompts.get(stage, '')
+        if stage == 'context':
+            prompt = 'withRetryBudget<T>' if index % 2 == 0 else 'Count from 1 to 200, one number per line'
+        elif stage == 'batch':
+            prompt = 'Write a short descriptive paragraph. Subject number ' + str(index) + ':'
+        tag_index = index // 2 if stage in ('prefix', 'context') else index
+        tag = '[probe ' + stage + '-' + str(tag_index) + ']'
+        role = 'system' if stage == 'predictable' else 'user'
+        request = {'messages': [{'role': role, 'content': prompt + ' ' + tag}],
+                   'max_completion_tokens': slot['max_tokens'], 'stream': True}
+        identity = stage + ':' + str(0 if stage == 'prefix' else index)
+        append(request, list(slot['metrics']), identity)
+    return {'responses': captures, 'request_sequence': [c['request_id'] for c in captures],
+            'metric_request_counts': {metric: 3 for metric in canonical.METRICS}}
+
+
+class ResourceAccounting(unittest.TestCase):
+    def test_cache_storage_deduplicates_hardlinks_and_rejects_missing_or_external_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / 'cache'
+            cache.mkdir()
+            payload = cache / 'tokens.bin'
+            payload.write_bytes(b'1234567')
+            os.link(payload, cache / 'alias.bin')
+            measured = route.r.storage_size(cache)
+            self.assertTrue(measured['complete'])
+            self.assertEqual(measured['logical_file_bytes'], 7)
+            self.assertEqual(measured['unique_regular_files'], 1)
+            self.assertEqual(measured['allocated_file_bytes'], payload.stat().st_blocks * 512)
+            (root / 'outside').write_bytes(b'unrelated weights')
+            (cache / 'external').symlink_to(root / 'outside')
+            measured = route.r.storage_size(cache)
+            self.assertFalse(measured['complete'])
+            self.assertEqual(measured['logical_file_bytes'], 7)
+            self.assertEqual(measured['symlinks_not_followed'], 1)
+            self.assertFalse(route.r.storage_size(root / 'missing')['complete'])
+            (root / 'linked-root').symlink_to(cache, target_is_directory=True)
+            self.assertFalse(route.r.storage_size(root / 'linked-root')['complete'])
+            self.assertFalse(route.r.storage_size(payload)['complete'])
+
+
+class CanonicalWorkloadCoverage(unittest.TestCase):
+    def test_complete_body_accepts_each_source_defined_setup_branch(self):
+        for opt_in in (False, True):
+            for vendor in (False, True):
+                probe = canonical_probe_fixture(opt_in, vendor)
+                result = canonical.workload_coverage(probe)
+                self.assertTrue(result['complete'], result['errors'])
+                self.assertEqual(result['benchmark_requests'], 34)
+                self.assertEqual(result['setup_requests'], 2 + int(opt_in) + int(vendor))
+                self.assertEqual(result['captured_requests'], 36 + int(opt_in) + int(vendor))
+
+    def test_every_auxiliary_and_measured_stage_is_required(self):
+        for index in range(len(canonical_probe_fixture()['responses'])):
+            probe = canonical_probe_fixture()
+            probe['responses'].pop(index)
+            probe['request_sequence'] = [c['request_id'] for c in probe['responses']]
+            self.assertFalse(canonical.workload_coverage(probe)['complete'], index)
+
+    def test_count_preserving_corruption_and_declared_counts_do_not_prove_coverage(self):
+        mutations = [
+            lambda p: p['responses'][-1]['request'].update(max_completion_tokens=8),
+            lambda p: p['responses'][5].update(metrics=[]),
+            lambda p: p['responses'][0].update(metrics=['ttftMs']),
+            lambda p: p['responses'][1]['request'].update(reasoning_effort='none'),
+            lambda p: p['responses'][3].update(request_index=4),
+            lambda p: p['responses'][3].update(http_status=500),
+            lambda p: p['request_sequence'].pop(),
+            lambda p: p['responses'][-1]['response'].update(complete=False),
+        ]
+        for mutate in mutations:
+            probe = canonical_probe_fixture()
+            mutate(probe)
+            self.assertFalse(canonical.workload_coverage(probe)['complete'])
+
+    def test_missing_optional_setup_is_rejected_when_response_requires_branch(self):
+        for opt_in, vendor, remove in ((True, False, 1), (False, True, 2)):
+            probe = canonical_probe_fixture(opt_in, vendor)
+            probe['responses'].pop(remove)
+            probe['request_sequence'] = [c['request_id'] for c in probe['responses']]
+            self.assertFalse(canonical.workload_coverage(probe)['complete'])
+
+    def test_summary_rechecks_structure_even_with_completion_marker(self):
+        plan = CanonicalIdentity().plan()
+        probe = canonical_probe_fixture()
+        probe['responses'].pop()
+        receipt = {'before': plan['runtime_identity'], 'after': plan['runtime_identity']}
+        boots = [{'completed': True, 'assets_preserved': True, 'numerical_mode': 'row-exact'}]
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            (out / 'worker-complete.json').touch()
+            with mock.patch.object(route, 'load_json', side_effect=lambda path: probe if path.name == 'probe.json' else receipt), mock.patch.object(route, 'read_rows', side_effect=lambda path: (boots if path.name == 'boots.jsonl' else [], [])), mock.patch.object(route.r, 'runtime_identity', return_value=plan['runtime_identity']), mock.patch.object(route, 'save'):
+                result = canonical.summarize(out, plan, final=True, supervisor={'exit_code': 0, 'timed_out': False})
+        self.assertFalse(result['complete'])
+        self.assertFalse(result['workload_coverage']['complete'])
+
+    def test_worker_rejects_incomplete_body_before_writing_completion_marker(self):
+        plan = CanonicalIdentity().plan()
+        plan.update(probe_assets={}, probe_cmd=['probe'])
+        probe = canonical_probe_fixture()
+        probe['responses'].pop()
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(mock.patch.object(route, 'load_json', return_value=plan))
+            stack.enter_context(mock.patch.object(canonical, 'source_hashes', return_value=plan['source_hashes']))
+            stack.enter_context(mock.patch.object(route.r, 'digest', return_value='hash'))
+            stack.enter_context(mock.patch.object(route.r, 'runtime_identity', return_value=plan['runtime_identity']))
+            stack.enter_context(mock.patch.object(route.r, 'controlled_probe_command', return_value=['probe']))
+            stack.enter_context(mock.patch.object(route, 'owned_boot'))
+            stack.enter_context(mock.patch.object(route.r, 'preflight_context', return_value={}))
+            stack.enter_context(mock.patch.object(route.r, 'canonical_probe', return_value=probe))
+            stack.enter_context(mock.patch.object(route.r, 'append'))
+            stack.enter_context(mock.patch.object(canonical.signal, 'signal'))
+            save = stack.enter_context(mock.patch.object(route, 'save'))
+            self.assertEqual(canonical.worker(Path(directory)), 1)
+        self.assertFalse(any(call.args[0].name == 'worker-complete.json' for call in save.call_args_list))
+        coverage = next(call.args[1] for call in save.call_args_list if call.args[0].name == 'workload-coverage.json')
+        self.assertFalse(coverage['complete'])
+
+
+class NativeCopyReceipts(unittest.TestCase):
+    def sample(self, known=False):
+        ms, tokens = (12.0, 7.5) if known else (None, None)
+        receipt = {
+            'family': 'dflash', 'kind': 'tree', 'selection': 'adaptive',
+            'lookup_candidates': True, 'candidate_rows': 4, 'legal_rows': 4,
+            'requested_rows': 0, 'rows': 8, 'accepted': 7, 'committed': 8,
+            'assistant': False, 'selected_local': 7, 'selected_neural': 0,
+            'selected_corpus': 0, 'selected_persistent': 0,
+            'lookup_order': 26, 'lookup_confidence': 1.0, 'selection_overhead_ms': None,
+            'predicted_tokens': tokens, 'executed_geometry_hash': 123,
+            'native_copy': {'rows': 8, 'backing_length': 26, 'geometry_hash': 123,
+                            'selected': True, 'ms_per_token': ms, 'expected_tokens': tokens},
+            'route': {'alternative_source': 'native_copy', 'decision': {
+                'skip': True, 'reason': 'native_copy' if known else 'native_copy_unmeasured',
+                'assistant_ms': 20.0, 'alternative_ms': ms, 'skipped': 0, 'interval': 12,
+                'native_copy': True, 'native_copy_ms': ms, 'native_copy_tokens': tokens}}}
+        return {'arm': 'persistent', 'family': 'dflash', 'arm_definition': {'actual': 'adaptive'},
+                'response': {'http_status': 200, 'text': 'answer', 'finish_reason': 'stop',
+                             'usage': {'prompt_tokens': 1, 'completion_tokens': 8, 'total_tokens': 9}},
+                'commits': [{'prompt_ids': [1], 'generated_ids': list(range(2, 10)), 'finish_reason': 'stop'}],
+                'rounds': [receipt], 'seconds': 1.0, 'body': {'max_tokens': 32}}
+
+    def test_separate_copy_geometry_and_unknown_prediction_are_explicit(self):
+        for known in (False, True):
+            self.assertEqual(route.check_sample(self.sample(known)), [])
+        sample = self.sample()
+        sample['rounds'][0]['predicted_tokens'] = 8
+        self.assertIn('round_0:native_copy_prediction_mismatch', route.check_sample(sample))
+
+    def test_copy_claim_requires_matching_execution_identity_and_economics(self):
+        changes = [('executed_geometry_hash', 456, 'native_copy_execution_mismatch'),
+                   ('assistant', True, 'native_copy_execution_mismatch'),
+                   ('rows', 7, 'native_copy_execution_mismatch'),
+                   ('selected_neural', 1, 'native_copy_origin_mismatch'),
+                   ('native_copy', None, 'missing_native_copy_identity')]
+        for key, value, expected in changes:
+            with self.subTest(field=key):
+                sample = self.sample(True)
+                sample['rounds'][0][key] = value
+                self.assertIn('round_0:' + expected, route.check_sample(sample))
+        sample = self.sample(True)
+        sample['rounds'][0]['native_copy']['ms_per_token'] = 8
+        self.assertIn('round_0:native_copy_economics_mismatch', route.check_sample(sample))
+        sample = self.sample(True)
+        sample['rounds'][0]['route']['decision']['alternative_ms'] = 99
+        self.assertIn('round_0:native_copy_alternative_price_mismatch', route.check_sample(sample))
+
+    def test_copy_cannot_masquerade_as_a_forced_or_ineligible_action(self):
+        for field, value in [('selection', 'fixed'), ('lookup_candidates', False), ('requested_rows', 8)]:
+            sample = self.sample()
+            sample['rounds'][0][field] = value
+            self.assertIn('round_0:native_copy_outside_adaptive_suffix_route', route.check_sample(sample))
+        sample = self.sample()
+        sample['rounds'][0]['native_copy']['backing_length'] = 1
+        self.assertIn('round_0:invalid_native_copy_eligibility', route.check_sample(sample))
 
 
 class RouteQualification(unittest.TestCase):
@@ -244,8 +450,8 @@ class CanonicalIdentity(unittest.TestCase):
                     identities = [changed if mutation_stage == 'before' else original,
                                   changed if mutation_stage == 'after' else original]
                     documents = {out / 'plan.json': plan, Path('source/plan.json'): previous,
-                                 Path('source/probe.json'): {}}
-                    with mock.patch.object(canonical, 'source_hashes', return_value=plan['source_hashes']), mock.patch.object(route, 'load_json', side_effect=lambda path: documents[path]), mock.patch.object(route.r, 'runtime_identity', side_effect=identities) as runtime, mock.patch.object(route.r, 'digest', return_value='hash'), mock.patch.object(route.r, 'controlled_probe_command', return_value=['probe']), mock.patch.object(route, 'owned_boot') as boot, mock.patch.object(route.r, 'preflight_context', return_value={}), mock.patch.object(route.r, 'canonical_probe', return_value={}), mock.patch.object(route.r, 'replay_canonical', return_value={'successful': True, 'supported': True}) as replay, mock.patch.object(route, 'save') as save, mock.patch.object(route.r, 'append'), mock.patch.object(canonical.signal, 'signal'):
+                                 Path('source/probe.json'): canonical_probe_fixture()}
+                    with mock.patch.object(canonical, 'source_hashes', return_value=plan['source_hashes']), mock.patch.object(route, 'load_json', side_effect=lambda path: documents[path]), mock.patch.object(route.r, 'runtime_identity', side_effect=identities) as runtime, mock.patch.object(route.r, 'digest', return_value='hash'), mock.patch.object(route.r, 'controlled_probe_command', return_value=['probe']), mock.patch.object(route, 'owned_boot') as boot, mock.patch.object(route.r, 'preflight_context', return_value={}), mock.patch.object(route.r, 'canonical_probe', return_value=canonical_probe_fixture()), mock.patch.object(route.r, 'replay_canonical', return_value={'successful': True, 'supported': True}) as replay, mock.patch.object(route, 'save') as save, mock.patch.object(route.r, 'append'), mock.patch.object(canonical.signal, 'signal'):
                         status = canonical.worker(out)
                     self.assertEqual(status, 0 if mutation_stage == 'none' else 1)
                     self.assertEqual(runtime.call_count, 1 if mutation_stage == 'before' else 2)
@@ -427,19 +633,13 @@ class CanonicalClaims(unittest.TestCase):
         self.assertEqual(values['prefixCache:warmTtftMs'], 4)
         self.assertEqual(values['batching:aggregateTokPerSec'], 40)
 
-    def aggregate_fixture(self, directory, mutate=None, live_runtime=None, mutate_paths=None):
+    def aggregate_fixture(self, directory, mutate=None, live_runtime=None, mutate_paths=None,
+                          setup_flags=(True, False)):
         base = Path(directory).resolve()
         config = CanonicalIdentity().cohort(unbounded=True)
         config.update(quartets=4, schedule=canonical.declared_schedule(4))
         documents, boots, paths = {}, {}, []
-        groups = [('decodeTokPerSec', 'ttftMs'), ('prefillTokPerSec',),
-                  ('speculative:predictableTokPerSec',), ('speculative:novelTokPerSec',),
-                  ('context:512:decodeTokPerSec', 'context:512:ttftMs', 'context:512:prefillTokPerSec')]
-        captures = [{'request_id': str(index), 'request_index': index, 'metrics': [],
-                     'response': {'complete': True, 'text': 'exact'}} for index in range(34)]
-        for index, metrics in enumerate(groups):
-            for rep in range(3):
-                captures[index * 3 + rep]['metrics'] = list(metrics)
+        captures = canonical_probe_fixture(*setup_flags)['responses']
         for slot in config['schedule']:
             index, mode = slot['slot'], slot['mode']
             root, replay_root = base / str(index), base / ('replay-' + str(index))
@@ -476,7 +676,7 @@ class CanonicalClaims(unittest.TestCase):
             documents[replay_root / 'plan.json'] = dict(plan, phase='replay', source=str(root))
             documents[replay_root / 'summary.json'] = {'complete': True, 'final': True}
             documents[replay_root / 'replay.json'] = {
-                'successful': True, 'supported': True, 'captured_requests': 34,
+                'successful': True, 'supported': True, 'captured_requests': len(captures),
                 'reference_modes': ['serial'],
                 'results': [{'reference_matches': 1} for _ in captures]}
             boots[root / 'boots.jsonl'] = [{
@@ -529,6 +729,23 @@ class CanonicalClaims(unittest.TestCase):
         self.assertEqual(len(result['physical_observations']), 32)
         self.assertEqual({row['quartets'] for row in result['statistics']['per_family']}, {4})
         self.assertFalse(result['fastest_native']['supported'])
+
+    def test_aggregate_replays_every_capture_for_variable_setup_branches(self):
+        for setup in ((False, False), (True, True)):
+            with self.subTest(setup=setup), tempfile.TemporaryDirectory() as directory:
+                status, result = self.aggregate_fixture(directory, setup_flags=setup)
+            self.assertEqual(status, 0)
+            self.assertTrue(result['measurement_qualified'])
+
+    def test_replay_cannot_cover_only_the_benchmark_body(self):
+        def mutate(documents, boots, config):
+            replay = next(value for path, value in documents.items() if path.name == 'replay.json')
+            replay.update(captured_requests=34, results=replay['results'][-34:])
+        with tempfile.TemporaryDirectory() as directory:
+            status, result = self.aggregate_fixture(directory, mutate)
+        self.assertEqual(status, 1)
+        self.assertFalse(result['measurement_qualified'])
+        self.assertTrue(any(error.startswith('incomplete_full_request_replay:') for error in result['errors']))
 
     def test_missing_or_duplicate_physical_windows_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

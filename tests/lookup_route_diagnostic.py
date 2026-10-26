@@ -59,7 +59,8 @@ SCENARIO_ARMS = {'local': ('legacy', 'adaptive', 'cut', 'fixed8'),
                  'baselines': ('dflash-legacy', 'mtp-legacy')}
 REUSE_CASES = ('lookup-edit', 'prose')
 ROUTE_KEYS = {'skip', 'reason', 'assistant_ms', 'alternative_ms', 'skipped', 'interval'}
-REASONS = {'unmeasured', 'invalid_alternative', 'assistant', 'alternative', 'recovery'}
+REASONS = {'unmeasured', 'invalid_alternative', 'assistant', 'alternative', 'recovery',
+           'native_copy', 'native_copy_unmeasured'}
 
 
 def arm_definitions(scenario, family, arms):
@@ -234,6 +235,9 @@ def prepare_boot_assets(folder, plan, arm):
         if before[key] != plan['reuse']['hashes'][tier]:
             raise r.BenchError('boot fixture does not match frozen seed')
     save(folder / 'assets-before.json', before)
+    save(folder / 'storage-before.json', {'store': r.storage_size(store),
+         'corpus': r.storage_size(corpus) if corpus else None,
+         'scope': 'runtime lookup assets only; excludes model/drafter weights and benchmark artifacts'})
     return store, corpus, before
 
 
@@ -244,6 +248,9 @@ def finish_boot_assets(folder, plan, store, corpus, before):
     evidence = {'before': before, 'after': after, 'unchanged': before == after,
                 'seed_hashes_after': seeds,
                 'seeds_unchanged': seeds == plan['reuse']['hashes'] if seeds is not None else True}
+    save(folder / 'storage-after.json', {'store': r.storage_size(store),
+         'corpus': r.storage_size(corpus) if corpus else None,
+         'scope': 'runtime lookup assets only; write-disabled frozen benchmarks do not measure live growth'})
     save(folder / 'assets-after.json', evidence)
     return evidence
 
@@ -255,8 +262,8 @@ def owned_boot(out, folder, plan, args, pair, arm, telemetry=None):
     machine_before = {'timestamp': time.time(), **r.machine_state()}
     save(folder / 'machine-before.json', machine_before)
     experiment = dict(spec.get('experiment', {}))
-    experiment.update(MLX_SERVE_LOOKUP_RECEIPTS='1', MLX_SERVE_LOOKUP_STORE_WRITE='0',
-                      MLX_SERVE_LOOKUP_SELECTION=spec['selection'])
+    experiment.setdefault('MLX_SERVE_LOOKUP_RECEIPTS', '1')
+    experiment.update(MLX_SERVE_LOOKUP_STORE_WRITE='0', MLX_SERVE_LOOKUP_SELECTION=spec['selection'])
     if plan.get('numerical_mode', 'stock') == 'row-exact':
         experiment['MLX_SERVE_ROW_EXACT'] = '1'
     if plan.get('price_trace'):
@@ -276,11 +283,15 @@ def owned_boot(out, folder, plan, args, pair, arm, telemetry=None):
                 raise r.BenchError('owned server numerical mode differs from plan')
             save(folder / 'numerical-mode.json', {'numerical_mode': server.numerical_mode,
                 'explicit_activation_observed': server.numerical_mode == 'row-exact'})
+            save(folder / 'memory-loaded.json', r.memory(server.proc.pid))
+            save(folder / 'allocator-loaded.json', r.allocator_memory(server))
             if telemetry is not None:
                 telemetry.phase(pair, arm, 'ready')
             try:
                 yield server
             finally:
+                save(folder / 'memory-final.json', r.memory(server.proc.pid))
+                save(folder / 'allocator-final.json', r.allocator_memory(server))
                 if telemetry is not None:
                     telemetry.phase(pair, arm, 'pre_shutdown')
         completed = True
@@ -314,6 +325,67 @@ def origin_evidence(receipts, tier):
                                'selected_acceptance_unproven' if selected else 'no_selected_origin')}
 
 
+
+
+def native_copy_receipt_errors(receipt):
+    """A distinct baseline copy is not a subset of the bounded lookup offer."""
+    errors = []
+    route = receipt.get('route')
+    decision = route.get('decision', {}) if isinstance(route, dict) else {}
+    if not isinstance(decision, dict):
+        return ['malformed_native_copy_decision'] if receipt.get('native_copy') is not None else []
+    copy = receipt.get('native_copy')
+    keys = {'native_copy', 'native_copy_ms', 'native_copy_tokens'}
+    selected = decision.get('native_copy', False)
+    source = route.get('alternative_source') if isinstance(route, dict) else None
+    reason = decision.get('reason')
+    copy_reason = reason in ('native_copy', 'native_copy_unmeasured')
+    if keys.intersection(decision):
+        if not keys.issubset(decision) or type(selected) is not bool:
+            errors.append('incomplete_native_copy_decision')
+    if copy is None:
+        if selected or source == 'native_copy' or copy_reason or any(
+                decision.get(key) is not None for key in ('native_copy_ms', 'native_copy_tokens')):
+            errors.append('missing_native_copy_identity')
+        return errors
+    required = {'rows', 'backing_length', 'geometry_hash', 'selected', 'ms_per_token', 'expected_tokens'}
+    if not isinstance(copy, dict) or not required.issubset(copy):
+        return errors + ['malformed_native_copy_identity']
+    if (receipt.get('family') != 'dflash' or receipt.get('selection') != 'adaptive'
+            or receipt.get('lookup_candidates') is not True or receipt.get('requested_rows') != 0):
+        errors.append('native_copy_outside_adaptive_suffix_route')
+    rows = copy['rows']
+    valid_rows = type(rows) is int and 2 <= rows <= 16
+    if not valid_rows or type(copy['backing_length']) is not int or copy['backing_length'] < 24:
+        errors.append('invalid_native_copy_eligibility')
+    if type(copy['geometry_hash']) is not int or not 0 <= copy['geometry_hash'] < 2**64:
+        errors.append('invalid_native_copy_geometry')
+    if not keys.issubset(decision) or type(copy['selected']) is not bool or copy['selected'] is not selected:
+        errors.append('native_copy_selection_mismatch')
+    ms, tokens = copy['ms_per_token'], copy['expected_tokens']
+    if (ms is None) != (tokens is None) or (
+            ms is not None and (not finite(ms) or ms <= 0 or not finite(tokens)
+                               or not valid_rows or not 1 <= tokens <= rows)):
+        errors.append('invalid_native_copy_economics')
+    if decision.get('native_copy_ms') != ms or decision.get('native_copy_tokens') != tokens:
+        errors.append('native_copy_economics_mismatch')
+    if selected:
+        if (not copy_reason or source != 'native_copy' or decision.get('skip') is not True
+                or receipt.get('assistant') is not False or receipt.get('rows') != rows
+                or receipt.get('executed_geometry_hash') != copy['geometry_hash']):
+            errors.append('native_copy_execution_mismatch')
+        if (reason == 'native_copy_unmeasured') is not (ms is None):
+            errors.append('native_copy_known_state_mismatch')
+        if receipt.get('predicted_tokens') != tokens:
+            errors.append('native_copy_prediction_mismatch')
+        if decision.get('alternative_ms') != ms:
+            errors.append('native_copy_alternative_price_mismatch')
+        if (receipt.get('selected_local') != rows - 1 if valid_rows else True) or any(
+                receipt.get('selected_' + origin) != 0 for origin in ('neural', 'corpus', 'persistent')):
+            errors.append('native_copy_origin_mismatch')
+    elif copy_reason or source == 'native_copy':
+        errors.append('unselected_native_copy_claimed')
+    return errors
 
 
 def check_sample(row):
@@ -369,6 +441,7 @@ def check_sample(row):
             errors.append('serial_speculation_observed')
     for index, receipt in enumerate(rounds):
         prefix = 'round_' + str(index) + ':'
+        errors.extend(prefix + error for error in native_copy_receipt_errors(receipt))
         native_mtp = family == 'mtp' and receipt.get('selection') == 'legacy'
         if not native_mtp and receipt.get('selection') != spec['actual']:
             errors.append(prefix + 'actual_selection_mismatch')
@@ -423,7 +496,7 @@ def check_sample(row):
             for key in ('skipped', 'interval'):
                 if type(decision.get(key)) is not int or decision[key] < 0:
                     errors.append(prefix + 'invalid_' + key)
-            if route.get('alternative_source') not in (None, 'plain', 'lookup'):
+            if route.get('alternative_source') not in (None, 'plain', 'lookup', 'native_copy'):
                 errors.append(prefix + 'invalid_alternative_source')
             if type(decision.get('skip')) is bool and receipt.get('assistant') is not (not decision['skip']):
                 errors.append(prefix + 'route_assistant_mismatch')
@@ -685,6 +758,7 @@ def record_sample(out, folder, server, args, spec, pair, arm, case, rep, telemet
     r.append(out / 'sample-starts.jsonl', {'sample': sample, 'pair': pair, 'arm': arm,
               'case': case['id'], 'rep': rep, 'log_offset': offset, 'time': time.time()})
     original_http = r.HTTP
+    memory_before = r.memory(server.proc.pid)
     boundary = None
     with (sample_dir / 'response.sse').open('wb') as raw:
         try:
@@ -704,6 +778,7 @@ def record_sample(out, folder, server, args, spec, pair, arm, case, rep, telemet
                     save(sample_dir / 'request-boundary.json', boundary)
         finally:
             r.HTTP = original_http
+    memory_after = r.memory(server.proc.pid)
     save(sample_dir / 'response.json', response)
     log = r.settled_log(server, offset, timeout=2)
     (sample_dir / 'receipts.log').write_text(log)
@@ -718,7 +793,8 @@ def record_sample(out, folder, server, args, spec, pair, arm, case, rep, telemet
            'family': spec['family'], 'mode': spec['mode'], 'arm_definition': spec, 'stats': stats,
            'numerical_mode': server.numerical_mode,
            'warmup': rep < 0, 'body': body, 'response': response, 'commits': commits,
-           'rounds': rounds, 'seconds': response.get('total_seconds'), 'errors': errors}
+           'rounds': rounds, 'seconds': response.get('total_seconds'), 'errors': errors,
+           'memory_before': memory_before, 'memory_after': memory_after}
     if boundary is not None:
         row['request_boundary'] = boundary
     row['errors'] = check_sample(row)

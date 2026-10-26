@@ -1,18 +1,20 @@
 # Lookup / StairCut: independent-replacement results
 
-## Status and evidence boundary
+## Latest status and evidence boundary
 
-**Useful decode gains on reusable requests; not a general performance win.** The current revision preserves substantial MTP gains and improves DFlash related-configuration decode. Unrelated-prose requests no longer execute harmful lookup-only rounds in these windows. Nevertheless, MTP first-exposure prose remains slower, DFlash short-code request latency is mixed, and the full-workload promotion gates fail. The accounting fixes are implemented; not every performance regression is resolved.
+The v14 adjacent ABBA/BAAB cohorts observed full-request improvements for both drafter families with exact serial-output agreement. Later isolated comparisons found an incremental DFlash2 width-policy benefit, but broader MTP coding and standalone PLD backoff remain mixed or flat. These cohorts fail unchanged-system-swap qualification; no default promotion or universal speedup is claimed. See the [MTP results](#adjacent-mtp-abbabaab-confirmation-v14), [DFlash results](#adjacent-dflash-abbabaab-confirmation-v14), and subsequent versioned experiments below. Earlier failed and diagnostic cohorts remain historical evidence.
 
-- **Current measured v6 binary:** `f4121e1f222d5e86413e86e4d52b138becff0a1ad52888961ce67b0bf2672de5`.
+- **v14 binary:** `c83e0cd6f4af08ad6fedd26beb040b91c66199280c48bb5a4ff955f300bb7350`; later sections identify their own binaries.
 - Target: `ddalcu/Qwen3.8-27B-MLX-Serve-4bit`; assistant: `incoai/Qwen3.8-27B-DFlash2`.
 - Every native/feature arm uses explicit **row-exact numerical mode**. These are numerical-mode-controlled references, not unchanged fastest defaults.
-- Results identify that binary, not subsequent edits. Receipt-enabled diagnostics include host logging overhead. Native-depth traces perform no GPU evaluation/readback, but their CPU/I/O cost can enter later wall-clock prices; these are not instrumentation-free throughput measurements.
+- Each section identifies its measured binary and protocol, not subsequent edits. Full receipt-enabled MTP diagnostics can additionally settle native GPU work before successor resolution; these are not instrumentation-free throughput measurements. Native-depth traces themselves perform no GPU evaluation/readback, but their CPU/I/O cost can enter later wall-clock prices.
 - Initial replacement authors were source-excluded; the integrating parent previously saw the retired implementation. Neither clean-room nor legal certification is claimed. See [provenance, attribution and implementation contracts](lookup-staircut-port.md).
 
 Paths below are relative to `~/.mlx-serve/bench/lookup-staircut/`. These are private artifacts, not bundled public datasets. Raw logs may contain credentials and reversible token data; do not publish them without redaction. Procedures and gates are in [the offline guide](lookup-staircut-offline.md).
 
-## Current revision: four complete workload windows
+## Historical v6: four complete workload windows
+
+Binary: `f4121e1f222d5e86413e86e4d52b138becff0a1ad52888961ce67b0bf2672de5`. This revision preserved substantial MTP gains and improved DFlash related-configuration decode, but MTP first-exposure prose remained slower and DFlash short-code request latency was mixed. These regressions and failed promotion gates describe v6, not the latest ABBA cohorts.
 
 Each window completed **24 exact-valid requests: 96 total, zero invalid samples**. Each has two paired boot blocks, both native families plus the persistent feature, two workloads, and first exposure plus a repeat. The boot block—not every request—is the independent unit.
 
@@ -459,3 +461,530 @@ Two additional training-only `production-combined` windows exercised lookup9 and
 | 16 | linear GDN | 16 | 152.267 ms | 9.517 ms |
 
 These individual first-offer observations show useful nonlinear width economics at this prefix: nine to twelve rows added little measured cost, while sixteen rows gave the lowest observed cost per committed token. They are not a repeated, drift-controlled hardware plateau determination. Diagnostic readback effects remain, the sixteen-row window was earlier, and no complete-round or throughput claim follows. The actual exporter produced the separately named five-cell `independent-v14-combined-boundary-training-prices.json` profile; canonical and completed ABBA cohorts do not consume it.
+
+## Request-local native economics and targeted ABBA (v15)
+
+The first three physical arms of `runs/independent-v14-canonical-abba` completed the pinned workload, but the fourth was stopped after finding a benchmark coverage defect and a real MTP routing regression. The client issued **34 benchmark-body requests plus three reasoning-setup requests**, not 34 total. The corrected contract validates the source-defined two-to-four setup branches independently, actual metric memberships and every replay capture. All three saved probes pass that coverage check; this does not complete or retrospectively qualify the interrupted cohort.
+
+The routing defect was a stale model-shared native comparator: a single post-warmup probe recorded **95.81 ms for one token** and remained the alternative for later requests. Native decode in the first arm actually averaged **44.86 ms per published token**, while lookup in the next arm averaged **69.61 ms/token**. Predicted two-row lookup verification cost was close to observed cost; relaxing confidence was not the fix.
+
+V15 uses paired duration/yield from consecutive homogeneous native cycles in the current request, context class and selected depth. It subtracts matching interval query preparation, excludes prepared-native alternatives and terminal/truncated intervals, and passes the same fresh comparator to bounded width exploration. These are query-adjusted wall estimates, not isolated GPU timings. No extra GPU barrier or periodic refresh probe was introduced.
+
+Runtime SHA-256: `b47cd4a09aad6bf7c04e05c826e895a23c6f76b9025b805326cb494d8367d838`. Focused Zig lookup tests and the ReleaseFast build succeeded. The targeted run `runs/independent-v15-native-comparator-smoke-2` executed native/adaptive/adaptive/native fresh boots followed by a separate serial boot, using three unchanged full requests per boot. All **15 outputs matched exact published IDs, HTTP text/usage and finish reasons**.
+
+| Targeted workload | Native HTTP seconds, geometric mean | Adaptive HTTP seconds, geometric mean | Reciprocal-latency speed change |
+|---|---:|---:|---:|
+| Canonical decode request | 9.625 | 9.916 | −2.94% |
+| Canonical novel request | 12.620 | 12.569 | +0.41% |
+| Held-out related configuration | 7.946 | 4.454 | +78.41% |
+
+This is one targeted ABBA quartet, not a completed full-client cohort or confidence interval. The general decode residual regression remains visible. Each native decode request executed 73 rounds; adaptive executed 76, including only six/four lookup rounds rather than the earlier extensive weak-lookups regime. New traces show current-request cost/yield updates instead of the fixed one-token shared estimate. This verifies the corrected decision path and retained reuse benefit; it does not causally compare the two binary versions under matched conditions.
+
+### Incremental memory and storage observations
+
+Both MTP arms use the same target and MTP head. No neural weights were added by enabling lookup/routing.
+
+| Whole-process measurement | Native mean | Adaptive mean | Adaptive minus native |
+|---|---:|---:|---:|
+| Loaded physical footprint | 17,309.65 MiB | 17,309.84 MiB | +0.20 MiB |
+| End-of-workload physical footprint | 17,619.04 MiB | 17,942.59 MiB | +323.55 MiB |
+| Lifetime maximum physical footprint | 19,229.30 MiB | 19,229.19 MiB | −0.12 MiB |
+| Persistent lookup files, logical content | 0 bytes | 3,920 bytes | +3,920 bytes |
+
+The lifetime maximum includes loading and cannot establish zero additional inference peak. End footprints vary across the two boots per arm and include allocator/KV/verification-buffer retention, not just lookup allocations. The cache occupied 4 KiB of allocated file blocks; this small frozen 970-token fixture is not a production-capacity test.
+
+A native arm64 type-layout probe measured the local ring at **1,048,576 bytes per armed request**, inline drafter state at **36,440 bytes**, inline policy at **8,608 bytes**, and the history-cache wrapper at **544 bytes**. Persistent token/position arrays scale at eight bytes per retained entry up to **2 MiB**; the payload cap is **1 MiB + 40 bytes**. Optional corpus arrays can reach **128 MiB** at their separate cap. Index replacement may temporarily retain old and new allocations. These implementation sizes exclude other tree scratch, dynamic price storage and GPU buffers; the offline guide documents the measurement contract.
+
+The memory helper's Darwin ABI was checked against compiled SDK offsets and exercised on a live process and nonexistent PID. Adversarial review found a symlink-root storage-accounting defect; the corrected helper rejects it. All **289 Python lookup-helper tests passed** after the fix. Resource observations above came from real directory roots and remain unchanged.
+
+### Upstream scope
+
+The current working tree is not yet a minimally invasive submission: relative to upstream `191da71d`, excluding the user's dirty `lib` tree, the inspected surface comprised 49 files: 18 source files with 8,969 added lines and 175 removed lines (including inline Zig tests), 26 test/benchmark scripts with 13,488 added lines, four documentation/changelog files, and build wiring. These are an assessment snapshot before subsequent component work, not production-only line counts. Keep learned embeddings independently reviewable, isolate reusable verification prerequisites, and justify lookup/routing and dynamic width selection with their own measured contrasts before deciding the final PR boundaries.
+
+## Learned-embedding decoded-row cache: first measured implementation (v16)
+
+The first implementation adds a bounded, table-owned 256-row direct-mapped cache of exact decoded f32 vectors. Cache misses retain the existing pooled reads; widths above 64 embedding rows bypass the cache. This is an embedding-gather optimization, not an additional speculative drafter, and requires no new model weights.
+
+Two real-pack runs, `runs/independent-v16-ple-reuse-{1,2}.json`, used `TensorFold/Qwen3.8-Flash-Next-MLX-oQ2-MTP`, seeds 1347175775 and 1347175776, 256 sampled contexts and eight immediate repeats. The `ple-bench` executable SHA-256 was `cd92a8cd2145ad91631d995555718c48c289b0e4c5a251e1b1d6a630d42ffc60`. Each run checked 9,216 forced-control pairs, 9,216 production microbenchmark comparisons and 24,576 sequential production gathers; decoded vectors matched exactly. The PLE tests and ReleaseFast benchmark build passed before execution.
+
+| Hash-and-gather workload | Run 1 speed change | Run 2 speed change |
+|---|---:|---:|
+| Immediate repeated context, one token / 16 rows | +165.08% | +135.74% |
+| Immediate repeated context, two tokens / 32 rows | +22.59% | +25.87% |
+| Immediate repeated context, four tokens / 64 rows | +21.07% | +21.41% |
+| Immediate repeated context, eight tokens / 128 rows, cache bypassed | +0.09% | −0.03% |
+| Initial 32-token sequential request | −0.19% | +1.42% |
+| Complete 32-token sequential repeat | +1.58% | +1.55% |
+| Similar request: shared 24-token prefix, changed eight-token suffix | +1.06% | +0.52% |
+
+Speed change is `(baseline time / treatment time − 1) × 100`, against the old production gather policy, not a forced serial control. Microbenchmark bootstrap intervals exclude parity for widths one, two and four; sequential results are descriptive ratios, not confidence intervals. Whole-policy order alternates; decoded-cache state resets before each three-request sequence, not between its requests. OS page-cache state is not reset, so these are not cold-disk measurements.
+
+The sequential results expose the limitation hidden by immediate repeats: a 32-token stream can touch 512 rows, exceeding the 256-row direct-mapped cache. Complete-repeat row hits were only about 15.5%, so most gathers still woke the read pool. A bounded four-way cache experiment is justified by this measured churn; its gains remain unmeasured here.
+
+Incremental cache payload and metadata were **165,920 bytes (162.03 KiB)** at this pack's dimension of 160, plus 1,024 bytes of narrow-call stack scratch. There are no additional worker threads or persistent files. These are implementation allocation sizes, not process-footprint deltas. No full-model Flash-Next inference speedup follows from the gather timings.
+
+## Coding diagnosis: useful wide lookup, weaker mixed narrow rounds
+
+The completed v14 DFlash2 cohort's `related-code` case contains 24 requests and 1,680 generated tokens per arm. Direct retained server timings total **30.546 s prefill / 27.879 s decode** for native and **30.397 s / 26.348 s** for adaptive. Aggregate HTTP durations were 58.471 s and 56.789 s: **+2.96% reciprocal-latency speed**, with **+5.81% decode-phase speed**. These aggregate phase diagnostics are not replacements for the declared quartet estimator or its machine-state gates. Prefill accounts for about 52% of native HTTP time on this short 70-token answer.
+
+| Published round population | Rounds | Published tokens | Tokens per round | Verify/commit milliseconds per token |
+|---|---:|---:|---:|---:|
+| Native DFlash2, generic eight rows | 216 | 1,680 | 7.778 | 14.962 |
+| Adaptive mixed offer, generic eight rows | 146 | 948 | 6.493 | 16.848 |
+| Adaptive mixed offer, linear sixteen rows | 48 | 732 | 15.250 | 10.784 |
+
+The wide lookup rounds are productive; narrow mixed rounds give back part of the gain. These populations occur at different prefixes and are not a causal topology comparison. In particular, native DFlash2 uses best-first admissions, not a guaranteed greedy spine; truncating the final preorder does not recover its original eight-row tree. The diagnostic follow-up retains exact native admissions from the same expanded lattice and compares ancestry-aware membership against the selected tree. Production preference must not be changed merely by comparing differently normalized neural and merged probability sums.
+
+The next coding workload is separate from the original frozen transfer contract: fresh algorithm generation, an unseen related helper with changed record semantics, a full-module semantic edit, and a missing-suffix completion. Its four training helpers share one JSON-Lines template; that is a deliberate reuse case, not four independent coding domains. Report cases separately, preserve first-exposure costs and exact serial output, and do not treat Python syntax checks as functional-correctness evidence.
+
+## Isolated DFlash2 fixed-eight versus StairCut (v16)
+
+`runs/independent-v16-df2-combined-fixed8-cut` completed four adjacent ABBA/BAAB primary quartets, with native references and serial correctness outside them: **28 boots, 224 requests, zero invalid samples**. Runtime SHA-256 was `1ced2f1697ef2b160cca8eadd38ea67c4b96a2f7bd202e883a0fa34d64f14655`. Both primary arms use the same DFlash2 assistant, combined candidate sources, frozen history and explicit row-exact numerical mode. No offline prices were supplied. Fresh-controller learning, preparation and exploration remain charged to HTTP duration.
+
+| Primary fixed-eight → cut contrast | First-exposure speed change | Repeat speed change |
+|---|---:|---:|
+| Related configuration | +10.75% | +19.61% |
+| Conflicting configuration | +11.09% | +10.70% |
+| Related code | +9.42% | +8.23% |
+| Unrelated prose | −3.37% | −0.43% |
+
+The complete-workload geometric mean of quartet summed-duration ratios is **1.067228× (+6.72%)**, with a descriptive quartet-bootstrap interval of **1.053496–1.083995× (+5.35% to +8.40%)**. Individual quartet ratios were 1.068511, 1.048538, 1.060338 and 1.091998. There are four statistical observations, not 224 independent samples.
+
+This is an observed isolated **combined-offer width-policy** benefit, including its learning overhead. It is not an isolated kernel gain or neural-only StairCut result. Cut executed 16 bounded width-learning trials and reduced 868 of 1,075 published rounds; fixed-width selection used 1,264 published rounds. Both candidate-source requirements passed.
+
+**Strict performance qualification remains false:** swap usage, swap-ins and swap-outs changed, and one first-prose quartet had a ratio of 0.899515, failing the five-percent per-cell regression guard. The average prose effect must not hide that result. All first-prose primary rounds actually executed generic eight-row verification; cut used 33–35 rounds per request versus fixed's 33. The regression cannot simply be attributed to executing wider prose kernels.
+
+Native DFlash2 references are outside the primary quartet and remain descriptive: cut/native full-workload ratio was 1.054782 (+5.48%); related-code ratios were 1.030706 first and 1.005947 repeat. Fixed/native code ratios were 0.941993 and 0.929423. Width adaptation recovers mixed-offer costs, but these references do not establish a large coding improvement over native DFlash2.
+
+### Resource observations in the completed width experiment
+
+All 56 loaded/final allocator snapshots were complete, exercising the owned authenticated `/props` path. The following are means across eight physical boots per arm; serial boots are excluded.
+
+| End-of-workload measurement | Native DFlash2 | Combined fixed-eight | Combined cut |
+|---|---:|---:|---:|
+| MLX active allocations, MiB | 18,239.324 | 18,239.324 | 18,239.324 |
+| MLX reclaimable cache, MiB | 116.265 | 96.000 | 96.000 |
+| MLX lifetime peak, MiB | 18,511.482 | 18,511.490 | 18,511.490 |
+| Process physical footprint, MiB | 18,598.390 | 18,593.671 | 18,588.569 |
+
+Reported model-weight bytes were identical across arms. These endpoint and lifetime measurements do not isolate live request peaks or imply that lookup itself saves memory; reclaimable-cache retention differs. The persistent fixture remained 3,920 logical bytes / 4,096 allocated bytes. It is write-disabled, so this run does not measure live cache growth or append costs. Adversarial review found no blocker in the frozen contrast or resource-accounting contract.
+
+## Four-way learned-embedding cache (v17)
+
+The bounded cache now holds **1,024 rows in 256 four-way sets**, with exact row-ID comparisons and deterministic round-robin replacement. Hits do not mutate replacement order. Duplicate insertion updates its existing slot; all gathered hits are copied before any miss insertion. Pooled misses, wide-gather dispatch and complete-output fallback are unchanged.
+
+`ple-bench-test` and `ple-bench-build` passed. Four real-pack CPU runs then completed without concurrent inference or compilation, using executable SHA-256 `c3c35a8843e43bf4bc62f3ed35f81db6adef9ddd0f585dcfd38054be9c58118e`. Artifacts are `runs/independent-v17-ple-reuse-{1,2}.json` and `runs/independent-v17-ple-coding-{1,2}.json`. Seeds remain 1347175775/1347175776. Generated-text runs use 256 contexts; coding runs use 128. Each generated-text run checked 9,216 forced-control pairs, 9,216 micro production comparisons and 122,880 sequential production gathers; each coding run checked 4,608, 4,608 and 61,440 respectively. **All decoded vectors matched exactly.**
+
+The coding corpus is a frozen concatenation of four independently authored Python benchmark helpers, 254,821 bytes, SHA-256 `0a458a06885a0e9b45dda083384dbe3f49b3e58cdfbf3e9d2eb5e015d1ebc789`. It contains no generated evaluation answers. Both 32- and 128-token cohorts use disjoint corpus windows and compare the new cache with the old production path without a decoded cache.
+
+| Sequential hash/gather workload | Generated text, run 1 | Generated text, run 2 | Python source, run 1 | Python source, run 2 |
+|---|---:|---:|---:|---:|
+| Initial 32-token request | −0.30% | −0.30% | +4.56% | +1.93% |
+| Complete 32-token repeat | +21.31% | +25.58% | +25.45% | +28.24% |
+| Shared 24-token prefix, changed eight-token suffix | +17.93% | +18.24% | +19.12% | +21.23% |
+| Initial 128-token request | +2.12% | +0.13% | +1.90% | +5.20% |
+| Complete 128-token repeat | +2.40% | +0.87% | +4.41% | +4.43% |
+| Shared 96-token prefix, changed 32-token suffix | +2.01% | +1.68% | +3.93% | +4.33% |
+
+These are descriptive reciprocal-latency changes for the hash/gather component, not full-model generation gains or sequential bootstrap intervals. The complete 32-token coding repeat took 6.639 → 5.292 ms in run one and 7.389 → 5.762 ms in run two. Its row-hit rate was 88.71%; the 128-token repeat hit only 21.77%, exposing capacity/collision limits. Partial-hit gathers can still wake the pool, so row-hit percentage is not the latency reduction.
+
+The new payload plus cache metadata is **663,840 bytes (648.28 KiB)** at dimension 160, **497,920 bytes (486.25 KiB)** more than the first cache. Narrow-call scratch remains 1,024 bytes; no persistent storage, worker threads or per-call heap allocations were added. Allocation rounding is excluded. This experiment changes capacity and associativity together; it does not independently attribute gains to either. The longer cohort exceeds total cache capacity, and the initial generated-text case preserves the small measured cold-path regression rather than hiding it.
+
+Adversarial source review found no blocker in ownership, collision handling, fallback, memory accounting or sequential benchmark separation. Full-model Flash-Next inference remains a separate memory-gated validation; CPU gather savings cannot be applied directly as an end-to-end speed percentage.
+
+## Composition: which gains can stack?
+
+Suffix lookup and dynamic width selection cooperate with the configured neural drafter. The native-versus-adaptive MTP/DFlash2 results already measure their combined effect; an isolated fixed-width-versus-cut percentage must not be added to those combined gains. MTP and DFlash2 are alternative neural paths in this implementation, not simultaneous speed multipliers.
+
+For example, the v16 descriptive native→combined-fixed ratio is 0.988338 and the isolated combined-fixed→cut ratio is 1.067228. Their product is the descriptive native→cut ratio, 1.054782. This is accounting across measured arms, not proof that component effects are independent; the native references remain outside the primary quartet.
+
+Learned-embedding caching acts on a different operation and could compose on a model with the required table and supported speculative route. Its hash/gather speedup is not an inference multiplier: if the operation occupies fraction `f` of baseline runtime and speeds up by `s`, with everything else unchanged, whole-runtime speed is `1 / ((1 - f) + f / s)`. Speculation can change `f`, gather width and reuse, so a combined full-model experiment remains necessary. The Qwen 27B speculative cohorts do not exercise the Flash-Next learned table.
+
+Miss backoff can reduce wasted suffix attempts but is relevant to misses, not another multiplier on successful lookup. Keep its standalone on/off comparison separate. PR claims should report measured combinations and controlled ablations, preserve interactions and regressions, and never sum headline percentages.
+
+## Native candidate displacement diagnostic (v17)
+
+Focused lookup/native-admission tests and the ReleaseFast build passed after correcting a test fixture whose near-certain child did not actually produce the intended sibling-first admission order. The expected ancestry behavior was retained, not weakened. Runtime SHA-256: `671581fa3e3561f49bb021c071614134591b6baaa7dc8725c046d43575fa36a7`.
+
+`runs/independent-v17-native-candidate-diagnostic` completed eight exact-output requests across serial, native MTP, native DFlash2 and combined fixed-eight DFlash2, using the original related-code case. The trace preserves the original native first-admission tree without changing production selection. A reviewed offline analyzer joined 20 witnesses to their actual published rounds and complete serial output; 18 comparisons had equal width/variant and uncensored continuation.
+
+At those same selected-run prefixes, the native tree matched **144 rows**, versus **132** for the selected mixed tree. Fourteen comparisons tied; native retained three more matching rows twice, four more once and two more once. Thus the diagnosed narrow-tree displacement can lose useful tokens even at identical prefixes—not merely in aggregate populations at different positions.
+
+This is a token-path counterfactual, not measured alternative latency or independently sampled rounds. Geometry trusts the producer's explicitly enabled request log. The analyzer requires row-exact greedy output, validates ancestry-sensitive membership, rejects duplicate joins and excludes terminal continuation from the comparable subset. Production selection remains unchanged pending a causal throughput comparison.
+
+## Broader coding workload, before the neural-calibration correction (v18 contract)
+
+The first coding contract failed on the native baseline's indentation when asked to continue inside an unfinished Python `for` suite. `runs/independent-v17-coding-dflash-abba` remains a failed seven-request run; its answer was not whitespace-normalized or requalified. A separately frozen second contract completes a new top-level function instead. Four independent training responses were regenerated under the new train/evaluation identity declaration; no evaluation answer seeded history.
+
+`runs/independent-v18-coding-{dflash,mtp}-abba` each completed **four ABBA/BAAB quartets plus serial reference: 17 boots, 136 exact-output requests**. Both used the pre-correction v17 runtime `671581fa3e3561f49bb021c071614134591b6baaa7dc8725c046d43575fa36a7`. The neural residual-calibration edit was not in that executable. Every case includes measured first and repeat exposure, with history writes disabled and prefix caching disabled. Syntax, declared function presence and unchanged-helper checks passed; generated code was not executed, so this is not functional task-correctness certification.
+
+| Coding case | DFlash2 first | DFlash2 repeat | MTP first | MTP repeat |
+|---|---:|---:|---:|---:|
+| Fresh interval-merging function | −1.35% | −3.08% | −5.85% | −5.97% |
+| Related JSON-Lines helper with changed key/retention semantics | −4.25% | −1.03% | +6.54% | +10.08% |
+| Semantic edit of supplied module | +0.53% | −1.35% | −6.15% | −6.18% |
+| Top-level function completion using supplied helper | −4.18% | −0.64% | −9.74% | −5.62% |
+
+Combined native→adaptive workload ratios were **0.981114 (−1.89%) for DFlash2** and **0.971618 (−2.84%) for MTP**. Descriptive quartet-bootstrap intervals were 0.937829–1.036505 and 0.924014–1.020987 respectively. Neither establishes an overall improvement. Both machine-state qualifications failed due changed swap observations; retain the raw point estimates and uncertainty rather than claiming a clean causal regression magnitude.
+
+The DFlash2 adaptive cohort executed wider sixteen-row rounds, but **all were generic**, not the cheaper linear-GDN variant: 55 on fresh code, 27 on the related helper, five on edits and two on completion. Fewer rounds therefore did not imply less verification time. The MTP fresh case increased from 1,280 to 1,337 rounds across its 16 requests, with 102 lookup rounds; completion increased from 664 to 709, with 450 lookup rounds. Native baselines already used their existing local-copy mechanisms on some cases. These observations bound the next optimization work: preserve useful neural ranking, account for executable shape rather than width alone, and investigate weak MTP admission/recovery instead of assuming more selected lookup tokens are beneficial.
+
+The staged incoai Qwen3.8-27B DFlash2 configuration has **block size eight**: one anchor plus seven neural draft positions. Expanding its candidate tree adds alternatives, not neural depth. A neural-only chain from that forward cannot reach the greater-than-eight-row linear-GDN path. Longer suffix continuations can reach it, but that opportunity depends on actual reusable context. Do not assume the wider generic coding rounds could simply have been replaced with sixteen correct neural tokens, or raise the trained horizon without a separate supported-model experiment.
+
+## Neural probability calibration experiment (v19)
+
+The old neural estimator shrank every confidence in the same bucket toward its empirical mean. Its within-bucket slope was `4 / (4 + samples)`: once populated, distinct neural confidences became nearly indistinguishable before multiplying path reach. A six-edge high-confidence continuation could consequently lose its final node to a less promising root alternative.
+
+The neural-only correction retains each raw probability and learns the bucket's mean residual: `clamp(raw + (hits - sum_predictions) / (4 + samples), 0, 1)`. Lookup entry/continuation calibration is unchanged. Eight prediction sums add 32 inline bytes, with no heap allocation, transcendental operation or GPU work. The sums decay with the existing hit/sample counters and participate in the policy fingerprint and value-copy snapshot. This does not guarantee globally monotone calibration across buckets or preservation of every native branch.
+
+A focused adapter regression failed with the old estimator (expected continuation token 7, selected alternative 88) and passed with the correction. Constant-input equivalence through decay, source isolation and snapshot/fingerprint tests passed, followed by the lookup-filtered suite and ReleaseFast build. The corrected executable is `9729431a0e67fe19b8eb7bed0210b393bca1e9703aa59935fcb194a7487554ee`; the pre-correction executable is preserved separately.
+
+`runs/independent-v19-native-candidate-diagnostic` completed eight exact responses. Its short-case witness still matched 144 native rows versus 132 selected rows across 18 comparable rounds—the same displacement as before. **The correction has not fixed that diagnostic loss, and no throughput benefit is established by these tests.**
+
+The separate coding before/after experiment keeps combined-adaptive controls and frozen training history identical across two executables; it is not a native-baseline comparison. Adversarial runner review caught an arm-name fallback that would have given the baseline an empty history. The copied baseline definition now explicitly selects the persistent tier, invoking the existing seed-copy and full-tree-hash checks. Both executable/linkage identities were frozen and checked throughout the run; all sixteen measured boot stores had identical hashes.
+
+`runs/independent-v19-coding-calibration-abba` completed four ABBA/BAAB quartets plus serial: **136 exact responses**. Whole-workload before/after ratio was **0.994197 (−0.58%)**, with descriptive quartet-bootstrap interval **0.981993–1.007441**. Swap bytes, swapins and swapouts changed, so machine qualification failed. This change has **not demonstrated a throughput improvement**.
+
+| Coding case | First exposure | Repeat |
+|---|---:|---:|
+| Fresh interval merge | −4.09% | +1.02% |
+| Related JSON-Lines helper | +0.88% | +0.08% |
+| Semantic module edit | −0.47% | −0.13% |
+| Function completion | −1.06% | −1.17% |
+
+The correction reduced sixteen-row generic executions from 50 to 43 on fresh code, 35 to 15 on the related helper, 16 to six on edits and 11 to seven on completion. Total verification rounds were nearly unchanged: 540→539, 462→464, 418→418 and 277→280 respectively. Better mathematical preservation of neural confidence is therefore not sufficient evidence of better generation performance.
+
+## MTP coding admission diagnosis
+
+In the v18 completion case, native executed 646 depth-two and 18 depth-one rounds. Adaptive executed 251 native depth-two rounds, eight native depth-one rounds, 305 two-row lookup rounds and 145 fifteen-row lookup rounds. Review of its admission traces found 445 of 450 lookup admissions still using a native yield of exactly one. Fourteen of sixteen requests retained an unchanged paired comparator despite subsequent native executions.
+
+The timing exclusion was intentional: recovery after lookup and mixed outgoing preparation are not homogeneous native-cycle durations. The error was using that timing eligibility to restrict all available native-yield evidence. A single poor eligible native sample could therefore remain the lookup comparator while later genuine native acceptances were excluded from its yield estimate.
+
+The next implementation keeps the paired cost/yield record unchanged and separately tracks uncensored native output by request, context class and executed depth. Admission combines the existing homogeneous cost with this broader yield estimate. Recovery and contention may update yield, never timing; missing timing still forbids a measured comparator. Lookup, errors, terminal/budget truncation and context-crossing outcomes are excluded. No forced GPU refresh episode, depth pinning or synchronization was added.
+
+This is a **factorized prediction from differently eligible populations**, not a freshly measured paired rate. Acceptance can affect duration, old cost can remain stale, and no estimator learns a new native outcome when lookup completely suppresses native execution. The edit case also has a separate problem: most lookup admissions already used native yield three, while some local-copy proposals greatly overpredicted acceptance. Do not attribute all coding regressions to the stale one-token sample.
+
+Adversarial source review found no blocker in the new completion hook, censoring, depth/context isolation or retained timing gates. The lookup-filtered suite and ReleaseFast build passed; runtime SHA-256 is `b79deedbe02b409c669f42968a1ffadfb730d723c3664761fe0cb2fc421f91da`. `runs/independent-v20-mtp-yield-smoke-2` completed eight exact 70-token responses across serial, native MTP, native DFlash2 and adaptive MTP. Actual logs contain 24 native-yield observations and 18 admission decisions using `request_cost_current_yield`. The first smoke command was rejected before inference because price tracing is restricted to DFlash oracle diagnostics; it was not a model failure.
+
+`runs/independent-v20-coding-mtp-abba` completed four native/adaptive ABBA/BAAB quartets plus serial: **136 exact responses**. Whole-workload ratio was **1.000483 (+0.05%)**, with descriptive quartet-bootstrap interval **0.975603–1.017532**. Swap bytes and swapins changed, so machine qualification failed. This is overall parity in the observed cohort, not a demonstrated whole-workload speedup or equivalence.
+
+| Coding case | First exposure | Repeat |
+|---|---:|---:|
+| Fresh interval merge | −4.79% | −4.56% |
+| Related JSON-Lines helper | +7.13% | +8.44% |
+| Semantic module edit | −4.29% | −3.42% |
+| Function completion | +3.23% | +1.43% |
+
+None of the 450 logged lookup admissions used a native-yield estimate of one; all used the new factorized scope. Completion executed **605 adaptive rounds versus 664 native**, including 67 fifteen-row lookup rounds and no two-row lookup rounds. The older v18 adaptive cohort executed 709 rounds, including 305 two-row and 145 fifteen-row lookup rounds. These are different cohorts, so the before/after timing difference is not an isolated estimate of the fix's effect.
+
+Fresh generation still executed 1,316 adaptive rounds versus 1,270 native. Its 14 lookup rounds committed only 20 tokens, with ten zero-draft-accept outcomes. Editing executed 625 versus 624 rounds; 16 of its 19 zero-accept lookup rounds matched only six suffix tokens, two matched three and one matched eight. Stronger native yield evidence addresses the diagnosed stale-comparator feedback but does not solve short-match prediction or transition costs. The completed v19 DFlash2 comparison does not contain this MTP change.
+
+## Raw-neural scoring ablation (v21)
+
+The residual-calibration experiment did not improve coding throughput or eliminate native candidate displacement. This ablation removes online neural calibration entirely, retaining the host drafter's bounded raw conditional probabilities. Lookup calibration, request trust, reached-path feedback and price selection remain active. Removing the neural hit/sample population and prediction sums saves 96 inline bytes relative to v20 before padding; it adds no GPU work.
+
+Focused tests cover pure-neural ranking after lookup learning and lookup feedback through pure-neural ancestors. All 75 adapter/policy/history tests passed, followed by the lookup-filtered suite and ReleaseFast build. Runtime SHA-256 is `064dbb50f0394d61c9fc472d13f9e95b34096adf785b7c7f2463cbcdb51240a6`.
+
+`runs/independent-v21-native-candidate-diagnostic` completed eight exact responses with no invalid samples. Across 18 equal-width, equal-variant, uncensored witnesses, native geometry matched 144 serial-path rows versus 131 selected rows. Four witnesses lost native matches: three lost three rows and one lost four. This **does not repair native candidate displacement**. Unselected lookup siblings can affect mixed-source mass projection even when every selected edge is neural; raw neural inputs alone do not preserve native admission order. These are same-prefix geometry observations, not counterfactual wall-time measurements.
+
+`runs/independent-v21-coding-raw-neural-abba` completed four ABBA/BAAB quartets plus serial, **136 exact responses**, using identical combined-adaptive controls and training history with v20 versus v21 executables. Whole-workload ratio was **0.988231 (−1.18%)**, with descriptive quartet-bootstrap interval **0.960926–1.002963**. Individual quartet ratios were 0.947786, 1.001449, 1.001320 and 1.003511. Swap bytes, swapins and swapouts changed, so measurement qualification failed. The ablation **did not demonstrate a throughput benefit**; the point estimate is not a clean causal regression claim either.
+
+| Coding case | Raw versus residual: first exposure | Repeat |
+|---|---:|---:|
+| Fresh interval merge | −1.95% | −0.94% |
+| Related JSON-Lines helper | −1.70% | −0.82% |
+| Semantic module edit | −1.10% | −0.81% |
+| Function completion | −1.63% | −0.56% |
+
+Published round counts changed from 534→540, 465→460, 418→422 and 281→287 respectively. Sixteen-row generic executions changed from 67→57, 25→35, nine→five and five→six. Neither arm executed linear-GDN rounds. Removing neural calibration simplifies the estimator and its state; it is not one of the measured speedups and does not resolve mixed-source candidate ranking.
+
+## CPU lookup profiling at coding prefixes
+
+`query-replay-v23-baseline-summary.json` preserves a standalone ReleaseFast CPU replay of the four frozen coding outputs against the 1,060-token, order-eight training history. It primes the local index, advances only published history, and calls lookup at **every output-token prefix**, with 32 deterministic replays per case and 22,848 measured queries. No inference or compilation ran concurrently. Timing surrounds `Drafter.look` only; output/node digests are computed outside that interval. The private harness, fixture, executable and production source hashes are retained.
+
+| Coding case | Mean lookup query | Median sum of queries for one output replay |
+|---|---:|---:|
+| Fresh interval merge | 6.32 µs | 1.374 ms |
+| Related JSON-Lines helper | 3.47 µs | 0.635 ms |
+| Semantic module edit | 3.11 µs | 0.608 ms |
+| Function completion | 3.56 µs | 0.410 ms |
+
+This is not actual speculative query cadence, a whole-request overhead measurement, or an inference speedup. It excludes priming, policy selection, learner updates, logging, model work and pipeline transitions; CPU behavior under simultaneous GPU work may differ. Nevertheless, these isolated query costs do not support prioritizing a suffix-search rewrite to recover the much larger observed coding wall-time gaps. The next measurements should distinguish admission errors and native pipeline/depth effects from broader host/control overhead rather than assuming lookup search dominates.
+
+## Exact-order request support (v22)
+
+Pooled model calibration already separated suffix orders, but request-local admission support pooled them. A consumer-level regression warmed order-64 request support and order-six pooled calibration, then asked to admit a previously unsupported order-six offer. The old implementation returned support **0.9864865 instead of zero**. The same regression passes with order-specific request support.
+
+The new request table separates orders 0–64, entry/continuation and eight confidence bins. Restriction reads each offered edge's stored order; reached feedback uses that child's order; nonoverlapping chain remainder uses the executed chain's order. Censoring, exactly-once shared-prefix handling and pure-neural ancestor traversal remain unchanged. The request fingerprint domain advances and covers every population. Inline state grows from **128 to 8,320 bytes (+8 KiB)**, with no heap/GPU allocation or disk payload.
+
+Adversarial source review found no blocker. All 77 focused adapter/policy/history tests passed, followed by the lookup-filtered suite and ReleaseFast build. Runtime SHA-256 is `61cd5a3ce32a9f527ce2e047f2069f764bdf2fdd4ef402ae2945c642f1ce21cd`. `runs/independent-v22-mtp-order-trust-smoke` completed eight exact 70-token responses with no invalid samples; adaptive MTP executed 34 published rounds, including six selecting persistent lookup and one selecting local lookup.
+
+`runs/independent-v22-native-candidate-diagnostic` also completed eight exact DFlash2 diagnostic responses without invalid samples. Its 18 eligible same-prefix witnesses matched **144 native rows versus 138 selected rows**, compared with 131 selected rows in v21; sixteen witnesses tied and two lost three rows each. Order-specific support reduces displacement in this diagnostic but does not eliminate it or establish faster inference.
+
+This is not a hard minimum suffix length or proof that short matches are unsafe. Same-order content and continuation depths still share support; some previously useful new-order matches must wait for evidence. Timing comparisons must count both prevented misses and lost profitable admissions. The implementation has runtime correctness evidence, not yet a throughput claim.
+
+## Standalone PLD miss-backoff isolation (v22)
+
+Evidence: `runs/independent-v22-pld-backoff`; binary `61cd5a3ce32a9f527ce2e047f2069f764bdf2fdd4ef402ae2945c642f1ce21cd`. Four adjacent primary ABBA/BAAB quartets compare identical frozen-history/cut configurations with miss backoff off versus on. Serial references are outside the primary quartets. All 24 boots and **192 exact-valid responses** completed, with zero invalid samples. This isolates the backoff policy, not lookup versus native decoding or StairCut versus fixed width.
+
+Full-workload speed ratio is **0.99856 (−0.14%)**, with quartet-bootstrap 95% interval **0.98282–1.00799**: no overall benefit demonstrated. Changed swap usage and swap-ins fail measurement qualification. Each quartet includes all four cases and first/repeat exposures; no cases or slow boots were dropped.
+
+| Case | First exposure speed change | Repeat speed change |
+|---|---:|---:|
+| Related configuration | −9.98% | −3.24% |
+| Conflicting configuration | −6.02% | −6.69% |
+| Related code | −4.45% | −5.16% |
+| Unrelated prose | +9.34% | +6.43% |
+
+Percentages are `100 × (off/on full-request duration ratio − 1)`, using the geometric mean of complete-quartet ratios. Unrelated first-exposure prose has interval **+8.55% to +10.14%**, but conflicting repeat configuration regresses **−8.97% to −5.10%**. Hardware qualification still applies to both findings.
+
+All 16 backoff-on prose exposures report the exercised 1/2/4/8 mechanism, ending with window 8 and seven plain steps remaining. Each records 18 misses, one reset and 103 plain emissions (17 drain plus 86 native), rather than inventing lookup work for skipped steps. Reduced lookup-receipt counts are not a reduction in total decoding rounds.
+
+The tradeoff is real in this workload: avoiding repeated misses helps prose, while skipped opportunities hurt useful reuse. Do not extend this standalone policy to MTP/DFlash or claim universal gain on this evidence. Serial-reference comparisons remain descriptive; they do not inherit the isolated backoff contrast's statistical interpretation.
+
+Adversarial follow-up found no safe branch substitution that removes the tradeoff while preserving exact 1/2/4/8 skip semantics. The terminal drain restores the uncached next anchor required by PLD; ordinary `next()` would leave a forwarded successor pending. A cheap probe of the last emitted suffix is not aligned with that future anchor, while resolving the pending anchor adds synchronization. Interrupting a skip on a probe would be a different backoff policy, not an implementation-equivalent optimization. Block-zero related/conflicting requests also lose accepted drafts with backoff enabled; their one or two cold skip emissions do not establish repeated drains as the sole latency cause. Retain opt-in behavior rather than adding an unmeasured presence index or claiming the full-workload regression is fixed.
+
+### Which improvements stack?
+
+Lookup supplies candidates, the width policy chooses verification work, and one selected neural family supplies neural drafts. These mechanisms can coexist; they are not three independently measured multipliers. The v16 within-cohort accounting is `fixed/native 0.98834 × cut/fixed 1.06723 = cut/native 1.05478`; only cut/fixed is the primary isolated comparison. Do not add v14 combined gains to v16 width gains from a different cohort. Learned-table caching affects another component and requires its own end-to-end contrast; component hash/gather gains are not whole-model multipliers.
+
+## Publication-only measurement mode (v23)
+
+Binary `59bf17e23613a2eb9d8793698d6aca2c41066279b98b676f22057bac4fd29918`; correctness evidence `runs/independent-v23-publication-smoke`. Full MTP round diagnostics can force settlement before successor resolution even on a native round. `MLX_SERVE_LOOKUP_RECEIPTS=commit` preserves complete published IDs and persistent-store identity without synthesizing those round receipts. Actual lookup execution, production pricing and bounded bootstrap probes retain their existing barriers; this is not a synchronization-free decoder.
+
+The rebuilt runtime completed **eight exact 70-token requests**: serial, native MTP with publication-only receipts, adaptive MTP with full receipts, and adaptive MTP with publication-only receipts, each first/repeat. All publications matched serial. Full adaptive mode emitted 34 round receipts; publication-only modes emitted none. Both adaptive modes retained two per-request store receipts, and native/feature MTP engagement checks passed. Trace was explicitly disabled in this correctness smoke.
+
+The selected-chain regression covers off, publication-only and full modes, preserving delayed per-edge lookup learning. Cache-control protocol tests ran with cache disabled and enabled; lookup-filtered runtime tests and ReleaseFast build completed. All **298 Python helper tests passed**. Adversarial review found no actionable receipt-mode, cache-control or full-model-driver defects after the serial-oracle fix.
+
+The separate `runs/independent-v23-mtp-receipts-abba` comparison completed **136 exact responses / 24,276 generated tokens**, with four adjacent full-versus-publication-only ABBA/BAAB quartets and a serial oracle outside them. Both arms use the same binary, adaptive policy, frozen history and lookup tracing. The full-request ratio is **0.98586 (−1.41%)**, with 95% quartet-bootstrap interval **0.96260–1.00003**. Changed swap usage and swap-ins fail measurement qualification. No receipt-overhead speedup was demonstrated.
+
+| Coding case | Publication-only versus full: first | Publication-only versus full: repeat |
+|---|---:|---:|
+| Fresh function | −3.29% | −1.47% |
+| Related helper | −1.37% | −1.01% |
+| Related edit | +0.11% | −0.52% |
+| Related completion | −1.68% | −2.37% |
+
+Non-diagnostic MTP statistics remain available in both arms: full mode records 3,754 native attempts plus 175 lookup rounds; publication-only records 3,758 plus 187. The full arm emits 3,929 round receipts and publication-only emits none. Missing receipt detail is not zero lookup activity. Because the controller consumes measured costs, removing a barrier can change later decisions; this contrast measures the complete mode change, not just the duration of an isolated synchronization call.
+
+Publication-only mode remains useful for production-like timing, but it does not explain away the coding regression. Earlier full-receipt benchmarks remain historical instrumented results; do not silently reinterpret them as production-timing measurements.
+
+## Flash-Next full-model server admission (v23)
+
+The frozen cache-only serial declaration in `runs/independent-v23-ple-serial-abba` specifies 16 boots / 96 full requests, alternating off/on ABBA/BAAB, followed by a separate MTP declaration only after a completed serial oracle exists. The first server boot failed normal admission: **55.0 GB required versus 46.89 GB available**, with estimated weights of 48.04 GB. Zero benchmark requests ran. The failed declaration and startup log are retained; there is no cache speed estimate, measured-workload hit rate or completed serial oracle from this attempt.
+
+No memory-preflight bypass was used. The earlier eight-token standalone CLI smoke remains execution evidence only: the CLI has a different single-prompt lifecycle and does not establish that the server/repeated-request configuration fits. The component hash/gather results remain valid at their stated scope, not as a substitute full-model claim.
+
+A separate bounded CLI integration check ran the same eight-token prompt once with the cache off and once on, on the v23 binary. Complete published IDs and finish reason matched exactly. Both normal shutdowns reported 48 workers and 36 pool rounds. Off allocated zero decoded payload and recorded zero cache operations; on allocated 655,360 bytes and recorded **144 misses, zero hits**. This proves actual cache lookup/insertion-path engagement, not successful reuse or acceleration on that cold prompt.
+
+Evidence is summarized in `independent-v23-ple-cli-analysis.json`. Both wrapper failures remain visible: the off wrapper initially looked for a serving-only log file instead of CLI stderr; the on wrapper incorrectly required a cache hit from a single cold prompt. The saved completed runtime outputs were analyzed without rerunning either request. This is post-run correctness/lifecycle evidence, not a salvaged performance cohort or a completed server benchmark.
+
+## Publication-only native-versus-adaptive MTP coding (v23)
+
+`runs/independent-v23-mtp-publication-coding-abba` completed **136 exact responses**, four primary adjacent ABBA/BAAB quartets plus an external serial oracle, using the same v23 binary and frozen coding history. Both primary arms use publication-only receipts; lookup tracing remains identical and enabled. The full-workload ratio is **0.93118 (−6.88%)**, with interval **0.92147–0.94836**: a regression, not a speedup. Swap usage and swap-ins changed, so hardware qualification also fails; that does not excuse the unfavorable result.
+
+| Coding case | Adaptive versus native: first | Adaptive versus native: repeat |
+|---|---:|---:|
+| Fresh function | −3.23% | −2.25% |
+| Related helper | +4.91% | +5.86% |
+| Related edit | −25.74% | −25.45% |
+| Related completion | +1.89% | −2.56% |
+
+The native MTP reference includes its existing prompt-lookup behavior. Across the 16 related-edit requests it performs **476 native attempts plus 160 legacy lookup rounds**, accepting 1,650 of 1,904 lookup drafts. The tiered feature performs **975 native attempts plus 43 lookup rounds**, accepting 249 of 359 lookup drafts. The feature is losing useful incumbent reuse, not merely spending too much CPU searching suffixes. Publication-only evidence does not expose per-round candidate/order decisions.
+
+The exact-order trust change is a candidate cause of lost support, not an isolated timing conclusion from comparisons across revisions. Two independently reviewed corrections are under validation: rate-aware MTP width exploration and preservation of native DFlash2 geometry when lookup adds no selected path. Neither is part of this measured v23 binary; neither may inherit a performance claim from earlier cohorts.
+
+## Rate-screened exploration and native geometry retention (v24)
+
+Binary: `b84d481e02925c4422d31b7a2423f5f1a693ae645a03c2ed9272d2e7d444bffa`. MTP upper-width exploration now compares `predicted wider tokens / (paid query + measured narrow verification)` against `predicted native tokens / (paid query + native remaining duration)`. This is a zero-added-verification-latency screening hypothesis, not a measured wider price or a mathematical latency bound. Losing hypotheses do not consume the bounded reservation. The actual wider action remains unpriced until its own eligible execution.
+
+DFlash2 now retains recorded native admission geometry at native width when every selected draft edge already has neural support. Lookup corroboration alone cannot rerank the native incumbent. Genuinely new lookup paths and other widths still compete using their actual selected geometry and kernel variant. Lookup feedback retains its immutable offered tree independently of the selected native tree.
+
+Validation caught and repaired two depth-contract defects before the final build: output-token budgets constrain draft depth, not sibling row capacity; `prepareTree` must not subtract the anchor twice. The regression exercises actual history queries at draft depths zero, one and fifteen plus two siblings at depth one. A fixture's unintended longer suffix was corrected without changing production semantics. The 83 focused adapter/policy/history tests passed; the corrected lookup-filtered integrated suite and ReleaseFast build then completed. Adversarial reviewers found no remaining depth-contract or rate-screening blocker.
+
+`runs/independent-v24-native-candidate-diagnostic` executed eight complete, serial-identical responses with zero invalid samples. All **16 equal-width, equal-variant, uncensored witnesses tie: 128 native versus 128 selected serial-path rows**. Eighteen witnesses joined actual published rounds; terminal-censored witnesses are excluded from that comparison. This confirms the exercised native-path retention, not a throughput improvement.
+
+The diagnostic's overall reuse gate **fails**: no persistent-origin nodes are selected after retaining the neural incumbent at fixed width eight. It is not a completed genuine-reuse benchmark, and the failed declaration is preserved. Exact publication agreement and same-prefix geometry are reported separately rather than weakening the activation gate or claiming copied neural paths as persistent-cache benefit. Adaptive wider lookup requires its own measurement.
+
+`runs/independent-v24-publication-smoke` additionally completed eight exact 70-token responses across serial, native MTP and both adaptive receipt modes. Full adaptive mode emitted 37 round receipts; publication-only adaptive mode emitted none, while both retained per-request persistent-store identity. This exercises the rebuilt MTP path without treating the smoke as a performance comparison.
+
+The next declared coding contrast uses preserved **v23 exact-order support versus v21 pooled request support**, not v24. It includes all four coding cases and first/repeat exposures, four adjacent ABBA/BAAB quartets and a serial oracle. This tests the complete binary-policy tradeoff before introducing continuation-state machinery. Pooled support can revive useful growing-copy matches but can also transfer long-match confidence to unrelated shorter matches; exact verification remains the output-correctness boundary in either case.
+
+## Request-support isolation: MTP coding (v24 experiment, preserved binaries)
+
+`runs/independent-v24-mtp-request-support-abba` compares **v23 exact-order request support** (`59bf17e2…`) with **v21 pooled-order request support** (`064dbb50…`). Both use the same combined-adaptive controls, frozen history, row-exact arithmetic and full diagnostic receipts. It does not use the v24 runtime or compare against native MTP. All **136 responses matched serial exactly** across four adjacent ABBA/BAAB quartets and a serial reference outside them.
+
+The pooled/exact-order full-workload speed ratio is **1.09379 (+9.38%)**, with descriptive quartet-bootstrap interval **1.07228–1.12017**. All four complete-workload quartet ratios favor pooled support: 1.06443, 1.13292, 1.08277 and 1.09619. Swap usage and swap-ins changed, so hardware qualification fails. The fresh-code first-exposure cell in the first quartet regresses 8.11%; it is retained, not hidden by the aggregate.
+
+| Coding case | Pooled versus exact-order: first | Repeat |
+|---|---:|---:|
+| Fresh function | −0.48% | +0.24% |
+| Related helper | +2.38% | +2.96% |
+| Related edit | +31.73% | +32.16% |
+| Related completion | +4.46% | +6.41% |
+
+Editing's realized published rounds fall **1,022→623**, while lookup rounds rise 26→180 and lookup-committed tokens rise **218→1,861**. Accepted lookup drafts rise 192→1,681 out of 364→2,520 offered drafts. Fresh-code rounds are 1,289→1,281, helper rounds 962→903 and completion rounds 662→604. This supports recovered productive reuse rather than merely more lookup attempts. These are complete treatment trajectories, not independently timed counterfactual rounds.
+
+Adversarial inspection also found a same-prefix witness in the first edit exposure: after five identical three-token rounds, pooled support accepts a local order-17 offer and commits 15 tokens, while exact-order support executes native MTP and commits three. Pooled support then fully accepts local offers at orders 32, 47 and 62; exact-order support declines the growing orders until 64. This directly demonstrates profitable copy opportunities lost through order fragmentation, without claiming counterfactual timing. The pooled sample also includes an order-six 14-draft miss, so pooling does not make every admission profitable.
+
+The evidence favors evaluating the simpler request-support rollback before adding continuation cursors or provenance-state machinery. It does not isolate the 8 KiB table footprint from trust-key behavior, eliminate long-to-short confidence contamination, establish publication-only timing, or prove the shared change is beneficial to DFlash2. A corresponding preserved-binary DFlash2 comparison is declared separately. Exact-order model calibration and exact target verification remain in both policies; the tradeoff concerns admission performance, not permission to publish incorrect drafts.
+
+## Request-support isolation: DFlash2 coding (v24 experiment, preserved binaries)
+
+The corresponding `runs/independent-v24-dflash-request-support-abba` contrast uses the same v23 exact-order and v21 pooled-order executables, frozen coding history and combined-adaptive full-receipt controls. All **136 responses matched serial exactly**. The full-workload pool/exact ratio is **0.99174 (−0.83%)**, with interval **0.97736–1.00632**; changed swap usage and swap-ins fail qualification. This is inconclusive overall, not proof of equivalence.
+
+| Coding case | Pooled versus exact-order: first | Repeat |
+|---|---:|---:|
+| Fresh function | −0.34% | −1.03% |
+| Related helper | +1.80% | −0.30% |
+| Related edit | −1.44% | −2.51% |
+| Related completion | −1.30% | −1.33% |
+
+All four edit-repeat quartet ratios favor exact-order support: approximately 0.99093, 0.94573, 0.96835 and 0.99526. Their aggregate interval is **0.95683–0.99309**. Fresh first exposure also has a quartet at 0.93478, below the existing regression guard. These are meaningful cautions despite failed hardware qualification; neither parity nor no-tradeoff is established.
+
+The smaller pooled-support implementation is selected as a candidate because of its MTP reuse recovery and reduced complexity, not because it dominates both families. The final combination with native DFlash geometry retention and rate-screened MTP exploration still needs its own two-family comparison. A large MTP gain cannot average away a DFlash regression, and effects from separate cohorts must not be multiplied.
+
+## Combined correction candidate (v25)
+
+Binary: `63aa73d85a8fdc526763cfb8105530761055a2ec609ffe4d77dbe772bc34c90f`. This combines rate-screened MTP exploration, native DFlash2 geometry retention and pooled request support. Model calibration remains exact-order; request support retains separate entry/continuation and confidence bins, reached-only learning, censoring and reset. Removing the larger request table saves **8 KiB/request**. The new growing-copy regression exercises actual price-based admission across orders 8→11→14→17 and rejects a separately miscalibrated short order despite pooled request support. All **83 focused tests passed**, followed by the lookup-filtered integrated suite and ReleaseFast build. Adversarial review found no remaining rollback defect after correcting stale test API calls.
+
+`runs/independent-v25-publication-smoke` completed eight exact 70-token requests. Full adaptive mode emitted 31 round receipts; publication-only adaptive mode emitted none, while both retained store identity. Seven full-mode preparation records exercised carried query-to-handoff plus resumed-preverify accounting; all totals equaled those disjoint parts. No preparation records appeared in serial or publication-only modes. Their summed 8.81 ms is diagnostic scope on these seven rounds—not an isolated penalty or speedup.
+
+`runs/independent-v25-preparation-fixed16` additionally completed eight exact-valid requests with zero invalid samples. Its 20 preparation records cover **two cold and 18 carried** intervals; every complete total matched its declared partition and cold records had no resumed charge. This forced-width smoke is not a production-adaptive throughput result.
+
+Preparation records are immutable flight-owned evidence, not next-query scratch. They add no GPU work or synchronization and do not yet feed routing or prices. Their optional inline field occupies **96 bytes** even when logging is disabled. The interval includes shared history work, policy/logging, materialization and existing settlement; `incremental_penalty_ns` remains null. Missing query/handoff boundaries and shadow requeries must not be treated as free preparation.
+
+### Completed native-versus-combined coding comparisons
+
+`runs/independent-v25-mtp-coding-abba` and `runs/independent-v25-dflash-coding-abba` each completed **136 exact responses**: four adjacent ABBA/BAAB quartets (128 primary requests) and eight external serial-oracle requests. Both arms within each family use the same v25 runtime and frozen history. MTP uses publication-only receipts; DFlash2 uses full diagnostic receipts. These are within-family comparisons, not a direct MTP-versus-DFlash2 race.
+
+| Family | Combined/native speed ratio | Change | 95% quartet-bootstrap interval |
+|---|---:|---:|---:|
+| MTP | 1.011923 | +1.19% | 0.989748–1.027778 |
+| DFlash2 | 0.989293 | −1.07% | 0.969592–1.007108 |
+
+Neither interval establishes a speedup or equivalence. Both cohorts fail hardware qualification because swap usage and swap-ins changed. The unfavorable cells remain part of the result; paging does not excuse them.
+
+| Coding case | MTP first | MTP repeat | DFlash2 first | DFlash2 repeat |
+|---|---:|---:|---:|---:|
+| Fresh function | −7.92% | −1.52% | −2.82% | −5.70% |
+| Related helper | +9.20% | +10.92% | −2.43% | +0.11% |
+| Related edit | −3.34% | −1.58% | −0.73% | +1.11% |
+| Related completion | +3.91% | +2.85% | +2.03% | +1.47% |
+
+MTP helper reuse improves while fresh-code first exposure loses. First fresh requests spend 73.958→80.992 seconds in decode, against only 8.436→8.473 seconds in prefill. Every feature boot has two 14-draft fresh lookup misses at orders four and one. Their gross verification duration is not an isolated incremental penalty. Related-edit lookup accepts 820 versus 824 drafts on first exposures while offering 1,260 versus 952: more offered tokens do not automatically mean more useful tokens. Intermediate-width chain prices are missing; native bootstrap and upper-width observations do not price the intervening actions.
+
+For DFlash2 fresh code, total rounds fall 560→544 but verified rows rise 4,480→4,848 and measured verification/commit time rises 67.987→71.757 seconds, with identical 3,488 committed tokens. Of 154 width-16 selections across cases, 138 are ordinary policy selections, not forced upper trials. Suppressing exploration alone therefore cannot explain or repair this result. Existing native-tree witnesses do not reconstruct a mixed, actually priced native-width alternative; that diagnostic must retain the alternative selected during the original decision.
+
+These results measure the combined correction, not independent contributions from pooling, geometry retention, width screening or lookup. Earlier component and workload gains cannot be multiplied into a combined speedup.
+
+## Flash-Next successful cache reuse smoke (v25)
+
+`runs/independent-v25-ple-reuse-cli-smoke` completed one cache-off and one cache-on CLI request. Both stopped with **59 identical published tokens**, producing the requested twelve repeated lines. Both used 48 workers. Cache-on recorded **840 hits and 152 misses** and reduced pool rounds from 91 to 39. This exercises real full-model reuse, rather than only insertion.
+
+The decoded row payload is **655,360 bytes (640 KiB)** when enabled and zero when disabled. Existing metadata is 8,480 bytes in either arm; full enabled cache accounting is 663,840 bytes (648.28 KiB). There is no additional on-disk table. Printed resident-model allocator peak is 45.914 GB in both runs, too coarse to resolve that payload.
+
+Printed decode rates are 35.314 versus 35.602 tokens/second. This single sequential pair is not a performance claim. Load-inclusive outer durations (59.335 versus 43.051 seconds) include materially different prefill/loading behavior and must not be presented as a cache speedup. A balanced repeated CLI comparison must report decode and load-inclusive time separately; it remains distinct from the server configuration that failed normal memory admission.
+
+The subsequent 32-request declaration `runs/independent-v25-ple-cli-abba` failed on its second request, before any cache-on arm. The model completed 407 tokens, but the coding output included explanation and Markdown and failed the unchanged Python-source gate. The CLI mapping had omitted the contract's system instruction requiring source-only output. Both completed observations and the failed cohort remain intact; no performance estimate is available.
+
+A separately declared schema-two workload explicitly flattens system content, two newlines and user content into the CLI's single user message. This is documented input adaptation, not HTTP role parity. It does not strip model output, weaken the source gate, change token caps, or resume the failed schedule.
+
+`runs/independent-v25-ple-cli-instructions-abba` also stopped at its second off-arm request. The adapted prompt completed 165 tokens, but the model still returned a Markdown-fenced answer and failed the unchanged source gate. There were no cache-on observations and no performance estimate. This is a remaining model/workload-quality limitation, not evidence for or against the cache's speed. Do not strip the fences or reinterpret either failed declaration as a completed comparison.
+
+A new normal-admission server attempt, `runs/independent-v25-ple-server-headroom-abba`, used the preserved v25 runtime and the unchanged 96-request server declaration. Despite a low-pressure system reading, actual preflight reported **51.38 GiB available versus approximately 55.0 GiB required**. It stopped before any request. Further inspection found a stronger constraint: `scheduler.loadAvail` takes the minimum of host availability and Metal's recommended working-set limit. The actual device query returned **55,662,788,608 bytes (51.84 GiB)** with `iogpu.wired_limit_mb=0`. Closing apps alone cannot satisfy this pack's approximately 55-GiB admission requirement under the current ceiling. No guard or global GPU-memory override was used. The server runner's process-creation cancellation fix was independently reviewed and exercised with a real owned child before this attempt.
+
+## Actual competing-width geometry (v26 diagnostic)
+
+Binary: `218774a5a0d2292b361cd8105e558ad357e2041315f577c06b9d95ac61737f15`. The diagnostic retains the selection evaluation's actual native-width prefix mask and incumbent-retention decision. It reconstructs that alternative without rerunning selection, rebuilding the neural lattice or executing another target forward. A mixed alternative is not silently replaced by the original native tree. Emission requires full receipts and price tracing; this is not timing-neutral.
+
+The build passed **83 focused Zig tests and 310 Python helper tests**, followed by the lookup-filtered integrated suite and ReleaseFast build. The eight-request `runs/independent-v26-competing-candidate-diagnostic` completed with zero invalid samples and exact serial publication. Its 14 joined native witnesses include eight uncensored equal-width/equal-variant ties (64 versus 64 serial-path rows).
+
+Four additional witnesses compare the actual priced eight-row alternative with the chosen sixteen-row action. All four are uncensored and cover **eight versus sixteen serial-path rows**. Two are explicitly unpriced upper trials; two are ordinary priced selections. For the latter, the decision's predicted verifier costs are 86.364 ms (eight-row generic) and 124.421 ms (sixteen-row linear-GDN). These are historical decision inputs, not same-state executed alternate timings. This small repeated-code example demonstrates useful wider path coverage, not a throughput claim or an explanation of the fresh-coding regression.
+
+Adversarial review found no remaining diagnostic or analyzer blocker. Analysis also rejected malformed widths/rate arithmetic and censored terminal output in CPU boundary checks. Earlier equal-width evidence still reduces to its original 16 ties / 128 versus 128 rows with the extended analyzer.
+
+The subsequent `runs/independent-v26-coding-geometry-diagnostic` covers all four coding cases and first/repeat exposures: **16 exact responses across serial and adaptive boots**, with no invalid samples. It deliberately produces no throughput estimate. Its 193 native witnesses include 170 uncensored equal-width comparisons: 167 ties, two one-row losses and one three-row loss (1,137 native versus 1,132 selected path rows). Genuinely new lookup paths can still displace native paths; retaining corroborated neural geometry does not prohibit that competition.
+
+| Coding case | Wider choices | Forced choices | Choices with no extra path rows | Predicted extra rows, summed | Actual extra serial-path rows, summed |
+|---|---:|---:|---:|---:|---:|
+| Fresh function | 5 | 2 | 4 | 8.422 | 4 |
+| Related helper | 6 | 0 | 2 | 11.404 | 16 |
+| Related edit | 3 | 0 | 0 | 9.826 | 12 |
+| Related completion | 1 | 0 | 0 | 2.950 | 2 |
+
+All fifteen competing-width witnesses are uncensored; two editing witnesses exercise **mixed alternatives**, not retained native geometry. The contrast exposes fresh-code marginal-yield overprediction in this trajectory while related helper/edit paths benefit from extra coverage. It does not time the unexecuted smaller actions, and these diagnostic counts cannot be converted into a speedup percentage. The same choice can reduce rounds yet lose wall time when its extra verification cost exceeds its extra useful coverage.
+
+## Production chain-price acquisition: complete requests, failed qualification
+
+`runs/independent-v25-mtp-chain-training` executed all **232 declared requests**, with exact serial publication and zero request-validation errors. The acquisition took 1,325.15 seconds overall; summed request time was 1,120.76 seconds. All fourteen supported context-zero chain/generic widths (2–15) had post-cold observations from both opposite-order sweeps. Receipt membership includes 28 first-actual-execution exclusions, 5,324 otherwise eligible observations and 152 inadmissible executions.
+
+The cohort failed its declared hardware gate because swap usage and swap-ins changed. Endpoint evidence shows swap-ins during **174 of 232 requests**, totaling 29,615 system page-in counter increments; there were no request-aligned swap-outs. This is not merely a boot-only qualification failure, and the counters do not identify which process paged. No price profile was exported; profile-off/on evaluation is therefore not yet available.
+
+The retained diagnostic population has median verification/commit durations around 117–122 ms at widths three through eight and 169–172 ms at widths nine through fifteen (width two: 98.97 ms). These are different-prefix, different-acceptance production populations under unqualified machine conditions, not a measured same-state hardware staircase. They justify investigating intermediate widths but do not establish their causal performance benefit or authorize filling missing production prices.
+
+The CPU declaration and twelve profile-contract tests passed, including the reviewed relative-output-path fix. Adversarial review found no remaining acquisition/export or provenance blocker. The outstanding prerequisite for qualified export is a stable measured acquisition environment, not a configured profile filename or another unmodified retry.
+
+## Actual native action remains eligible (v27)
+
+Binary: `53b9c4fd3935de90b43cdc693612cff67724951ab45f3fc5dca629e29954cfbe`. The earlier incumbent-retention rule protected native only when the mixed prefix had no lookup-only edge. Otherwise, the mixed action replaced native at its width—even if native had a known kernel price and the mixed kernel was unknown. Bootstrap could consequently execute an unpriced mixed action under the native label.
+
+The correction evaluates native and mixed candidates using their respective rewards and actual kernel prices, choosing the better eligible representative at that width and retaining native on exact ties. Bootstrap now prepares the actual native action. It adds no new price estimator, confidence shrinkage, near-tie margin, GPU operation or heap allocation. Explicit fixed-width controls keep their row count; upper exploration keeps its bounded reservation rules.
+
+Both added regression tests failed before the fix. They cover cold/native-only/dominated/faster mixed kernel populations, native exact ties and legitimately better lookup candidates. All **85 focused tests passed**, followed by the lookup-filtered integrated suite and ReleaseFast build. Adversarial review found no remaining runtime-consumer, bound, forced-width or diagnostic reconstruction defect.
+
+`runs/independent-v27-native-competition-diagnostic` completed **16 exact coding responses**, first/repeat across all four cases, with zero invalid samples. All **183 uncensored equal-width/equal-variant native comparisons tie**, totaling 1,244 versus 1,244 serial-path rows. Thirteen wider comparisons remain, including six with no extra coverage. This validates the exercised geometry and complete publications, not a speedup. In particular, native already competed in the earlier fresh-code near-tie; this structural correction does not claim to fix that marginal-yield prediction.
+
+The isolated `runs/independent-v27-native-competition-abba` comparison uses v26 versus v27 with identical combined-adaptive controls and frozen history, not a native baseline. All **136 responses matched serial exactly**. The full-workload ratio is **1.00603 (+0.60%)**, with quartet-bootstrap interval **1.00049–1.01160**. Quartet ratios are 1.00101, 1.01372, 0.99998 and 1.00949. The small observed gain does not meet the declared 5% practical margin, and changed swap usage/swap-ins fail hardware qualification.
+
+| Coding case | v27 versus v26: first | Repeat |
+|---|---:|---:|
+| Fresh function | −2.87% | +0.85% |
+| Related helper | +0.27% | +1.38% |
+| Related edit | +0.95% | +2.59% |
+| Related completion | +1.57% | −0.25% |
+
+Fresh first exposure regresses in all four quartets; edit repeat improves in all four. Neither pattern is erased by the aggregate. The structural correction remains justified by native-action eligibility and the reproduced dominated-action case, not by a universal performance claim. A direct native-versus-combined comparison is separate.
+
+Adversarial attribution review found different work-count evidence for those cases. Across eight edit-repeat requests, rounds fall 208→200 and verified rows fall 1,696→1,616. That is a real reduction, although it cannot account for the entire measured timing difference. Fresh-first instead changes 271→272 rounds and 2,440→2,432 rows; seven of eight earlier requests already have the same width schedule and accepted-token sequence as all eight corrected requests. Large settled-duration differences also occur on matching offered geometry, dispatch and acceptance. These records do not isolate the fresh regression to increased work, nor establish hardware variability as its sole cause. No fitted near-tie margin or reward rescaling was added.
+
+The direct native-versus-v27 comparison, `runs/independent-v27-dflash-coding-abba`, subsequently completed all **136 responses exactly**. Its combined full-workload ratio is **1.00479 (+0.48%)**, interval **0.99110–1.02281**; the four quartet ratios are 1.00420, 1.03335, 0.99035 and 0.99184. Swap usage and swap-ins again fail hardware qualification. This is an observed near-neutral aggregate, not established acceleration over native DFlash2.
+
+| Coding case | Combined v27 versus native DFlash2: first | Repeat |
+|---|---:|---:|
+| Fresh function | −4.60% | −1.68% |
+| Related helper | +0.10% | +2.15% |
+| Related edit | +2.62% | +3.50% |
+| Related completion | +0.51% | +0.97% |
+
+Fresh-first loses in every quartet; edit-repeat improves in every quartet, with interval 1.00958–1.07212 before hardware qualification. These opposing workload effects are why isolated component gains must not be added together or advertised as a general stacked speedup.
+
+The direct native comparison makes the workload tradeoff concrete. Across eight fresh-first requests, rounds fall 280→272 while verifier rows rise 2,240→2,448 (**+9.29%**). At anchors 130, 138 and 229, every feature request verifies sixteen versus eight rows yet commits the same eight tokens as native: 192 extra verified rows without extra coverage at those decisions. The first two anchors are bounded learning actions; the third is ordinary priced selection. Widening elsewhere does add coverage and reduces rounds, so suppressing every wider action is not justified.
+
+Edit-repeat instead falls 216→200 rounds and 1,728→1,640 verifier rows. Assistant-bearing rounds rise 144→198: native already has a useful local-copy bypass, which the combined policy often trades away. The observed edit gain therefore is not evidence that the feature primarily saves assistant calls. Adversarial review found no reporting defect; these actual work differences explain mechanisms without assigning an isolated millisecond cost to unexecuted alternatives.
+
+## MTP post-query preparation correction (v28)
+
+Binary: `6a5750780959964f46414c5d1b98afcdde9dc47a618248ded2ad4f536feb1a14`. Row-exact MTP native-cycle admission now adds each lookup width's known post-query preparation before selecting the best width. Native cost remains unchanged. Cold/carried estimates are separate; missing preparation preserves the prior hypothesis without inventing an observation or reopening verifier exploration. This corrects omitted empirical lookup work, not exact same-state total-action pricing.
+
+Verification passed **92 focused Zig tests and 310 Python helper tests**, the lookup-filtered integrated suite and ReleaseFast build. Adversarial review found no remaining implementation defect. Review of the new smoke caught a missing executed-width check; the corrected gate rejects a requested fifteen-row action executing eight rows while allowing legitimate capped widths.
+
+`runs/independent-v28-preparation-accounting-smoke` completed **eight exact 70-token responses** across serial, native MTP, forced-width lookup with full receipts, and the same lookup control with publication-only receipts. The full arm produced twenty eligible preparation records: two cold records with one learned sample, and eighteen carried records with fifteen learned samples after per-cell cold exclusions. Both feature arms exposed twelve admissions with positive learned carried preparation. Publication-only emitted no full round/preparation records. This proves exercised acquisition and complete publication, not adaptive performance.
+
+Cold preparation measured 0.050–0.108 ms and carried preparation 0.672–2.643 ms in this smoke; these are active wall intervals, not pure GPU or incremental switching costs. The measured estimator storage is **9,720 bytes per model policy**, with no added disk file. The optional flight snapshot is **112 bytes**, up 16 bytes from v25. Separate v27/v28 publication-only ABBA evaluates whether this correction improves real coding latency.
+
+The initial isolated comparison, `runs/independent-v28-mtp-preparation-abba`, stopped after **96 request-valid observations** and before its serial-reference boot. The runtime guard detected a hostname change, `Mac.localdomain`→`Jason-M2-MacBook.local`; comparison of both frozen executable identities found no other changed field. The cohort remains incomplete and has no throughput estimate or complete serial-exactness claim.
+
+Runtime identity schema two excludes the network hostname while retaining OS/kernel build, architecture, dependency resolution, executable/library hashes and Metal assets. The hostname regression failed before this correction and the eight runtime-identity tests passed afterward. Actual installed-runtime inspection covered seven images and thirteen Metal candidates and remained identical under a simulated hostname change. This fixes a false interruption, not a hardware qualification failure; the old cohort is not resumed or reclassified.
+
+## Native DFlash2 backed-copy preservation (v29)
+
+Binary: `e357c1c866a329f7c7aaa8a87416aaf1bda95d1ccbb5681331cbf6e0a55a7031`. The earlier tiered route disabled the host's backed-copy shortcut and could invoke the assistant for an already available seven-token copy. At the retained v27 edit-repeat prefix 285, the local offer contained that continuation, but its discounted predicted yield lost to the assistant comparator. This was loss of an existing action's identity/economics, not absence of its tokens.
+
+The correction retains the actual native copy as a distinct candidate, including its backing length and silence eligibility. Unknown economics preserve that action; known copy competes using paired actual remaining duration/yield, without a perfect-copy prior or fitted margin. It executes preselected geometry rather than appending copies to a selected tree. Copy and assistant remaining clocks now share the post-query, pre-policy boundary. Therefore the isolated before/after contrast includes baseline-action preservation **and this required clock alignment**, not an independently toggled copy-only effect.
+
+Adversarial review caught the clock mismatch before integration. Parent integration also reproduced and fixed a receipt-price mismatch: a selected copy had inherited the competing lookup/plain price. Unknown selected-copy prices now remain null; known selected-copy prices match that action. Losing-copy economics remain separately visible. Two regression assertions failed before the reporting fix. Final verification passed **101 focused Zig tests, 316 Python tests, all five targeted native-copy runtime regressions and ReleaseFast compilation**; the lookup-filtered integrated suite also passed during integration.
+
+`runs/independent-v29-native-copy-diagnostic` completed **sixteen exact responses** across the four coding cases and both exposures, with zero validation errors. Editing offered nine native copies in each exposure. First exposure selected six copies—two with unknown economics and four with known economics—committing 42 tokens with 36 accepted drafts. Repeat selected one known copy, committing two tokens with one accepted draft. No native-copy opportunities appeared in the other three cases. The diagnostic proves unknown/known execution and complete output, not a latency gain; its price tracing perturbs the measured populations.
+
+Measured state growth is **960 bytes per existing context-map value**, excluding spare map capacity; query scratch is **256 KiB of bounded stack space**. No new disk file or second estimator map is added. Native-copy selected geometry has its own identity and is not falsely counted as pruning the lookup offer. The subsequent four-quartet v28/v29 comparison uses full receipts without price tracing.

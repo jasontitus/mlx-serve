@@ -152,11 +152,24 @@ class CounterfactualReceipts(unittest.TestCase):
                 for row in pair:
                     row['prepared'].update(preparation=preparation, assistant_horizon=7,
                                            suffix_candidates=preparation == 'production-combined')
+                    if preparation == 'production-neural':
+                        # Extra rows are siblings, not an invented deeper horizon.
+                        row['kernel']['variant'] = 'generic'
+                        row['kernel']['geometry']['selected_parents'][8:] = [0] * 8
+                        row['kernel']['geometry']['selected_depths'][8:] = [1] * 8
                 measured = cf.validate_pair(pair, 'assistant16', preparation)
                 self.assertEqual(measured['prepared']['assistant_horizon'], 7)
                 pair[1]['kernel']['rows'] = 8
                 with self.assertRaisesRegex(ValueError, 'forced width'):
                     cf.validate_pair(pair, 'assistant16', preparation)
+
+    def test_neural_only_width_does_not_extend_assistant_horizon(self):
+        pair = self.pair()
+        for row in pair:
+            row['prepared'].update(preparation='production-neural', assistant_horizon=7,
+                                   suffix_candidates=False)
+        with self.assertRaisesRegex(ValueError, 'exceeds actual assistant horizon'):
+            cf.validate_pair(pair, 'assistant16', 'production-neural')
 
     def test_preparation_mismatch_and_neural_lookup_actions_fail_closed(self):
         for action in ('serial', 'assistant1', 'assistant16'):
@@ -293,13 +306,24 @@ class TrainingPriceExport(unittest.TestCase):
         self.assertEqual(source['prices_sha256'], cf.hashlib.sha256(self.output.read_bytes()).hexdigest())
         self.assertEqual(source['preparation'], 'merged16')
         row = cf.normalized(cf.load(self.feature / 'receipts.json')[1])
-        self.assertEqual(source['source_windows'], [{
-            'path': str(self.feature), 'plan_sha256': cf.sha(self.feature / 'plan.json'),
-            'receipts_sha256': cf.sha(self.feature / 'receipts.json'),
-            'action': 'assistant16', 'case': 'train-config-a',
-            'prepared': row['prepared'], 'geometry': row['kernel']['geometry'],
-            'accepted_drafts': 0, 'committed_tokens': 1,
-        }])
+        self.assertEqual(len(source['source_windows']), 1)
+        window = source['source_windows'][0]
+        self.assertEqual(window['path'], str(self.feature))
+        self.assertEqual(window['plan_sha256'], cf.sha(self.feature / 'plan.json'))
+        self.assertEqual(window['receipts_sha256'], cf.sha(self.feature / 'receipts.json'))
+        self.assertEqual((window['action'], window['case']), ('assistant16', 'train-config-a'))
+        self.assertEqual(window['prepared'], row['prepared'])
+        self.assertEqual(window['geometry'], row['kernel']['geometry'])
+        self.assertEqual((window['accepted_drafts'], window['committed_tokens']), (0, 1))
+        warmup, measured = window['acquisition_timings']
+        self.assertEqual(warmup['verify_commit_ns'], 1000000)
+        self.assertEqual(measured['verify_commit_ns'], 23000)
+        self.assertEqual(measured['diagnostic_readback_ns'], 9000000)
+        self.assertEqual(measured['full_round_ns'], 99000000)
+        # These costs are retained for accounting, never added to the exported
+        # 0.023ms measured verify/commit cell or mislabeled as a full-round price.
+        self.assertTrue({'warmup', 'diagnostic_readback_ns', 'full_round_ns'}
+                        <= set(source['excluded_timings']))
         self.assertNotIn('step_ms', cf.load(self.output))
 
     def test_sidecar_binding_covers_exact_bytes_not_reserialized_json(self):
@@ -330,6 +354,9 @@ class TrainingPriceExport(unittest.TestCase):
         rows = cf.load(self.feature / 'receipts.json')
         for row in rows:
             row['prepared'].update(preparation='production-neural', assistant_horizon=7, suffix_candidates=False)
+            row['kernel']['variant'] = 'generic'
+            row['kernel']['geometry']['selected_parents'][8:] = [0] * 8
+            row['kernel']['geometry']['selected_depths'][8:] = [1] * 8
         cf.save(self.feature / 'receipts.json', rows)
         self.export()
         source = cf.load(self.source)

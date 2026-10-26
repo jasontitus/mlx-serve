@@ -139,6 +139,9 @@ def validate_receipt(receipt, action, phase, preparation='merged16'):
         parent = parents[index]
         require(type(parent) is int and 0 <= parent < index and depths[index] == depths[parent] + 1,
                 'invalid selected parent/depth geometry')
+    if preparation == 'production-neural':
+        require(max(depths[:width]) <= horizon and count <= horizon + 1,
+                'neural-only geometry/publication exceeds actual assistant horizon')
     committed = geometry['committed_rows'][:count]
     require(geometry['committed_count'] == count and len(committed) == count and committed[0] == 0,
             'commit geometry count mismatch')
@@ -537,6 +540,7 @@ def export_prices(paths, oracle, output):
         sources.append({'path': str(root), 'plan_sha256': sha(root / 'plan.json'),
                         'receipts_sha256': sha(root / 'receipts.json'),
                         'action': plan['action'], 'case': plan['case']['id'],
+                        'acquisition_timings': [receipt['timing'] for receipt in load(root / 'receipts.json')],
                         'prepared': row['prepared'], 'geometry': kernel['geometry'],
                         'accepted_drafts': row['accepted_drafts'], 'committed_tokens': row['published_len']})
     plan = plans[0]
@@ -556,6 +560,9 @@ def export_prices(paths, oracle, output):
         'throughput_claim': False, 'aggregation': 'none; duplicate cells rejected',
         'excluded_timings': ['warmup', 'diagnostic_readback_ns', 'full_round_ns'],
         'plain_evidence': 'none; forced one-row chain/tree is not relabeled as plain',
+        'calibration_cost_scope': 'Both warmup and measured acquisition timings retained per source; '
+                                  'boot, prefill, serial oracle and remaining request costs are not '
+                                  'amortized into these verify/commit priors. Not a full-round price.',
     }
     price_path, source_path = save_new_prices(output, table, provenance)
     print(json.dumps({'prices': str(price_path), 'provenance': str(source_path),

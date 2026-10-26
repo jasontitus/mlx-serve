@@ -550,15 +550,17 @@ def price_files(out, curves):
             raise runner.BenchError("price curves require an explicit observed variant key") from exc
         if not isinstance(parts, list) or len(parts) != 7:
             raise runner.BenchError("price curves require an explicit observed variant key")
-        mode, _profile, kind, variant, cls, rows, cost_regime = parts
+        mode, profile, kind, variant, cls, rows, cost_regime = parts
         if variant not in VERIFY_VARIANTS or cell.get("variant") != variant:
             raise runner.BenchError("price curves require unambiguous observed executed variant evidence")
-        kinds = tables.setdefault(mode, {}).setdefault(str(cls), {})
+        # Different prompt profiles can share a coarse context class without
+        # sharing geometry or preparation cost. Never pool them into one prior.
+        kinds = tables.setdefault(mode + "/" + profile, {}).setdefault(str(cls), {})
         kinds.setdefault(kind, {}).setdefault(variant, {}).setdefault(str(rows), []).append(cell)
         if rows == 1 and cost_regime == "no-assistant":
             kinds.setdefault("plain", {}).setdefault(variant, {}).setdefault("1", []).append(cell)
     paths = {}
-    for mode, table in tables.items():
+    for binding, table in tables.items():
         result = {"schema": 3, "context_bucket": CONTEXT_BUCKET}
         for cls, kinds in table.items():
             result[cls] = {
@@ -568,9 +570,9 @@ def price_files(out, curves):
                         for rows, cells in widths.items()}
                     for variant, widths in variants.items()}
                 for kind, variants in kinds.items()}
-        path = out / (mode + "-training-prices.json")
+        path = out / (identity(binding) + "-training-prices.json")
         runner.atomic_json(path, result)
-        paths[mode] = path
+        paths[binding] = path
     return paths
 
 
@@ -756,7 +758,7 @@ def main(argv=None):
                             actions.reverse()
                         for action in actions:
                             rows.append(execute(args, binary, model, out, mode, profile, phase, repetition,
-                                                action, corpus, snapshot, paths.get(mode)))
+                                                action, corpus, snapshot, paths.get(mode + "/" + profile["id"])))
             if phase == "train":
                 curves = fit_curves(rows, widths)
                 hardware_curves = fit_curves(rows, widths, causal=True)

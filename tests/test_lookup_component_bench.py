@@ -108,6 +108,65 @@ class ComponentMatrix(unittest.TestCase):
                 c.component_orders('mtp', 'lookup', arms, count)
 
 
+class IsolatedWidthQuartets(unittest.TestCase):
+    def test_each_primary_has_its_own_adjacent_quartet_and_native_references(self):
+        for component in c.WIDTH_QUARTETS:
+            plan = protocol(component=component)
+            definitions = plan['arm_definitions']
+            primary, = [item for item in plan['contrasts'] if item['role'] == 'primary']
+            a, b = primary['baseline'], primary['treatment']
+            self.assertEqual(len(definitions), 7)
+            self.assertEqual(len(plan['contrasts']), 3)
+            for block, order in enumerate(plan['orders']):
+                self.assertEqual(order[0 if block % 2 == 0 else -1], 'serial')
+                logical = [definitions[arm]['comparison_arm'] for arm in order if arm != 'serial']
+                self.assertEqual(logical[1:5], [a, b, b, a] if block % 2 == 0 else [b, a, a, b])
+                self.assertEqual([logical[0], logical[-1]], ['dflash-native'] * 2)
+                self.assertEqual(Counter(order), Counter(list(definitions)))
+            rows, boots = observations(plan)
+            self.assertEqual(len(rows), 224)
+            self.assertEqual(c.schedule_errors(plan, rows, boots), [])
+            self.assertTrue(c.schedule_errors(plan, rows[:-1], boots))
+            for family in ('mtp', 'pld'):
+                with self.assertRaises(c.r.BenchError):
+                    c.component_matrix(family, component, 8)
+
+    def test_slot_drift_cancels_without_pooling_native_or_other_contrasts(self):
+        for component in c.WIDTH_QUARTETS:
+            plan = protocol(component=component)
+            primary = plan['contrasts'][0]
+            rows, _ = observations(plan)
+            for row in rows:
+                logical = plan['arm_definitions'][row['arm']].get('comparison_arm', row['arm'])
+                slot = plan['orders'][row['pair']].index(row['arm'])
+                row['seconds'] = (1 + .2 * slot) * (2 if logical == primary['baseline'] else 1)
+                if logical == 'dflash-native':
+                    row['seconds'] = 10000 + slot  # Must not contaminate the primary.
+            effect = c.contrast_effects(plan, rows)[0]
+            self.assertTrue(effect['isolated_width_contrast'])
+            self.assertEqual(effect['statistical_unit'], 'complete four-boot ABBA/BAAB quartet')
+            for estimate in (effect['full_workload'], *effect['case_exposure'].values()):
+                self.assertEqual(estimate['boot_blocks'], 4)
+                for ratio in estimate['ratios']:
+                    self.assertAlmostEqual(ratio, 2)
+            for arm in c.comparison_groups(plan)[primary['treatment']]:
+                missing = [row for row in rows if not (row['pair'] == 0 and row['arm'] == arm
+                           and row['case'] == c.CASES[0] and row['rep'] == -1)]
+                self.assertEqual(c.contrast_effects(plan, missing)[0]['full_workload']['boot_blocks'], 3)
+
+    def test_primary_replicas_share_every_control_except_selection(self):
+        for component in c.WIDTH_QUARTETS:
+            plan = protocol(component=component)
+            primary = plan['contrasts'][0]
+            specs = []
+            for name in (primary['baseline'], primary['treatment']):
+                original = plan['arm_definitions'][name]
+                self.assertEqual(original, plan['arm_definitions'][name + '-repeat'])
+                specs.append({key: value for key, value in original.items()
+                              if key not in ('selection', 'actual', 'comparison_arm')})
+            self.assertEqual(*specs)
+
+
 class ProductionRoutingQuartets(unittest.TestCase):
     def test_production_comparison_does_not_claim_a_forced_ablation(self):
         for family in ('mtp', 'dflash'):
@@ -276,6 +335,19 @@ class MechanismObservation(unittest.TestCase):
         self.assertTrue(observed['width_cut_requirement_pass'])
         self.assertFalse(observed['backoff_observed'])
         self.assertTrue(observed['backoff_requirement_pass'])
+
+    def test_native_copy_is_not_reported_as_staircut_pruning(self):
+        plan = protocol('dflash', 'production-routing')
+        plan['reuse'] = {}
+        arm = 'dflash-combined-adaptive'
+        rows = [{'arm': arm, 'case': 'unrelated-prose', 'rounds': [
+            {'selection': 'adaptive', 'rows': 8, 'legal_rows': 16, 'commit_scope': 'published',
+             'native_copy': {'selected': True}},
+            {'selection': 'adaptive', 'rows': 8, 'legal_rows': 16, 'commit_scope': 'published',
+             'native_copy': {'selected': False}}]}]
+        observed = c.mechanism_evidence(plan, rows)[arm]
+        self.assertEqual(observed['native_copy_selected_rounds'], 1)
+        self.assertEqual(observed['width_reduced_rounds'], 1)
 
     def test_fixed_caps_do_not_satisfy_forced_cut_requirement(self):
         plan = protocol('dflash', 'neural-width')
@@ -492,6 +564,7 @@ class OfflinePriceContracts(unittest.TestCase):
                          'binary_sha256': 'b' * 64, 'runtime_identity': {'images': 'frozen'}, 'model': {'id': 'target'},
                          'model_content': {'target': {'weights': 'd' * 64}, 'assistant': {'weights': 'e' * 64}},
                          'contract_sha256': c.r.digest(c.s.CONTRACT),
+                         'preparation': 'production-neural', 'seed_hashes': {'persistent': {'tokens.bin': 'f' * 64}},
                          'source_windows': [{'path': '/independent-training', 'action': 'assistant8', 'case': 'training'}],
                          'scope': 'same-state first-offer verify/commit only; no throughput claim'}
         c.d.save(self.price, self.table)
@@ -499,7 +572,7 @@ class OfflinePriceContracts(unittest.TestCase):
         c.d.save(self.source, self.metadata)
 
     def price_plan(self, declaration):
-        return dict(self.metadata, prices=declaration,
+        return dict(self.metadata, prices=declaration, reuse={'hashes': self.metadata['seed_hashes']},
                     source_hashes={str(c.s.CONTRACT.resolve()): c.r.digest(c.s.CONTRACT)})
 
     def bind_current_table(self):
@@ -646,6 +719,16 @@ class OfflinePriceContracts(unittest.TestCase):
                 with self.assertRaises(c.r.BenchError):
                     c.validate_prices(incomplete)
 
+    def test_foreign_candidate_preparation_or_seed_cannot_supply_prices(self):
+        declaration = c.price_declaration(self.price, self.source)
+        for component in ('combined-fixed-cut', 'combined-max-cut'):
+            with self.assertRaisesRegex(c.r.BenchError, 'preparation'):
+                c.bind_prices(protocol(component=component)['arm_definitions'], declaration)
+        plan = self.price_plan(declaration)
+        plan['reuse'] = {'hashes': {'persistent': {'tokens.bin': 'different'}}}
+        with self.assertRaisesRegex(c.r.BenchError, 'seed_hashes'):
+            c.validate_prices(plan)
+
     def test_runtime_checks_include_price_validation(self):
         plan = {'binary': '/binary', 'runtime_identity': {'images': 'frozen'}}
         with mock.patch.object(c.r, 'runtime_identity', return_value={'images': 'changed'}):
@@ -685,7 +768,6 @@ class PldBackoffContracts(unittest.TestCase):
 
     def test_matrix_changes_backoff_only_with_separate_serial_reference(self):
         definitions, contrasts = c.component_matrix('pld', 'suffix-backoff', 8)
-        self.assertEqual(list(definitions), ['serial', 'pld-backoff-off', 'pld-backoff-on'])
         self.assertEqual(definitions['serial']['mode'], 'serial')
         for arm, enabled in (('pld-backoff-off', '0'), ('pld-backoff-on', '1')):
             self.assertEqual(definitions[arm]['mode'], 'pld-persistent')
@@ -696,6 +778,35 @@ class PldBackoffContracts(unittest.TestCase):
         self.assertEqual([(item['baseline'], item['treatment']) for item in primary],
                          [('pld-backoff-off', 'pld-backoff-on')])
         self.assertTrue(all(item['baseline'] == 'serial' for item in contrasts if item['role'] != 'primary'))
+
+    def test_backoff_quartets_cancel_slot_drift_without_serial_contamination(self):
+        plan = protocol('pld', 'suffix-backoff')
+        primary, = [item for item in plan['contrasts'] if item['role'] == 'primary']
+        a, b = primary['baseline'], primary['treatment']
+        definitions = plan['arm_definitions']
+        for block, order in enumerate(plan['orders']):
+            logical = [definitions[arm]['comparison_arm'] for arm in order]
+            self.assertEqual(logical[1:-1], [a, b, b, a] if block % 2 == 0 else [b, a, a, b])
+            self.assertEqual((logical[0], logical[-1]), ('serial', 'serial'))
+        rows, boots = observations(plan)
+        self.assertEqual(c.schedule_errors(plan, rows, boots), [])
+        for row in rows:
+            logical = definitions[row['arm']]['comparison_arm']
+            slot = plan['orders'][row['pair']].index(row['arm'])
+            row['seconds'] = 10000 + slot if logical == 'serial' else (1 + .2 * slot) * (2 if logical == a else 1)
+        effect = next(item for item in c.contrast_effects(plan, rows) if item['role'] == 'primary')
+        for estimate in (effect['full_workload'], *effect['case_exposure'].values()):
+            self.assertEqual(estimate['boot_blocks'], 4)
+            for ratio in estimate['ratios']:
+                self.assertAlmostEqual(ratio, 2)
+        for arm in c.comparison_groups(plan)[a] + c.comparison_groups(plan)[b]:
+            missing = [row for row in rows if not (row['pair'] == 0 and row['arm'] == arm and
+                       row['case'] == c.CASES[0] and row['rep'] == -1)]
+            self.assertTrue(c.schedule_errors(plan, missing, boots))
+            incomplete = next(item for item in c.contrast_effects(plan, missing) if item['role'] == 'primary')
+            self.assertEqual(incomplete['full_workload']['boot_blocks'], 3)
+        with self.assertRaises(c.r.BenchError):
+            c.component_orders('pld', 'suffix-backoff', ['serial', a, b], 4)
 
     def test_exact_saturating_windows_cumulative_emissions_and_reset(self):
         self.assertEqual(c.backoff_errors(self.row()), [])
@@ -743,13 +854,30 @@ class PldBackoffContracts(unittest.TestCase):
         plan['reuse'] = {}
         rows, _ = observations(plan)
         for row in rows:
-            row.update(rounds=[], commits=[], backoff_events=backoff_trace() if row['arm'] == 'pld-backoff-on' else [])
+            row.update(rounds=[], commits=[], backoff_events=backoff_trace()
+                       if plan['arm_definitions'][row['arm']].get('backoff') else [])
         self.assertTrue(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_requirement_pass'])
-        next(row for row in rows if row['arm'] == 'pld-backoff-on' and row['case'] == 'unrelated-prose')['backoff_events'] = []
-        self.assertFalse(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_requirement_pass'])
+        for arm in c.comparison_groups(plan)['pld-backoff-on']:
+            missing = copy.deepcopy(rows)
+            next(row for row in missing if row['arm'] == arm and row['case'] == 'unrelated-prose')['backoff_events'] = []
+            self.assertFalse(c.mechanism_evidence(plan, missing)['pld-backoff-on']['backoff_requirement_pass'])
 
 
 class ReceiptControls(unittest.TestCase):
+    def test_independent_copy_geometry_does_not_fake_lookup_offer_capacity(self):
+        row = controlled_row(source='combined', selection='adaptive')
+        receipt = row['rounds'][0]
+        receipt.update(family='dflash', candidate_rows=4, legal_rows=4, assistant=False,
+            selected_local=7, selected_neural=0, predicted_tokens=None, executed_geometry_hash=123,
+            native_copy={'rows': 8, 'backing_length': 26, 'geometry_hash': 123,
+                         'selected': True, 'ms_per_token': None, 'expected_tokens': None},
+            route={'alternative_source': 'native_copy', 'decision': {
+                'skip': True, 'reason': 'native_copy_unmeasured', 'native_copy': True,
+                'native_copy_ms': None, 'native_copy_tokens': None}})
+        self.assertEqual(c.component_receipt_errors(row), [])
+        receipt['executed_geometry_hash'] = 456
+        self.assertIn('round_0:native_copy_execution_mismatch', c.component_receipt_errors(row))
+
     def test_unsettled_native_entry_cannot_masquerade_as_verified_work(self):
         receipt = {'family': 'pld', 'kind': 'chain', 'selection': 'cut',
                    'timing_scope': 'native_entry_unsettled', 'lookup_candidates': True,
@@ -783,6 +911,21 @@ class ReceiptControls(unittest.TestCase):
         for selection in ('fixed', 'max', 'cut'):
             with self.subTest(selection=selection):
                 self.assertEqual(c.component_receipt_errors(controlled_row(selection=selection)), [])
+
+    def test_cut_width_learning_is_charged_and_never_allowed_in_fixed_max_controls(self):
+        probe = {'family': 'dflash', 'class': 0, 'rows': 16, 'variant': 'generic',
+                 'reason': 'upper_width_learning', 'reservation_consumed': True,
+                 'max_forced_executions': 2}
+        row = controlled_row()
+        row['width_probe_events'] = [probe]
+        self.assertEqual(c.component_receipt_errors(row), [])
+        self.assertIn('width trials', c.PROTOCOL['cost_accounting']['endpoint'])
+        for selection in ('fixed', 'max'):
+            control = controlled_row(selection=selection)
+            control['width_probe_events'] = [probe]
+            self.assertIn('width_probe_in_nonlearning_control', c.component_receipt_errors(control))
+        row['width_probe_events'] = [dict(probe, max_forced_executions=3)]
+        self.assertIn('invalid_width_learning_receipt', c.component_receipt_errors(row))
 
     def test_missing_or_lying_candidate_source_fails_closed(self):
         for value in (None, True, 0):

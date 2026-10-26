@@ -262,7 +262,8 @@ class RequestBoundaries(unittest.TestCase):
             root = Path(directory)
             log = root / 'server.log'
             log.write_text('')
-            server = SimpleNamespace(log_path=log, numerical_mode='row-exact', assert_owned=lambda: None)
+            server = SimpleNamespace(log_path=log, numerical_mode='row-exact', assert_owned=lambda: None,
+                                     proc=SimpleNamespace(pid=1234))
             clock = [0]
             def snapshot():
                 clock[0] += 2
@@ -278,6 +279,7 @@ class RequestBoundaries(unittest.TestCase):
             original_http = c.r.HTTP
             with mock.patch.object(t, 'stamp', side_effect=lambda: point(clock[0])), \
                     mock.patch.object(c.r, 'request_body', return_value={}), \
+                    mock.patch.object(c.r, 'memory', return_value={'physical_footprint_bytes': 1024}), \
                     mock.patch.object(c.r, 'request', side_effect=request), \
                     mock.patch.object(c.r, 'settled_log', return_value=''), \
                     mock.patch.object(c.r, 'parse_stats', return_value={'commits': [], 'rounds': []}), \
@@ -322,7 +324,7 @@ class BootBoundaries(unittest.TestCase):
     def test_failure_still_records_shutdown_and_preserves_original_swap_envelope(self):
         class Server:
             numerical_mode = 'row-exact'
-            proc = SimpleNamespace(returncode=0)
+            proc = SimpleNamespace(returncode=0, pid=1234)
             command = ['server']
             env = {'HOME': '/owned'}
             def __init__(self, *args, **kwargs):
@@ -340,6 +342,7 @@ class BootBoundaries(unittest.TestCase):
             with mock.patch.object(c.d, 'prepare_boot_assets', return_value=(root / 'store', None, {})), \
                     mock.patch.object(c.d, 'finish_boot_assets', return_value={'unchanged': True, 'seeds_unchanged': True}), \
                     mock.patch.object(c.r, 'machine_state', side_effect=[before, after]), \
+                    mock.patch.object(c.r, 'memory', return_value={'physical_footprint_bytes': 1024}), \
                     mock.patch.object(c.r, 'Server', Server):
                 with self.assertRaisesRegex(RuntimeError, 'request'):
                     with c.d.owned_boot(root, root, plan, SimpleNamespace(), 0, 'native', telemetry=collector):

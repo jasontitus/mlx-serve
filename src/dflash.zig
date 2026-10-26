@@ -2304,6 +2304,10 @@ pub const TreeParams = struct {
     /// into the scores (null for a greedy target).
     noise: ?[]const f32 = null,
     noise_w: f32 = 0.7,
+    /// Optional diagnostic output: final preorder row -> original best-first
+    /// admission index. Caller owns storage of at least max_nodes; only the
+    /// returned tree length is written. No extra allocation or lattice work.
+    admission_order: ?[]usize = null,
 };
 
 /// Nodes in the order taken (a parent always before its children): `tokens`,
@@ -2327,6 +2331,7 @@ pub const DraftTree = struct {
 };
 
 pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
+    if (p.admission_order) |order| if (order.len < p.max_nodes) return error.InvalidAdmissionOrderBuffer;
     const k = lat.k;
     const Item = struct { value: f32, conditional_log: f32, parent: i32, depth: u32, cand: u32 };
     var queue: std.ArrayList(Item) = .empty;
@@ -2394,14 +2399,14 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.scores = try allocator.realloc(tree.scores, n);
         tree.confidence = try allocator.realloc(tree.confidence, n);
     }
-    try preorder(allocator, &tree);
+    try preorder(allocator, &tree, p.admission_order);
     return tree;
 }
 
 /// Renumber the nodes depth-first, each node's children in the order they
 /// were taken (best first): the likeliest path lands on consecutive rows, so
 /// a round that keeps it moves no KV rows.
-fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
+fn preorder(allocator: std.mem.Allocator, t: *DraftTree, admission_order: ?[]usize) !void {
     const n = t.tokens.len;
     if (n == 0) return;
     const order = try allocator.alloc(usize, n);
@@ -2437,6 +2442,7 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     defer allocator.free(scores);
     const confidence = try allocator.dupe(f32, t.confidence);
     defer allocator.free(confidence);
+    if (admission_order) |output| @memcpy(output[0..n], order);
     for (order, 0..) |old, i| {
         t.tokens[i] = tokens[old];
         t.depth[i] = depth[old];
@@ -5029,4 +5035,41 @@ test "dflash2: a quantized selector codebook is refused at load, not at the firs
     try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, true);
 
     try testing.expectError(error.InvalidDflashCodebook, loadDflashQuant(io, allocator, s, dir_path, 0));
+}
+
+test "bestFirstTree diagnostic admissions recover every exact native prefix including ties" {
+    const allocator = std.testing.allocator;
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22, 30, 31, 32 };
+    var unary = [_]f32{ 3, 2.9, -9, 9, -9, -9, 9, -9, -9 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [18]f32 = @splat(0);
+    for (0..2) |regime| {
+        if (regime == 1) @memset(&unary, 0); // Exact queue-priority ties.
+        const lat = Lattice{ .m = 3, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+        var admission_order: [12]usize = @splat(std.math.maxInt(usize));
+        try std.testing.expectError(error.InvalidAdmissionOrderBuffer,
+            bestFirstTree(allocator, &lat, .{ .max_nodes = 9, .admission_order = admission_order[0..8] }));
+        var full = try bestFirstTree(allocator, &lat, .{ .max_nodes = 9, .admission_order = &admission_order });
+        defer full.deinit(allocator);
+        for (admission_order[full.tokens.len..]) |untouched| try std.testing.expectEqual(std.math.maxInt(usize), untouched);
+        for (1..full.tokens.len + 1) |count| {
+            var native = try bestFirstTree(allocator, &lat, .{ .max_nodes = count });
+            defer native.deinit(allocator);
+            var remap: [9]i32 = @splat(-1);
+            var dst: usize = 0;
+            for (full.tokens, 0..) |token, row| {
+                if (admission_order[row] >= count) continue;
+                const parent = full.parents[row];
+                if (parent >= 0) try std.testing.expect(remap[@intCast(parent)] >= 0);
+                try std.testing.expectEqual(native.tokens[dst], token);
+                try std.testing.expectEqual(native.parents[dst], if (parent < 0) -1 else remap[@intCast(parent)]);
+                try std.testing.expectEqual(native.depth[dst], full.depth[row]);
+                try std.testing.expectEqual(native.confidence[dst], full.confidence[row]);
+                try std.testing.expectEqual(native.scores[dst], full.scores[row]);
+                remap[row] = @intCast(dst);
+                dst += 1;
+            }
+            try std.testing.expectEqual(native.tokens.len, dst);
+        }
+    }
 }

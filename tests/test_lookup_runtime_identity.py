@@ -57,6 +57,19 @@ class RuntimeIdentity(unittest.TestCase):
         self.assertTrue(identity['metal_assets'][str(self.metal)]['exists'])
         self.assertTrue(all(command[0] in ('/usr/bin/otool', '/usr/bin/sw_vers') for command in self.calls))
 
+    def test_network_hostname_changes_do_not_invalidate_runtime_but_kernel_changes_do(self):
+        original = os.uname_result(('Darwin', 'before.local', '27.0.0', 'kernel-build-a', 'arm64'))
+        with mock.patch.object(r.os, 'uname', return_value=original):
+            identity = r.runtime_identity(self.exe)
+        changed_host = os.uname_result(('Darwin', 'after.local', '27.0.0', 'kernel-build-a', 'arm64'))
+        with mock.patch.object(r.os, 'uname', return_value=changed_host):
+            self.assertEqual(identity, r.runtime_identity(self.exe))
+        for index, replacement in ((0, 'OtherOS'), (2, '27.1.0'), (3, 'kernel-build-b'), (4, 'x86_64')):
+            changed = list(original)
+            changed[index] = replacement
+            with self.subTest(field=index), mock.patch.object(r.os, 'uname', return_value=os.uname_result(changed)):
+                self.assertNotEqual(identity, r.runtime_identity(self.exe))
+
     def test_transitive_library_and_metallib_content_changes_invalidate(self):
         initial = r.runtime_identity(self.exe)
         self.child.write_bytes(b'replaced transitive kernel code')

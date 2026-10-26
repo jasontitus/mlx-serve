@@ -332,6 +332,26 @@ class ExplicitNumericalMode(unittest.TestCase):
         with self.assertRaises(BenchError):
             clean_environment("persistent", experiment={key: "true"})
 
+    def test_receipt_and_trace_modes_require_explicit_valid_overrides(self):
+        import os
+        from unittest.mock import patch
+        from bench_lookup_staircut import clean_environment
+        receipt = "MLX_SERVE_LOOKUP_RECEIPTS"
+        trace = "MLX_SERVE_LOOKUP_TRACE"
+        with patch.dict(os.environ, {receipt: "commit", trace: "0"}):
+            clean = clean_environment("persistent")
+            self.assertNotIn(receipt, clean)
+            self.assertEqual(clean[trace], "1")
+        for value in ("0", "1", "commit"):
+            self.assertEqual(clean_environment("persistent", experiment={receipt: value})[receipt], value)
+        for value in ("", "true", "full", "commits", "2"):
+            with self.subTest(value=value), self.assertRaises(BenchError):
+                clean_environment("persistent", experiment={receipt: value})
+        for value in ("0", "1"):
+            self.assertEqual(clean_environment("persistent", experiment={trace: value})[trace], value)
+        with self.assertRaises(BenchError):
+            clean_environment("persistent", experiment={trace: "commit"})
+
     def test_counterfactual_preparation_must_be_declared_and_supported(self):
         import os
         from unittest.mock import patch

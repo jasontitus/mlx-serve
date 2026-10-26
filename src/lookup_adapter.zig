@@ -250,6 +250,21 @@ pub const Route = struct {
     lookup_ms: ?f32,
     lookup_rows: u32,
     lookup_expected_tokens: f32,
+    lookup_variant: ?policy.Variant,
+    lookup_verify_ms: ?f32,
+};
+
+/// Opt-in diagnostics retain losing and unpriced ranked-prefix alternatives.
+pub const RouteEvaluation = struct {
+    pub const Entry = struct {
+        rows: u32,
+        variant: policy.Variant,
+        verify_ms: ?f32,
+        expected_tokens: f32,
+        ms_per_token: ?f32,
+    };
+    entries: [policy.MAX_TREE_ROWS]Entry = undefined,
+    len: usize = 0,
 };
 
 /// All diagnostic costs are milliseconds per expected committed token. Query time
@@ -257,11 +272,13 @@ pub const Route = struct {
 /// Assistant history retains native remaining work and yield, not a mixed cycle.
 /// Unknown exact widths do not become actionable merely from extrapolated prices.
 /// Prune only when bypassing the assistant; otherwise retain proposals for merging.
-pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f32, row_limit: u32) Route {
+pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f32, row_limit: u32, dispatch: policy.TreeDispatch, evaluation: ?*RouteEvaluation) Route {
+    if (evaluation) |log| log.len = 0;
     var plain: ?f32 = null;
     var lookup_cost: ?f32 = null;
     var best = lookup.*;
     var expected: f32 = 0;
+    var best_verify_ms: ?f32 = null;
     const valid_preparation = std.math.isFinite(query_ms) and query_ms >= 0;
     if (valid_preparation) {
         if (controller.plainFor(class)) |ms| {
@@ -271,16 +288,27 @@ pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f3
         if (validTree(lookup)) {
             const cap = @min(lookup.len, @min(policy.MAX_TREE_ROWS, row_limit));
             if (cap >= 2) for (2..cap + 1) |width| {
-                const verify_ms = controller.prices.known(@intCast(width), .tree, class) orelse continue;
-                const candidate = controller.chooseTreeControlled(lookup, class, query_ms, @intCast(cap), @intCast(width), null);
+                const candidate = controller.chooseTreeControlled(lookup, class, query_ms, @intCast(cap), @intCast(width), null, dispatch);
+                const variant = candidate.variant(dispatch);
+                const verify_ms = controller.prices.known(@intCast(candidate.len), .tree, class, variant);
+                if (verify_ms == null and evaluation == null) continue;
                 var reward: f32 = 0;
                 for (candidate.scores[0..candidate.len]) |reach| reward += reach;
-                const total = (query_ms + verify_ms) / reward;
-                if (!positive(total)) continue;
-                if (lookup_cost == null or total < lookup_cost.?) {
-                    lookup_cost = total;
+                const total: ?f32 = if (verify_ms) |ms| blk: {
+                    const value = (query_ms + ms) / reward;
+                    break :blk if (positive(value)) value else null;
+                } else null;
+                if (evaluation) |log| {
+                    log.entries[log.len] = .{ .rows = @intCast(candidate.len), .variant = variant,
+                        .verify_ms = verify_ms, .expected_tokens = reward, .ms_per_token = total };
+                    log.len += 1;
+                }
+                const measured = total orelse continue;
+                if (lookup_cost == null or measured < lookup_cost.?) {
+                    lookup_cost = measured;
                     best = candidate;
                     expected = reward;
+                    best_verify_ms = verify_ms;
                 }
             };
         }
@@ -296,6 +324,8 @@ pub fn route(controller: *policy.Policy, lookup: *Tree, class: i64, query_ms: f3
         .lookup_ms = lookup_cost,
         .lookup_rows = if (lookup_cost != null) @intCast(best.len) else 0,
         .lookup_expected_tokens = expected,
+        .lookup_variant = if (lookup_cost != null) best.variant(dispatch) else null,
+        .lookup_verify_ms = best_verify_ms,
     };
 }
 
@@ -361,21 +391,21 @@ test "context labels are native lower bounds with saturated upper bucket" {
 test "assistant retention preserves proposals and plain routing selects only root" {
     var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
     defer controller.deinit();
-    controller.prices.observe(2, 8, .tree, 0);
+    controller.prices.observe(2, 8, .tree, 0, .generic);
     _ = controller.observeSpecRemainingProbe(3, 3, 0, 0);
     var offer = Tree.chain(83, &.{ 41, 59, 26 }, 0.7, 0.8);
     const before = offer;
-    const assistant = route(&controller, &offer, 0, 0.2, 4);
+    const assistant = route(&controller, &offer, 0, 0.2, 4, .generic, null);
     try std.testing.expect(!assistant.decision.skip);
     try std.testing.expectEqual(before.len, offer.len);
     try std.testing.expectEqualSlices(u32, before.tokens[0..before.len], offer.tokens[0..offer.len]);
 
     var plain_controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
     defer plain_controller.deinit();
-    plain_controller.prices.observe(2, 50, .tree, 0);
+    plain_controller.prices.observe(2, 50, .tree, 0, .generic);
     plain_controller.observePlain(2, 0);
     _ = plain_controller.observeSpecRemainingProbe(80, 2, 0, 0);
-    const plain_route = route(&plain_controller, &offer, 0, 0.2, 4);
+    const plain_route = route(&plain_controller, &offer, 0, 0.2, 4, .generic, null);
     try std.testing.expect(plain_route.decision.skip);
     try std.testing.expectEqual(Alternative.plain, plain_route.source);
     try std.testing.expectEqual(@as(usize, 1), offer.len);
@@ -482,21 +512,21 @@ test "routing retains unknown assistant and accounts for paid query in both alte
     defer controller.deinit();
     const nodes = [_]VoteNode{vote(101, null, 1, 1, 1)};
     var tree = lookupTree(10, &nodes, 1, &controller.cal, 1);
-    var choice = route(&controller, &tree, 4096, 0, 2);
+    var choice = route(&controller, &tree, 4096, 0, 2, .generic, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.plain_ms == null and choice.lookup_ms == null);
     _ = controller.observeSpecRemainingProbe(8, 4, 4096, 0);
     controller.observePlain(2, 4096);
-    controller.prices.observe(2, 3, .tree, 4096);
-    choice = route(&controller, &tree, 4096, 5, 2);
+    controller.prices.observe(2, 3, .tree, 4096, .generic);
+    choice = route(&controller, &tree, 4096, 5, 2, .generic, null);
     try std.testing.expectApproxEqAbs(@as(f32, 7), choice.plain_ms.?, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 4), choice.lookup_ms.?, 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.25), choice.decision.assistant_ms.?, 0.00001);
     try std.testing.expect(!choice.decision.skip);
-    choice = route(&controller, &tree, 4096, 0, 2);
+    choice = route(&controller, &tree, 4096, 0, 2, .generic, null);
     try std.testing.expectEqual(Alternative.lookup, choice.source);
     try std.testing.expect(choice.decision.skip);
-    choice = route(&controller, &tree, 8192, 0, 2);
+    choice = route(&controller, &tree, 8192, 0, 2, .generic, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.lookup_ms == null);
 }
@@ -507,7 +537,7 @@ test "routing rejects invalid preparation instead of silently making it free" {
     controller.observePlain(1, 0);
     _ = controller.observeSpecRemainingProbe(9, 1, 0, 0);
     var tree = Tree.init(3);
-    const choice = route(&controller, &tree, 0, std.math.nan(f32), 8);
+    const choice = route(&controller, &tree, 0, std.math.nan(f32), 8, .generic, null);
     try std.testing.expect(!choice.decision.skip);
     try std.testing.expect(choice.plain_ms == null);
 }
@@ -518,7 +548,7 @@ test "pruned alternatives do not donate probability during policy selection" {
     var nodes: [47]VoteNode = undefined;
     for (&nodes, 0..) |*node, index| node.* = vote(@intCast(index + 200), null, 1, 0.5, 1);
     const tree = lookupTree(6, &nodes, 3, &controller.cal, 1);
-    const selected = controller.chooseTreeControlled(&tree, 0, 0, 16, 16, null);
+    const selected = controller.chooseTreeControlled(&tree, 0, 0, 16, 16, null, .generic);
     try std.testing.expectEqual(@as(usize, 16), selected.len);
     for (selected.look_order[1..selected.len]) |order| try std.testing.expectEqual(@as(u32, 3), order);
     for (selected.scores[1..selected.len]) |reach| {
@@ -602,7 +632,7 @@ test "merged selected lookup success is learned once and missing next decision i
     const offered = lookupTree(1, &nodes, 1, &controller.cal, 2);
     var merged = neuralTree(1, &.{2}, &.{-1}, &.{0}, &.{0.7}, &controller.cal, 1);
     merge(&merged, &offered);
-    const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null);
+    const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null, .generic);
     try std.testing.expectEqual(policy.NodeSource.both, selected.sources[1]);
     controller.observeTree(&selected, &.{2}, .neural, null);
     controller.observeTree(&offered, &.{2}, .lookup, null);
@@ -648,7 +678,7 @@ test "cold request lookup cannot displace neural selection but retains shadow co
     const cold = controller.restrictLookup(&offered, &trust);
     var merged = neuralTree(1, &.{11}, &.{-1}, &.{0}, &.{0.8}, &controller.cal, 1);
     merge(&merged, &cold);
-    const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null);
+    const selected = controller.chooseTreeControlled(&merged, 0, 0, 2, 2, null, .generic);
     try std.testing.expectEqualSlices(u32, &.{ 1, 11 }, selected.tokens[0..selected.len]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), selected.scores[1], 0.00001);
     controller.observeTree(&selected, &.{ 11, 13 }, .neural, null);
@@ -676,7 +706,7 @@ test "lookup supported continuation survives zero entry trust and neural parent 
     var neural = neuralTree(10, &.{11}, &.{-1}, &.{0}, &.{0.7}, &controller.cal, 1);
     merge(&neural, &restricted);
     try std.testing.expectApproxEqAbs(@as(f32, 0.42), neural.scores[2], 0.00001);
-    const selected = controller.chooseTreeControlled(&neural, 0, 0, 3, 3, null);
+    const selected = controller.chooseTreeControlled(&neural, 0, 0, 3, 3, null, .generic);
     try std.testing.expectApproxEqAbs(@as(f32, 0.42), selected.scores[2], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), selected.conditional_reach[2], 0.00001);
     try expectClosed(&selected);
@@ -692,6 +722,23 @@ test "lookup-only root merge cannot bypass request restriction through recalibra
     var candidate = Tree.init(10);
     merge(&candidate, &restricted);
     try std.testing.expect(candidate.scores_calibrated);
-    const selected = controller.chooseTreeControlled(&candidate, 0, 0, 3, 3, null);
+    const selected = controller.chooseTreeControlled(&candidate, 0, 0, 3, 3, null, .generic);
     for (selected.scores[1..selected.len]) |reach| try std.testing.expectEqual(@as(f32, 0), reach);
+}
+
+test "lookup routing cannot bypass the assistant using another kernel variant price" {
+    var controller = policy.Policy.init(policy.PriceModel.init(std.testing.allocator));
+    defer controller.deinit();
+    _ = controller.observeSpecRemainingProbe(20, 1, 0, 0);
+    controller.prices.observe(9, 1, .tree, 0, .generic);
+    var offer = Tree.chain(10, &.{ 11, 12, 13, 14, 15, 16, 17, 18 }, 1, 1);
+    const unknown = route(&controller, &offer, 0, 0, 9, .linear_gdn, null);
+    try std.testing.expect(!unknown.decision.skip);
+    try std.testing.expect(unknown.lookup_ms == null);
+    try std.testing.expectEqual(@as(usize, 9), offer.len);
+    controller.prices.observe(9, 1, .tree, 0, .linear_gdn);
+    const measured = route(&controller, &offer, 0, 0, 9, .linear_gdn, null);
+    try std.testing.expect(measured.decision.skip);
+    try std.testing.expectEqual(Alternative.lookup, measured.source);
+    try std.testing.expectEqual(@as(u32, 9), measured.lookup_rows);
 }

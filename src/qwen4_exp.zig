@@ -435,6 +435,38 @@ pub const NgramTable = struct {
         });
     }
 
+    pub const BenchmarkArm = enum { serial, pooled };
+
+    /// Explicit component-benchmark controls over the SAME implementations used by gather.
+    /// No environment/policy mutation and no silent pooled-to-serial fallback: a failed or
+    /// unavailable control must fail the benchmark rather than mislabel its measurements.
+    pub fn gatherForBenchmark(self: *const NgramTable, arm: BenchmarkArm, row_ids: []const i64, out: []f32) !void {
+        if (out.len != (std.math.mul(usize, row_ids.len, self.dim) catch return error.InvalidBenchmarkShape))
+            return error.InvalidBenchmarkShape;
+        for (row_ids) |r| if (r < 0 or r >= self.rows) return error.InvalidBenchmarkRow;
+        switch (arm) {
+            .serial => self.gatherSerial(row_ids, out),
+            .pooled => {
+                if (self.bits == 16) return error.BenchmarkPoolUnsupported;
+                const pool = self.pool orelse return error.BenchmarkPoolUnavailable;
+                if ((self.fd < 0 and self.embedded == null) or
+                    self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2 > PrefetchPool.ROW_BUF)
+                    return error.BenchmarkPoolUnsupported;
+                if (!self.gatherPooled(pool, row_ids, out)) return error.BenchmarkPoolReadFailed;
+            },
+        }
+    }
+
+    pub fn benchmarkPoolInfo(self: *const NgramTable) struct { threads: usize, max_rows_per_round: usize, row_buffer_bytes: usize, rounds: u64, calibrated_prefer_pool: bool } {
+        return .{
+            .threads = if (self.pool != null) PrefetchPool.N else 0,
+            .max_rows_per_round = PrefetchPool.MAX_ROWS,
+            .row_buffer_bytes = PrefetchPool.ROW_BUF,
+            .rounds = if (self.pool) |p| p.runs.load(.monotonic) else 0,
+            .calibrated_prefer_pool = if (self.pool) |p| p.prefer_pool else false,
+        };
+    }
+
     fn gatherSerial(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
     }
@@ -1375,6 +1407,38 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const after_refresh = pool.runs.load(.monotonic);
     t.gather(ids, got, 0);
     try testing.expectEqual(after_refresh + @as(u64, if (pool.prefer_pool) ROWS / PrefetchPool.MAX_ROWS else 0), pool.runs.load(.monotonic));
+}
+
+test "ngram benchmark controls preserve vectors and reject mislabeled pooled fallback" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeFixture(&td, .scale_nonunit);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+    defer table.close();
+    if (table.pool == null) table.pool = try PrefetchPool.create();
+    var rows: [128]i64 = undefined;
+    for (&rows, 0..) |*r, i| r.* = @intCast(i % 6);
+    var serial: [128 * 32]f32 = undefined;
+    var pooled: [128 * 32]f32 = undefined;
+    for ([_]usize{ 16, 32, 64, 128 }) |n| {
+        const before = table.pool.?.runs.load(.monotonic);
+        try table.gatherForBenchmark(.serial, rows[0..n], serial[0 .. n * 32]);
+        try testing.expectEqual(before, table.pool.?.runs.load(.monotonic));
+        try table.gatherForBenchmark(.pooled, rows[0..n], pooled[0 .. n * 32]);
+        try testing.expectEqual(before + (n + 63) / 64, table.pool.?.runs.load(.monotonic));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial[0 .. n * 32]), std.mem.sliceAsBytes(pooled[0 .. n * 32]));
+    }
+    try testing.expectError(error.InvalidBenchmarkShape, table.gatherForBenchmark(.serial, &.{0}, &.{}));
+    try testing.expectError(error.InvalidBenchmarkRow, table.gatherForBenchmark(.pooled, &.{6}, pooled[0..32]));
+    var no_pool = table;
+    no_pool.pool = null;
+    try testing.expectError(error.BenchmarkPoolUnavailable, no_pool.gatherForBenchmark(.pooled, &.{0}, pooled[0..32]));
+    no_pool.gather(&.{0}, serial[0..32], 0);
+    try table.gatherForBenchmark(.serial, &.{0}, pooled[0..32]);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial[0..32]), std.mem.sliceAsBytes(pooled[0..32]));
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {

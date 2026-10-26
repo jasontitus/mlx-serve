@@ -116,6 +116,132 @@ def absolute_asset(value, directory=False):
     return str(path.resolve())
 
 
+
+def runtime_identity(binary):
+    """Freeze actual Darwin linkage and conservative Metal-library load candidates.
+
+    Read installed Mach-O commands, never build sources. Resolve dyld run-path
+    stacks in load order, retain logical/symlink paths and every resolution
+    candidate, and hash all non-system transitive images. System shared-cache
+    libraries are identified by their install names plus the OS build/kernel.
+    Metal assets include installed resources and absolute paths embedded in the
+    loaded images; absent candidates are recorded so a newly appearing override
+    invalidates the declaration too. This does not launch the executable.
+    """
+    if sys.platform != "darwin":
+        raise BenchError("runtime identity currently requires Darwin Mach-O linkage")
+    executable = Path(os.path.abspath(binary))
+    if not executable.is_file():
+        raise BenchError("runtime executable is missing: " + str(executable))
+    environment = clean_environment("legacy")
+    architecture = os.uname().machine
+
+    def command(arguments):
+        try:
+            run = subprocess.run(arguments, env=environment, capture_output=True,
+                                 text=True, check=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BenchError("cannot inspect runtime linkage: " + str(exc)) from exc
+        return run.stdout
+
+    def system(path):
+        return path.startswith(("/usr/lib/", "/System/Library/"))
+
+    def expand(value, loader):
+        for token, root in (("@loader_path", loader.parent), ("@executable_path", executable.parent)):
+            if value == token or value.startswith(token + "/"):
+                return os.path.normpath(str(root) + value[len(token):])
+        if value.startswith("/"):
+            return os.path.normpath(value)
+        raise BenchError("unsupported relative runtime load path: " + value)
+
+    images, edges, system_libraries, metal_candidates = {}, [], set(), set()
+    metal_directories, mlx_images = set(), []
+
+    def visit(path, inherited_rpaths):
+        logical = str(path)
+        resolved = str(path.resolve())
+        if resolved in images:
+            return
+        if not path.is_file():
+            raise BenchError("unresolved non-system runtime image: " + logical)
+        listing = command(["/usr/bin/otool", "-arch", architecture, "-L", logical])
+        commands = command(["/usr/bin/otool", "-arch", architecture, "-l", logical])
+        blocks = re.split(r"(?m)^Load command \d+\s*$", commands)[1:]
+        rpaths, dependencies, install_id = [], [], None
+        for block in blocks:
+            kind = re.search(r"(?m)^\s*cmd (LC_\w+)\s*$", block)
+            if not kind:
+                continue
+            kind = kind.group(1)
+            if kind == "LC_RPATH":
+                value = re.search(r"(?m)^\s*path (.+) \(offset \d+\)\s*$", block)
+                if not value:
+                    raise BenchError("unparseable LC_RPATH in " + logical)
+                rpaths.append(value.group(1))
+            elif kind in ("LC_ID_DYLIB", "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB",
+                          "LC_REEXPORT_DYLIB", "LC_LAZY_LOAD_DYLIB", "LC_LOAD_UPWARD_DYLIB"):
+                value = re.search(r"(?m)^\s*name (.+) \(offset \d+\)\s*$", block)
+                if not value:
+                    raise BenchError("unparseable dylib load command in " + logical)
+                if kind == "LC_ID_DYLIB":
+                    install_id = value.group(1)
+                else:
+                    dependencies.append({"name": value.group(1), "command": kind})
+        listed = re.findall(r"(?m)^\s+(.+) \(compatibility version ", listing)
+        if listed != ([install_id] if install_id else []) + [dep["name"] for dep in dependencies]:
+            raise BenchError("otool dependency views disagree: " + logical)
+        stack = list(dict.fromkeys([expand(value, path) for value in rpaths] + inherited_rpaths))
+        images[resolved] = {"path": logical, "resolved": resolved, "sha256": digest(path),
+                            "install_id": install_id, "rpaths": rpaths,
+                            "effective_rpaths": stack, "dependencies": dependencies}
+        # Extract literal absolute Metal paths from this actual image, not sources.
+        for match in re.finditer(rb"/[ -~]{1,4096}\.metallib(?=\x00)", path.read_bytes()):
+            metal_candidates.add(os.path.normpath(match.group().decode("ascii")))
+        if path.name.startswith("libmlx"):
+            mlx_images.append(logical)
+            for image in (path, Path(resolved)):
+                metal_directories.update((image.parent, image.parent / "Resources",
+                                          image.parent.parent / "Resources"))
+        for dep in dependencies:
+            name = dep["name"]
+            candidates = ([os.path.normpath(base + name[len("@rpath"):]) for base in stack]
+                          if name.startswith("@rpath/") else [expand(name, path)])
+            selected = next((value for value in candidates if system(value) or Path(value).is_file()), None)
+            if selected is None:
+                raise BenchError("unresolved non-system dependency " + name + " from " + logical)
+            edges.append({"loader": logical, "name": name, "command": dep["command"],
+                          "candidates": candidates, "selected": selected,
+                          "resolved": selected if system(selected) else str(Path(selected).resolve())})
+            if system(selected):
+                system_libraries.add(selected)
+            else:
+                visit(Path(selected), stack)
+
+    visit(executable, [])
+    metal_directories.update((executable.parent, executable.parent / "Resources",
+                              executable.parent.parent / "Resources"))
+    for directory in metal_directories:
+        metal_candidates.update(str(directory / name) for name in ("mlx.metallib", "default.metallib"))
+        if directory.is_dir():
+            metal_candidates.update(str(path) for path in directory.glob("*.metallib"))
+    metal = {}
+    for candidate in sorted(metal_candidates):
+        path = Path(candidate)
+        metal[candidate] = {"exists": path.is_file(), "resolved": str(path.resolve()),
+                           "sha256": digest(path) if path.is_file() else None}
+    if mlx_images and not any(asset["exists"] for asset in metal.values()):
+        raise BenchError("linked MLX runtime has no identifiable Metal-library asset")
+    return {"version": 1, "executable": str(executable), "architecture": architecture,
+            "os_version": command(["/usr/bin/sw_vers"]).strip(),
+            "kernel": dict(zip(("system", "node", "release", "version", "machine"), os.uname())),
+            "images": images, "load_edges": edges, "system_libraries": sorted(system_libraries),
+            "metal_assets": metal, "metal_search_directories": sorted(str(path) for path in metal_directories),
+            "loading_policy": {"DYLD_*": "removed", "LD_LIBRARY_PATH": "removed", "LD_PRELOAD": "removed",
+                               "MLX_*": "removed before explicit benchmark controls",
+                               "resolution": "Mach-O loader-first inherited LC_RPATH stack; no unresolved non-system paths",
+                               "metal": "Conservative installed/bundle and image-embedded candidates; all contents frozen"}}
+
 def http_json(base, endpoint, body=None, timeout=60):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(base + endpoint, data,
@@ -127,11 +253,31 @@ def http_json(base, endpoint, body=None, timeout=60):
     return result
 
 
+BENCHMARK_EXPERIMENT_KEYS = {
+    "MLX_SERVE_LOOKUP_SELECTION", "MLX_SERVE_LOOKUP_STORE_WRITE",
+    "MLX_SERVE_LOOKUP_RECEIPTS", "MLX_SERVE_LOOKUP_PRICES", "MLX_SERVE_ROW_EXACT",
+    "MLX_SERVE_LOOKUP_PRICE_TRACE", "MLX_SERVE_LOOKUP_COUNTERFACTUAL",
+    "MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION", "MLX_SERVE_LOOKUP_COUNTERFACTUAL_PREPARATION",
+    "MLX_SERVE_LOOKUP_CANDIDATES", "MLX_SERVE_LOOKUP_BACKOFF",
+}
+
+
+def evidence_environment(environment):
+    """Record reproducibility controls, never arbitrary inherited credentials."""
+    allowed = BENCHMARK_EXPERIMENT_KEYS | {
+        "HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+        "HF_HUB_DISABLE_TELEMETRY", "NO_PROXY", "MLX_SERVE_LOOKUP_TRACE",
+        "MLX_SERVE_ROUND_COST_PERSIST", "MLX_SERVE_LOOKUP",
+        "MLX_SERVE_LOOKUP_CORPUS", "MLX_SERVE_LOOKUP_STORE",
+    }
+    return {key: value for key, value in environment.items() if key in allowed}
+
+
 def clean_environment(tier, corpus=None, store=None, experiment=None):
     # Do not inherit GPU/kernel/acceptance experiments, price files or network proxies.
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("MLX_", "DSV", "QWEN", "ANE_", "LLMPROBE_", "NPM_"))
-           and k not in ("NODE_OPTIONS", "NODE_PATH")
+           if not k.startswith(("MLX_", "DSV", "QWEN", "ANE_", "LLMPROBE_", "NPM_", "DYLD_"))
+           and k not in ("NODE_OPTIONS", "NODE_PATH", "LD_LIBRARY_PATH", "LD_PRELOAD")
            and k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                HF_DATASETS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
@@ -142,18 +288,15 @@ def clean_environment(tier, corpus=None, store=None, experiment=None):
         env["MLX_SERVE_LOOKUP_CORPUS"] = str(corpus)
     if store:
         env["MLX_SERVE_LOOKUP_STORE"] = str(store)
-    allowed = {"MLX_SERVE_LOOKUP_SELECTION", "MLX_SERVE_LOOKUP_STORE_WRITE",
-               "MLX_SERVE_LOOKUP_RECEIPTS", "MLX_SERVE_LOOKUP_PRICES", "MLX_SERVE_ROW_EXACT",
-               "MLX_SERVE_LOOKUP_PRICE_TRACE", "MLX_SERVE_LOOKUP_COUNTERFACTUAL",
-               "MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION"}
     if experiment:
-        if set(experiment) - allowed:
+        if set(experiment) - BENCHMARK_EXPERIMENT_KEYS:
             raise BenchError("unsupported benchmark environment override")
         for key, value in experiment.items():
             value = str(value)
             if key == "MLX_SERVE_LOOKUP_SELECTION" and not re.fullmatch(r"adaptive|cut|max|fixed:[1-9][0-9]*", value):
                 raise BenchError("invalid lookup row selection")
-            if key in ("MLX_SERVE_LOOKUP_STORE_WRITE", "MLX_SERVE_LOOKUP_RECEIPTS") and value not in ("0", "1"):
+            if key in ("MLX_SERVE_LOOKUP_STORE_WRITE", "MLX_SERVE_LOOKUP_RECEIPTS",
+                       "MLX_SERVE_LOOKUP_CANDIDATES", "MLX_SERVE_LOOKUP_BACKOFF") and value not in ("0", "1"):
                 raise BenchError("invalid benchmark boolean")
             if key == "MLX_SERVE_ROW_EXACT" and value != "1":
                 raise BenchError("row-exact mode requires an explicit value of 1")
@@ -161,8 +304,10 @@ def clean_environment(tier, corpus=None, store=None, experiment=None):
                 raise BenchError("diagnostic price tracing requires an explicit value of 1")
             if key == "MLX_SERVE_LOOKUP_COUNTERFACTUAL" and value not in ("0", "1"):
                 raise BenchError("invalid counterfactual boolean")
-            if key == "MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION" and value not in ("assistant8", "assistant16", "lookup8", "lookup16"):
+            if key == "MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION" and not re.fullmatch(r"(assistant|lookup)([1-9]|1[0-6])", value):
                 raise BenchError("invalid counterfactual action")
+            if key == "MLX_SERVE_LOOKUP_COUNTERFACTUAL_PREPARATION" and value not in ("merged16", "production-neural", "production-combined"):
+                raise BenchError("invalid counterfactual preparation")
             if key == "MLX_SERVE_LOOKUP_PRICES":
                 absolute_asset(value)
             env[key] = value
@@ -1263,10 +1408,7 @@ def main():
               "port": args.port, "isolation": args.isolation,
               "ready_timeout": args.ready_timeout, "request_timeout": args.request_timeout,
               "policy": "fresh_process_per_slot;seed_restart_frozen_store;prescribed_cold_training_warm;exact_canonical_replay",
-              "experiment_environment": clean_environment("local")}
-    # Only experiment env is identity-bearing, not the user's shell/session variables.
-    config["experiment_environment"] = {k: v for k, v in config["experiment_environment"].items()
-                                         if k.startswith(("MLX_", "HF_", "TRANSFORMERS_"))}
+              "experiment_environment": evidence_environment(clean_environment("local"))}
     identity = hashlib.sha256(canonical(config).encode()).hexdigest()
     plan = {"run_identity": identity, "profile": args.model, "modes": modes,
             "unsupported": {m: unsupported(model, m) for m in modes if unsupported(model, m)},
@@ -1372,7 +1514,7 @@ def main():
                               "MLX_SERVE_LOOKUP_SELECTION": slot["selection"]}
                 with Server(args, binary, model, mode, arm / "server.log", corpus_for_arm, store, experiment) as server:
                     atomic_json(arm / "launch.json", {"command": server.command,
-                        "environment": {k: v for k, v in server.env.items() if k.startswith(("MLX_", "HF_", "TRANSFORMERS_"))},
+                        "environment": evidence_environment(server.env),
                         "pid": server.proc.pid, "store_reopened": frozen is not None,
                         "server_settings": http_json(server.base, "/props").get("settings"),
                         "frozen_start_sha256": frozen["sha256"] if frozen else None})

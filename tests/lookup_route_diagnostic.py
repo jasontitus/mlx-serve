@@ -215,22 +215,23 @@ def prepare_reuse(out, model, cases):
 
 
 def prepare_boot_assets(folder, plan, arm):
+    tier = plan.get('arm_definitions', {}).get(arm, {}).get('tier', arm)
     store = folder / 'server-home' / 'lookup-store'
     store.parent.mkdir(parents=True)
     corpus = None
-    if arm == 'persistent':
+    if tier == 'persistent':
         shutil.copytree(plan['reuse']['paths']['persistent'], store)
     else:
         store.mkdir()
-    if arm == 'corpus':
+    if tier == 'corpus':
         corpus = folder / 'corpus'
         shutil.copytree(plan['reuse']['paths']['corpus'], corpus)
         freeze(corpus)
     freeze(store)
     before = {'store': tree_hashes(store), 'corpus': tree_hashes(corpus) if corpus else {}}
-    if arm in ('corpus', 'persistent'):
-        key = 'store' if arm == 'persistent' else 'corpus'
-        if before[key] != plan['reuse']['hashes'][arm]:
+    if tier in ('corpus', 'persistent'):
+        key = 'store' if tier == 'persistent' else 'corpus'
+        if before[key] != plan['reuse']['hashes'][tier]:
             raise r.BenchError('boot fixture does not match frozen seed')
     save(folder / 'assets-before.json', before)
     return store, corpus, before
@@ -248,33 +249,44 @@ def finish_boot_assets(folder, plan, store, corpus, before):
 
 
 @contextmanager
-def owned_boot(out, folder, plan, args, pair, arm):
+def owned_boot(out, folder, plan, args, pair, arm, telemetry=None):
     spec = plan['arm_definitions'][arm]
     store, corpus, before = prepare_boot_assets(folder, plan, arm)
     machine_before = {'timestamp': time.time(), **r.machine_state()}
     save(folder / 'machine-before.json', machine_before)
-    experiment = {'MLX_SERVE_LOOKUP_RECEIPTS': '1', 'MLX_SERVE_LOOKUP_STORE_WRITE': '0',
-                  'MLX_SERVE_LOOKUP_SELECTION': spec['selection']}
+    experiment = dict(spec.get('experiment', {}))
+    experiment.update(MLX_SERVE_LOOKUP_RECEIPTS='1', MLX_SERVE_LOOKUP_STORE_WRITE='0',
+                      MLX_SERVE_LOOKUP_SELECTION=spec['selection'])
     if plan.get('numerical_mode', 'stock') == 'row-exact':
         experiment['MLX_SERVE_ROW_EXACT'] = '1'
     if plan.get('price_trace'):
         experiment['MLX_SERVE_LOOKUP_PRICE_TRACE'] = '1'
     server = r.Server(args, plan['binary'], plan['model'], spec['mode'], folder / 'server.log',
                       corpus=corpus, store=store, experiment=experiment)
-    save(folder / 'launch.json', {'command': server.command, 'arm': arm, 'environment': server.env,
+    save(folder / 'launch.json', {'command': server.command, 'arm': arm, 'environment': r.evidence_environment(server.env),
                                  'numerical_mode': plan.get('numerical_mode', 'stock'),
                                  'fresh_home': server.env['HOME'], 'fresh_store': str(store),
                                  'corpus_clone': str(corpus) if corpus else None})
     completed = False
+    if telemetry is not None:
+        telemetry.phase(pair, arm, 'prelaunch')
     try:
         with server:
             if server.numerical_mode != plan.get('numerical_mode', 'stock'):
                 raise r.BenchError('owned server numerical mode differs from plan')
             save(folder / 'numerical-mode.json', {'numerical_mode': server.numerical_mode,
                 'explicit_activation_observed': server.numerical_mode == 'row-exact'})
-            yield server
+            if telemetry is not None:
+                telemetry.phase(pair, arm, 'ready')
+            try:
+                yield server
+            finally:
+                if telemetry is not None:
+                    telemetry.phase(pair, arm, 'pre_shutdown')
         completed = True
     finally:
+        if telemetry is not None:
+            telemetry.phase(pair, arm, 'post_shutdown')
         assets = finish_boot_assets(folder, plan, store, corpus, before)
         machine_after = {'timestamp': time.time(), **r.machine_state()}
         save(folder / 'machine-after.json', machine_after)
@@ -360,6 +372,18 @@ def check_sample(row):
         native_mtp = family == 'mtp' and receipt.get('selection') == 'legacy'
         if not native_mtp and receipt.get('selection') != spec['actual']:
             errors.append(prefix + 'actual_selection_mismatch')
+        if receipt.get('timing_scope') == 'native_entry_unsettled':
+            if (family != 'pld' or spec['actual'] not in ('adaptive', 'cut')
+                    or spec.get('experiment', {}).get('MLX_SERVE_LOOKUP_BACKOFF', '1') != '1'
+                    or receipt.get('lookup_candidates') is not True
+                    or receipt.get('candidate_rows') != 1 or receipt.get('legal_rows') != 1
+                    or receipt.get('requested_rows') != 0 or receipt.get('rows') != 1
+                    or receipt.get('accepted') != 0
+                    or type(receipt.get('committed')) is not int or not 0 <= receipt['committed'] <= 1
+                    or receipt.get('verify_commit_ms') is not None
+                    or receipt.get('predicted_verify_ms') is not None
+                    or receipt.get('priced') is not False):
+                errors.append(prefix + 'invalid_unsettled_native_entry')
         if row['arm'] == 'fixed8' and not native_mtp:
             if receipt.get('requested_rows') != 8:
                 errors.append(prefix + 'fixed8_requested_rows_mismatch')
@@ -649,7 +673,7 @@ def preflight_tests(out):
     save(out / 'preflight-results.json', results)
 
 
-def record_sample(out, folder, server, args, spec, pair, arm, case, rep):
+def record_sample(out, folder, server, args, spec, pair, arm, case, rep, telemetry=None):
     """One owned request with raw HTTP, settled receipts and native-family validation."""
     sample = f'{pair}-{arm}-{case["id"]}-{rep}'
     sample_dir = folder / (case['id'] + '-' + str(rep))
@@ -661,10 +685,23 @@ def record_sample(out, folder, server, args, spec, pair, arm, case, rep):
     r.append(out / 'sample-starts.jsonl', {'sample': sample, 'pair': pair, 'arm': arm,
               'case': case['id'], 'rep': rep, 'log_offset': offset, 'time': time.time()})
     original_http = r.HTTP
+    boundary = None
     with (sample_dir / 'response.sse').open('wb') as raw:
         try:
             r.HTTP = RecordingHTTP(original_http, raw, sample_dir / 'http.json')
-            response = r.request(server, body, args.request_timeout)
+            if telemetry is not None:
+                boundary = telemetry.start_request(sample)
+            request_error = None
+            try:
+                response = r.request(server, body, args.request_timeout)
+                request_error = response.get('error')
+            except BaseException as exc:
+                request_error = type(exc).__name__ + ': ' + str(exc)
+                raise
+            finally:
+                if boundary is not None:
+                    telemetry.finish_request(boundary, request_error)
+                    save(sample_dir / 'request-boundary.json', boundary)
         finally:
             r.HTTP = original_http
     save(sample_dir / 'response.json', response)
@@ -682,6 +719,8 @@ def record_sample(out, folder, server, args, spec, pair, arm, case, rep):
            'numerical_mode': server.numerical_mode,
            'warmup': rep < 0, 'body': body, 'response': response, 'commits': commits,
            'rounds': rounds, 'seconds': response.get('total_seconds'), 'errors': errors}
+    if boundary is not None:
+        row['request_boundary'] = boundary
     row['errors'] = check_sample(row)
     return row
 
@@ -729,10 +768,17 @@ def kill_group(pid, sig):
             pass
 
 
-def supervise(args, prepare, script, summary):
-    """Shared 290-second owner/supervisor, including preparation and cleanup."""
+def supervise(args, prepare, script, summary, *, deadline_seconds=290, worker_stop_seconds=285):
+    """Own the worker group; only explicit None/None removes the default bounds."""
+    if not (deadline_seconds is None and worker_stop_seconds is None):
+        if (type(deadline_seconds) not in (int, float) or type(worker_stop_seconds) not in (int, float)
+                or not math.isfinite(deadline_seconds) or not math.isfinite(worker_stop_seconds)
+                or not 0 < worker_stop_seconds < deadline_seconds):
+            raise r.BenchError('supervisor requires positive worker < deadline budgets or explicit None/None')
     start = time.monotonic()
-    deadline = start + 290
+    deadline = None if deadline_seconds is None else start + deadline_seconds
+    def cleanup_timeout():
+        return 1 if deadline is None else min(1, max(.001, deadline - time.monotonic()))
     state = {'pid': None}
     out = args.output or KIT / 'runs' / (time.strftime('%Y%m%d-%H%M%S') + '-route-diagnostic-' + str(os.getpid()))
     out = out.expanduser().resolve()
@@ -745,15 +791,20 @@ def supervise(args, prepare, script, summary):
         finally:
             os._exit(124)
     signal.signal(signal.SIGALRM, hard_stop)
-    signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - time.monotonic()))
+    if deadline is not None:
+        signal.setitimer(signal.ITIMER_REAL, max(.001, deadline - time.monotonic()))
     def supervisor_interrupt(signum, _frame):
         raise KeyboardInterrupt('signal ' + str(signum))
     signal.signal(signal.SIGTERM, supervisor_interrupt)
     signal.signal(signal.SIGINT, supervisor_interrupt)
     child = None
-    supervisor = {'exit_code': None, 'timed_out': False}
+    supervisor = {'exit_code': None, 'timed_out': False,
+                  'deadline_seconds': deadline_seconds, 'worker_stop_seconds': worker_stop_seconds}
     try:
         plan = prepare(out)
+        if any(plan.get(key, value) != value for key, value in
+               (('deadline_seconds', deadline_seconds), ('worker_stop_seconds', worker_stop_seconds))):
+            raise r.BenchError('prepared plan and supervisor time budgets differ')
         summary(out, plan)
         print('Evidence: ' + str(out), flush=True)
         if args.plan_only:
@@ -766,17 +817,18 @@ def supervise(args, prepare, script, summary):
             supervisor['process_group'] = child.pid
             save(out / 'bounded-run.json', supervisor)
             try:
-                child.wait(timeout=max(.001, start + 285 - time.monotonic()))
+                child.wait(timeout=None if worker_stop_seconds is None
+                           else max(.001, start + worker_stop_seconds - time.monotonic()))
             except subprocess.TimeoutExpired:
                 supervisor['timed_out'] = True
                 kill_group(child.pid, signal.SIGTERM)
                 try:
-                    child.wait(timeout=min(1, max(.001, deadline - time.monotonic())))
+                    child.wait(timeout=cleanup_timeout())
                 except subprocess.TimeoutExpired:
                     pass
             finally:
                 kill_group(child.pid, signal.SIGKILL)
-                child.wait(timeout=min(1, max(.001, deadline - time.monotonic())))
+                child.wait(timeout=cleanup_timeout())
                 supervisor['exit_code'] = child.returncode
                 supervisor['elapsed_seconds'] = time.monotonic() - start
                 save(out / 'bounded-run.json', supervisor)

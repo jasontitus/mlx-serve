@@ -187,3 +187,223 @@ A standard suite needs an unchanged, completed decode protocol containing genuin
 Further performance qualification needs exclusive-inference measurement, stable machine evidence, broader held-out/conflict/miss coverage, and at least four qualified balanced boots under the existing gates. Investigate sparse/drifting native width prices with actual measurements rather than a fixture-specific prior or forced width. Same-family benefits must survive fastest-native comparison before making that stronger claim. Canonical throughput needs its own complete qualified run.
 
 Warm history is not unseen-request generalization; fewer rounds do not imply proportional savings; selected-action price error is not regret over unmeasured alternatives. No measured Flash-Next improvement or cross-architecture transfer follows from these dense-27B results.
+
+## Variant-correct pricing and component validation (v7)
+
+Runtime SHA-256: `de3fd40f31143f0da899a8f8e5e616787ec91a36962ee400243063690e3d14d0`. ReleaseFast build succeeded. Focused lookup integration passed **109 tests with four skipped**; PLD-focused checks passed **eight**. The price model no longer pools generic-tree and linear-GDN costs. Schema-three profiles, actual-prefix classification and variant-sensitive assistant routing have focused regressions.
+
+`runs/independent-v7-pld-smoke` completed **30 serial/PLD-off/PLD-on requests with identical published token IDs, finish reasons and HTTP output/usage**. It covered the four held-out workloads and output caps 1, 2, 3, 5, 9 and 17. Actual backoff windows 1, 2, 4 and 8 were observed. Review found and fixed skipped-cold-step pricing against a stale context class. This sequential correctness smoke is **not a performance confirmation**; some PLD-on requests were slower, so backoff is not presumed to improve complete workloads.
+
+### Real Flash-Next learned-table costs
+
+The staged TensorFold Flash-Next pack uses affine `ngram_embedding.shard_N` tensors. The loader now recognizes that spelling without conversion or changed dequantization. The CPU-only component benchmark passed **9,216 exact serial/pooled vector comparisons and 1,024 exact production-path checks per run**; two whole runs completed. Five focused loader/benchmark tests passed. Benchmark executable SHA-256: `d38e10455139e9ed728b3413f13e8da135d13a7d063728b40ccfa57e68722b65`.
+
+First run, mean hash-plus-gather time in milliseconds:
+
+| Token batch | First-access serial | First-access pooled | Pooled latency reduction | Warm serial | Warm pooled | Warm pooled slowdown |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 4.1533 | 0.4123 | 90.07% | 0.00476 | 0.21462 | 45.06× |
+| 2 | 5.7922 | 0.5419 | 90.64% | 0.00991 | 0.24280 | 24.51× |
+| 4 | 6.3869 | 0.5335 | 91.65% | 0.01919 | 0.25112 | 13.08× |
+| 8 | 7.3659 | 0.9113 | 87.63% | 0.03863 | 0.49273 | 12.76× |
+
+These compare existing implementations, **not a newly accelerated target model**. First access has uncontrolled OS cache, not proven disk-cold storage. Warm pairs repeat the same context; confidence intervals resample whole context blocks. The separate repeat run retained the same direction in every batch. Production used pooled reads for batches 1–4 in this component setup and serial reads for batch 8; forced pooling at batch 8 is diagnostic. Startup full-model calibration and memory pressure were absent.
+
+The result exposes a real tradeoff: pooled reads help first-access faults but waste hundreds of microseconds on already-hot rows. Do not force either arm globally from this microbenchmark. Full-target weights can evict table pages, so a “warm table” assumption needs validation under the actual model's memory footprint. No full Flash-Next inference speedup, neural-drafter speedup, or additive contribution to suffix-lookup gains is established here. Artifacts: `runs/independent-v7-ple-component.json` and `runs/independent-v7-ple-component-reuse.json`.
+
+### Full MTP component cohort: useful signal, failed qualification
+
+`runs/independent-v7-mtp-lookup` completed all **96 requests**, with no invalid samples, under declared exclusive inference. Four balanced blocks compared native MTP, lookup-chain cut without adaptive native fallback, and adaptive lookup/native routing. First and repeated requests both count toward complete-workload latency.
+
+| Comparison against native MTP | Geometric mean speed ratio | Speed change | 95% block-bootstrap interval |
+|---|---:|---:|---:|
+| Adaptive lookup/native routing, full workload | 1.321× | +32.1% | 1.056–1.739× |
+| Forced lookup-chain cut control, full workload | 0.622× | −37.8% | 0.553–0.714× |
+| Adaptive routing, unrelated prose first exposure | 0.957× | −4.3% | Not a qualified performance claim |
+| Adaptive routing, unrelated prose repeat | 0.957× | −4.3% | Not a qualified performance claim |
+
+These are **descriptive observations, not confirmed speedups**. Swap usage, swap-ins and swap-outs changed across the cohort; the speed-comparison validity gate failed. Some individual workload/block regressions also exceeded the allowance. Native prose decode varied from approximately 21 to 11 to 14 to 19 tokens/s across blocks despite similar accepted-token counts. Prefill slowed alongside decode, so controller behavior alone does not explain the drift. Boot-boundary machine snapshots cannot attribute paging specifically to measured requests rather than loading.
+
+The forced cut control is not the production adaptive router: on prose it executed root-only verification rather than retaining native MTP. Its loss establishes the importance of the native fallback, not a neural-only MTP StairCut result. Separately, one adaptive prose block used 66 native attempts versus 48 for its baseline; that work-count difference needs investigation even if machine drift is resolved. No samples were discarded or old gates relaxed.
+
+### DFlash neural-width cohort: the intended contrast did not activate
+
+`runs/independent-v7-dflash-neural-width` completed **128 exact-valid requests**, zero invalid. Native, tiered fixed-eight, maximum and dynamic-cut arms each executed **632 rounds at eight rows**, accepting **3,192 drafts** and publishing **3,824 tokens**. Cut never reduced a tree. Thus this cohort does not test the advertised adaptive-width benefit, even though the requests and comparisons completed correctly.
+
+| Full-workload contrast | Descriptive speed ratio | Speed change | 95% block-bootstrap interval |
+|---|---:|---:|---:|
+| Cut versus native DFlash | 1.004× | +0.4% | 0.937–1.058× |
+| Cut versus tiered fixed-eight | 1.006× | +0.6% | 0.980–1.032× |
+| Cut versus tiered maximum | 1.015× | +1.5% | 0.991–1.043× |
+
+All contrasts are inconclusive; swap guards also failed. On this non-NAX machine, the inherited neural proposal heuristic limited the candidate pool to seven drafts before cost selection. Missing smaller-width prices further favored the already-measured eight-row execution. The next revision separates the bounded candidate pool from the native execution-width heuristic and requires actual training-only width prices. Candidate expansion is not itself a speedup: native versus new tiered fixed-eight will include a proposal/geometry change, not only width selection.
+
+A passive `macmon` capture began partway through this cohort and continued into idle time: `passive-gpu-tail.jsonl`, 300 samples at approximately two-second intervals. Among its 159 samples with at least 90% GPU activity, clock frequency ranged **599–1,378 MHz** (median **843 MHz**) and GPU temperature ranged **76.6–86.2°C**. This establishes substantial operating-condition variation, not a thermal diagnosis or complete per-request coverage. It cannot retrospectively qualify this cohort or explain the earlier MTP cohort.
+
+## Request-local timing and wider neural candidates (v9 smoke)
+
+Runtime SHA-256: `7f2d50387995c6968e0427c1e257343d042c938f5ea56ad900047f73e5fb26cc`. ReleaseFast build completed **8/8 steps**. The applied MTP timing/empty-offer and DFlash candidate fixes passed static adversarial review. Before the latest protocol corrections, the complete Python helper suite passed **237 tests**; the subsequent focused counterfactual/telemetry/component suites passed **32/15/34** tests.
+
+`runs/independent-v9-runtime-smoke` completed **32 requests**: serial, native MTP, adaptive MTP lookup and neural-only maximum-width DFlash, each exercising the four full held-out cases with first/repeat exposure. All published token IDs, text, reasoning, usage and finish reasons matched current serial output. **148 DFlash rounds actually verified more than eight rows**, all with the expected generic branching verifier. Owned passive telemetry captured all request intervals and passed its endpoint/coverage checks; mean pre/post endpoint collection cost was **86 ms per request**, outside recorded HTTP latency.
+
+| Workload | Native MTP mean HTTP seconds | Adaptive MTP mean HTTP seconds | Descriptive speed gain |
+|---|---:|---:|---:|
+| Related configuration | 7.735 | 5.538 | +39.68% |
+| Conflicting configuration | 8.212 | 5.697 | +44.13% |
+| Related code | 4.962 | 3.911 | +26.87% |
+| Unrelated prose | 8.471 | 7.539 | +12.37% |
+
+Total measured HTTP time was **58.760 s native versus 45.370 s adaptive**, a descriptive **1.295×** ratio. This is a **single sequential smoke**, not balanced confirmation, a confidence interval, or proof that the code caused every observed gain. Instrumentation gaps are excluded from the summed HTTP durations, so this is not uninterrupted offered-load throughput. DFlash had no matched native arm in this smoke and receives no speedup claim. The standalone PLD cold-start exploration fix was not present in this binary.
+
+## Standalone persistent suffix activation (v10 smoke)
+
+Runtime SHA-256: `1f334b2673c428c2fbc216884146a7d0cb2cd20902521f730e1ce9eb0db85e1b`. All **30 policy tests** passed, including bounded standalone width learning; ReleaseFast build completed **8/8 steps**. Static adversarial review found no actionable issue in that patch.
+
+`runs/independent-v10-pld-smoke` completed **24 exact requests**: current serial, frozen persistent-history PLD with backoff off, then on; four full held-out cases with first/repeat exposure. Telemetry coverage and endpoint qualification passed. Off executed **190 wider-than-root rounds and accepted 565 drafts**; on executed **151 and accepted 548**. Each PLD boot reserved the same four-row learning shape twice in context class zero, with no further reservation. This proves real activation and bounded reservations, not a performance confirmation.
+
+| Workload | Serial mean HTTP seconds | PLD backoff off | PLD backoff on | Off speed change vs serial | On speed change vs serial |
+|---|---:|---:|---:|---:|---:|
+| Related configuration | 10.890 | 4.697 | 6.049 | +131.8% | +80.0% |
+| Conflicting configuration | 11.690 | 5.520 | 6.924 | +111.8% | +68.8% |
+| Related code | 6.458 | 3.387 | 4.071 | +90.7% | +58.6% |
+| Unrelated prose | 9.990 | 12.429 | 12.416 | −19.6% | −19.5% |
+
+Speed change is baseline time / treatment time − 1. Sequential arm order prevents causal attribution. For example, the first related-configuration request executed 27 rounds with 115 accepted drafts in both PLD arms, yet summed verification/commit time was 2.961 s off versus 4.166 s on. Machine operating conditions or other timing effects must be separated before blaming backoff for the wall-time difference.
+
+Prose remains a real performance concern: backoff reduced lookup-verification rounds from 118/121 to 20/20, but full-request latency remained above serial. Reducing queries alone is insufficient. The earlier v7 PLD smoke used **local-only history**, whereas this run used the frozen persistent seed; their acceptance difference cannot be attributed solely to the width-learning patch. Neither this smoke nor its comparison with v7 establishes a balanced speedup, a native-MTP/DFlash win, or an isolated contribution from bounded exploration.
+
+The separate `runs/independent-v10-pld-local-smoke` then exercised **24 exact requests without external history**. Off accepted **221 drafts in 277 wider rounds**; on accepted **143 in 140**. Telemetry qualification passed. This directly establishes that local-only lookup no longer stays root-only, while the sequential timings still do not establish a performance win. Static review identified an opportunity to enter the native pipeline earlier on an absent proposal; that optimization was not present in either v10 smoke.
+
+### Calibration and larger-model checks
+
+The current-binary training serial oracle and `lookup16` diagnostic completed in `runs/independent-v10-cf-training-{serial,lookup16}`. The measured receipt correctly named **tree / linear-GDN / 16 rows**, committed 16 tokens with 15 accepted drafts, and recorded **173.393 ms verification/commit** separately from **138.061 ms diagnostic readback**. Full-round time remained unavailable. The actual exporter CLI successfully produced one training price cell; subsequent review found missing table-to-sidecar binding and consumer-contract checks, so that historical export is not sufficient for qualified component calibration.
+
+A stock-serial Flash-Next launch with context 512 was attempted with normal memory guards intact: `runs/independent-v10-flashnext-load`. The preflight refused loading at **48.04 GB estimated weights, about 55.0 GB required free including headroom, and 42.14 GB available**. It exited before inference. This establishes a current available-memory blocker, not architectural impossibility or a learned-table/full-model performance result.
+
+## Six-permutation MTP cohort (v10b)
+
+`runs/independent-v10b-mtp-lookup` completed **144 exact-valid requests, zero invalid**, using the v10 binary above. All six permutations of native MTP, forced lookup cut and adaptive lookup/MTP ran the complete four-case first/repeat workload. The production comparison is adaptive versus native; forced cut remains a separate control.
+
+| Adaptive versus native MTP | First-request speed change | Repeat-request speed change |
+|---|---:|---:|
+| Related configuration | +88.5% | +72.6% |
+| Conflicting configuration | +57.1% | +53.0% |
+| Related code | +28.4% | +26.3% |
+| Unrelated prose | −3.7% | −0.7% |
+
+The full-workload geometric mean speed ratio was **1.343×**, with descriptive unadjusted block-bootstrap 95% interval **1.292–1.383×**. Every block's aggregate favored adaptive routing. Frozen-history accepted-output witnesses appeared in every required related cell. Forced cut remained much slower (**0.585× native**) and never accepted persistent candidates; it is not the production router.
+
+Completed target-verification work, averaged over each case's 12 requests per arm:
+
+| Workload | Native rounds/request | Adaptive rounds/request | Round reduction | Native verified rows/request | Adaptive verified rows/request |
+|---|---:|---:|---:|---:|---:|
+| Related configuration | 49.58 | 19.83 | 60.0% | 144.17 | 165.08 |
+| Conflicting configuration | 48.00 | 23.08 | 51.9% | 143.42 | 186.75 |
+| Related code | 25.42 | 16.58 | 34.8% | 75.42 | 86.92 |
+| Unrelated prose | 48.58 | 49.08 | −1.0% | 144.58 | 144.25 |
+
+Published outputs were identical within each case. This establishes fewer completed verification rounds on reusable workloads, **not proportionally less GPU work**: wider blocks verified more total rows there. It explains why hardware-specific width costs and full-request timing remain necessary.
+
+**Full qualification failed.** Swap usage/counters changed, and some individual prose/block ratios violated the five-percent regression guard. Request-aligned evidence locates paging changes in three requests: block 3 forced-cut conflicting-config first exposure (four swap-ins), block 5 native related-config first exposure (4,804 swap-outs and approximately 78.7 MB increased swap usage), and block 5 native conflicting-config repeat (eight swap-ins). No adaptive request interval changed those counters. That attribution does not erase loading effects, certify other intervals, or justify excluding the affected baseline requests.
+
+Most native/adaptive prose requests used 48–49 verification rounds. Block 5 adaptive first prose instead used **56 rounds**—21 at two rows and 35 at three—versus its native reference's 48 rounds. Its inherited alternate-depth cost remained unrefreshed early in the request. Block 1 also had a larger wall-time loss without a comparable work-count change. Controller adaptation and operating-condition variation therefore remain separate investigations. Neither failed evidence nor its thresholds were rewritten; these observations are not a qualified blanket speedup or canonical benchmark result.
+
+## Native-pipeline miss entry (v11 correctness smoke)
+
+Runtime SHA-256: `b15f7f708db73ded79daf41ab8586b2ec04bfc85910fc0f569dc5989b3eab6f5`. The integrated Python helper suite passed **257 tests** and ReleaseFast build completed **8/8 steps**. Static adversarial review found two receipt-contract mismatches in the first native-entry implementation; both were corrected before this build by retaining the configured selection label and removing a redundant backoff event.
+
+`runs/independent-v11-pld-smoke` completed **42 exact-current-serial requests** across serial, persistent PLD off/on, the full four-case first/repeat workload, and output caps **1, 2, 3, 5, 9 and 17**. It observed **36 native-entry rounds**. Lookup-round publication plus skipped native/drain/cold emissions reconciled exactly to published output, and all backoff state transitions validated. Native-entry receipts remain explicitly **unsettled and unpriced**, with no synthetic verification duration or extra settle barrier.
+
+This is correctness/activation evidence, not a measured speedup. Passive telemetry did not qualify the entire smoke because some subsecond boundary requests contained no one-second sample. Prose latency was still variable; the sequential arm order cannot isolate the optimization's contribution. The later bounded MTP alternate-refresh change is not present in this binary.
+
+## Bounded MTP price refresh (v12 diagnostic)
+
+Runtime SHA-256: `08f34039f98ff502affa2f0d5892d2255e6d6e1c0a37032450d798a14ef3a5cd`. ReleaseFast build completed **8/8 steps** after review corrected the refresh eligibility budget to account for an unpublished lazy predecessor.
+
+`runs/independent-v12-mtp-refresh-diagnostic` completed **72 exact-current-serial requests**: eight serial references followed by two reverse-order blocks of old/new native and old/new adaptive MTP. Every boot retained the six configuration/code requests before prose. The new controller issued **23 refresh plans**, never more than one per request. This establishes bounded activation and output correctness, not improved economics.
+
+| Block | Old native HTTP seconds | New native | Old adaptive | New adaptive |
+|---|---:|---:|---:|---:|
+| Forward arm order | 59.057 | 66.285 | 47.632 | 53.663 |
+| Reverse arm order | 77.043 | 82.522 | 59.167 | 57.263 |
+
+The new adaptive controller executed **437 completed verification rounds versus 419** for the old controller. Across both blocks, code increased from 60 to 73 rounds and prose from 193 to 204. Exact outputs matched, so this is a real work-count difference, although differing online timing histories also change the selected widths. The elapsed-time comparison is inconclusive and the telemetry gate failed on changed swap usage, swap-ins and swap-outs. The refresh is **not a demonstrated performance fix**; it must be investigated or removed rather than promoted on correctness alone.
+
+### Combined DFlash activation on the same v12 binary
+
+`runs/independent-v12-dflash-smoke` completed **16 exact-current-serial requests**, covering native DFlash then combined adaptive DFlash on all four held-out cases with first/repeat exposure. Native executed **158 eight-row generic-tree rounds**; adaptive executed **111 eight-row generic-tree rounds and 25 sixteen-row linear-GDN rounds**. Configuration requests dropped from 18 to 12 rounds each. Assistant bypass did not activate.
+
+Total HTTP time was **40.895 s native versus 41.240 s adaptive**: no observed aggregate speedup in this sequential smoke, despite fewer verification rounds. Adaptive verified 1,288 rows versus native's 1,264. The telemetry gate also failed on changed swap usage/counters. This proves wider useful lookup execution and exact output, not DFlash acceleration; preparation costs, width prices and operating conditions still require matched measurement.
+
+### Production-horizon neural width calibration
+
+The v12 `production-neural` serial oracle and separate `assistant7`, `assistant8` and `assistant16` windows completed in `runs/independent-v12-cf-neural-*`. Each action used horizon seven, no suffix candidates, the same first-offer context length 158, and identical prepared target KV, recurrent state, assistant state and neural offer. The comparison validator accepted the same-preparation width contrast and exact serial publication.
+
+| Verified rows | Actual variant | Committed tokens | Settled verify/commit ms | ms per committed token |
+|---|---|---:|---:|---:|
+| 7 | generic | 7 | 91.721 | 13.103 |
+| 8 | generic | 7 | 97.224 | 13.889 |
+| 16 | generic | 8 | 146.686 | 18.336 |
+
+The larger tree recovered one extra token, but paid substantially more per committed token at this training prefix. These are single first-offer observations, **not pure GPU time or complete-round throughput**. Diagnostic readback duration is excluded; its effects on execution are not erased. No staircase plateau or universal best width follows from three points.
+
+The actual exporter produced three bound schema-three cells, and the actual component declaration consumed them after checking exact price bytes, runtime identity, training contract and full target/assistant file hashes. Artifacts: `independent-v12-neural-training-prices{,.source}.json` and `independent-v12-neural-calibration-consumer.json`. This validates the calibration handoff, not production-equivalent timing or a full component performance gate. These prices are tied to the v12 binary and must not be relabeled for a later build.
+
+Static analysis also confirmed a useful limit: a horizon-seven neural offer cannot commit more than eight tokens, regardless of a fifteen-node tree budget. Extra nodes buy alternate branches, not a longer continuation. On saturated configuration/code, wider neural verification alone therefore cannot exceed native DFlash's existing eight-token yield. A longer-horizon experiment must explicitly include its extra assistant and candidate-preparation costs.
+
+## Stable native-cycle pricing and route economics (v13 smoke)
+
+Runtime SHA-256: `3a53a365dbec6ab79d8f28890a5cdfc9cab96caa692f3891a0951c8cc7958429`. The Python helper suite passed **258 tests**; integrated lookup checks completed successfully and ReleaseFast build completed **8/8 steps**. Review identified mixed-depth preparation in inter-round timing. The fix restricts request-local price overrides to consecutive homogeneous native cycles, preserves acceptance/clock advancement on excluded transitions, and removes the unproven once-per-request refresh. Shared legacy estimates remain approximate fallback evidence.
+
+`runs/independent-v13-family-smoke` completed **40 exact-current-serial requests** across serial, native/adaptive MTP and native/adaptive DFlash, with all four full cases and first/repeat exposure. Passive telemetry coverage and machine endpoint qualification passed. **135 route receipts** exposed the new pre-assistant lookup economics with valid measured/missing-value semantics.
+
+| Family | Native summed HTTP seconds | Adaptive summed HTTP seconds | Descriptive speed change |
+|---|---:|---:|---:|
+| MTP | 63.942 | 43.182 | +48.08% |
+| DFlash | 46.538 | 46.507 | +0.07% |
+
+Sequential arm order still prevents a causal speedup claim or isolation of the timing correction. DFlash remains effectively unchanged in aggregate. The new receipts identify a specific gap: related-configuration anchors 222–270 executed successful sixteen-row linear-GDN trees, but their best priced **pre-assistant lookup** alternatives were eight-row generic trees. Their predicted yields rose from 5.03 to 6.03 tokens; the assistant remained cheaper under those predictions. This is not simply a pessimistic prediction for the same sixteen-row tree. Candidate geometry and exact-key price coverage must be checked before changing trust or assistant admission.
+
+## Ranked lookup alternatives and production-horizon merging (v14)
+
+Runtime SHA-256: `c83e0cd6f4af08ad6fedd26beb040b91c66199280c48bb5a4ff955f300bb7350`. The Python helper suite passed **260 tests**. Zig compilation initially caught a test call missing the new diagnostic anchor argument; after correction, integrated lookup checks completed and ReleaseFast build completed **8/8 steps**. An additional configuration-environment serialization fix passed all **57 offline helper tests** and an actual model-free dry-run with synthetic inherited credential sentinels: none appeared in emitted plan output. No inference subprocess environment was changed.
+
+`runs/independent-v14-dflash-smoke` completed **24 exact-current-serial requests**, covering serial and native/adaptive DFlash on every full case with first/repeat exposure. Machine endpoints and passive telemetry qualified. All **1,214 ranked-prefix price receipts** passed checks for actual variant, null unpriced costs and query-inclusive cost/reward arithmetic.
+
+Native summed HTTP time was **33.812 s**, adaptive **34.918 s**, a descriptive **−3.17% speed change**. This sequential, price-traced diagnostic is not an instrumentation-free comparison or a speedup claim.
+
+The losing alternatives now resolve the v13 ambiguity. On first-exposure related configuration at anchor 254, lookup eight was generic, priced at 144.245 ms with expected yield 6.032; lookup sixteen was linear-GDN, priced at 264.196 ms with expected yield 10.158. Their query-inclusive costs were **23.915 versus 26.010 ms per predicted token**, so eight correctly won the lookup comparison. The assistant's estimate was lower still, at 19.588 ms per token. Repeat exposure later selected sixteen as the best lookup alternative, but it still lost to the assistant. Earlier sixteen-row alternatives were explicitly unpriced, not mislabeled as generic.
+
+Thus, this evidence does not justify a variant-routing fix or arbitrary trust relaxation. Historical verifier prices and expected yield both matter; successful merged-tree execution does not establish the counterfactual yield of assistant-free lookup. Tracing adds host/I/O work and can affect learned wall-clock prices.
+
+### Production-combined same-state calibration
+
+The v14 serial oracle plus `assistant8`, `assistant16` and `lookup16` windows each completed two exact requests on the predeclared `train-config-a` first offer. The comparison validator accepted common baseline/prefix state and, for assistant-width comparisons, identical preparation and full offers. Assistant actions used the production horizon seven with suffix candidates enabled; lookup used no assistant preparation. Request trust remained cold.
+
+| Action | Actual variant | Committed tokens | Settled verify/commit ms | ms per committed token |
+|---|---|---:|---:|---:|
+| assistant8 | generic | 7 | 106.444 | 15.206 |
+| assistant16 | generic | 8 | 155.220 | 19.402 |
+| lookup16 | linear_gdn | 16 | 152.267 | 9.517 |
+
+At this independently declared training prefix, assistant-free lookup used **37.4% less verification/commit time per committed token** than assistant8. This establishes a useful local opportunity, not a complete-round or workload speedup: candidate sources differ, the readback perturbs execution, and these are individual first-offer observations. In contrast, widening the assistant tree bought only one extra committed token.
+
+Artifacts are `runs/independent-v14-cf-combined-*`. The actual exporter created three exact-variant cells in `independent-v14-combined-training-prices{,.source}.json`; the actual component declaration accepted that bound profile in `independent-v14-combined-calibration-consumer.json` after full target/assistant content validation. That declaration has not itself established a performance result. Do not relabel these diagnostic prices as pure verifier or production-equivalent measurements.
+
+### Actual server-path Metal attribution
+
+`runs/independent-v14-metal-server-{dflash-native,dflash-combined-adaptive}` contain matched owned-server captures for configuration and unrelated prose, first/repeat exposure. All eight requests matched the current serial oracle. Native executed 18/18 configuration and 34/34 prose rounds; adaptive executed 12/13 and 35/33. The adaptive repeated configuration included three assistant-free lookup rounds with 40 published tokens.
+
+These traces attach to the ready owned process and wait for an actual Darwin tracing-start notification before issuing requests. The earlier one-shot CLI capture did not activate DFlash despite its argument banner; it was rejected as mechanism evidence and its adaptive counterpart was cancelled.
+
+| Later instrumented sample window | Native compute occupancy | Adaptive compute occupancy |
+|---|---:|---:|
+| Configuration repeat | 95.69% | 94.48% |
+| Prose first | 96.38% | 96.18% |
+| Prose repeat | 96.43% | 95.86% |
+
+The denominator surrounds `record_sample()`, including setup, ownership checks, HTTP, receipt settling and persistence—not decode alone or precisely the HTTP interval. Owned compute intervals are clipped and unioned. Warm sampled shader duration is matrix-kernel dominated; sampled shares are not percentages of request wall time or absolute GPU cost.
+
+Adversarial review caught an idle-gap calculation that omitted sample-window boundaries. Corrected `analysis-corrected.json` retains the originals, uses exact structured PIDs and includes leading/trailing gaps. First-window gaps are **348.093 ms native / 359.447 ms adaptive**; later-window largest gaps are **87–115 ms**, not the originally reported 3–8 ms inter-encoder gaps. Trace-envelope containment does not imply complete shader attribution: dominant target-kernel samples are missing from the native first configuration window. No first-window kernel-mixture or throughput claim is made.
+
+Raw traces and exported TOCs can include inherited environment credentials and remain private. These profiles support investigating useful committed yield versus matrix-verification cost; they do not justify arbitrary trust-estimator relaxation or establish a performance win.

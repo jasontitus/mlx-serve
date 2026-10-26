@@ -29,6 +29,7 @@ import bench_lookup_staircut as runner
 VERSION = 1
 MAX_ROWS = 64
 CONTEXT_BUCKET = "floor-power-of-two-2048"
+VERIFY_VARIANTS = ("generic", "linear_gdn")
 
 
 def identity(value):
@@ -45,7 +46,9 @@ def receipt_errors(receipt, action):
     if not isinstance(receipt, dict):
         return ["missing_round_receipt"]
     errors = []
-    required = ("version", "family", "kind", "class", "anchor_pos", "prefix_hash",
+    if receipt.get("timing_scope") == "native_entry_unsettled":
+        errors.append("unsettled_native_entry_noncomparable")
+    required = ("version", "family", "kind", "variant", "class", "anchor_pos", "prefix_hash",
                 "candidate_hash", "candidate_probability_hash", "candidate_rows", "legal_rows",
                 "requested_rows", "selection",
                 "rows", "accepted", "committed", "draft_ms", "verify_commit_ms",
@@ -67,6 +70,8 @@ def receipt_errors(receipt, action):
         errors.append("unsupported_family")
     if receipt["kind"] not in ("chain", "tree"):
         errors.append("unsupported_kind")
+    if receipt["variant"] not in VERIFY_VARIANTS:
+        errors.append("unsupported_executed_variant")
     if not 1 <= receipt["rows"] <= receipt["legal_rows"] <= receipt["candidate_rows"] <= MAX_ROWS:
         errors.append("illegal_row_geometry")
     if receipt["accepted"] >= receipt["rows"]:
@@ -134,7 +139,8 @@ def no_assistant_root(receipt):
 
 def curve_key(row):
     r = row["round"]
-    return runner.canonical([row["mode"], row["profile"], r["kind"], r["class"], r["rows"],
+    return runner.canonical([row["mode"], row["profile"], r["kind"], r["variant"],
+                             r["class"], r["rows"],
                              "no-assistant" if no_assistant_root(r) else "candidate-paid"])
 
 
@@ -162,6 +168,7 @@ def fit_curves(rows, widths, causal=False):
             if row["action"].startswith("fixed:"):
                 cells.setdefault(curve_key(row), []).append(row["round"])
     return {key: {"n": len(values), "context_bucket": CONTEXT_BUCKET,
+                  "variant": values[0]["variant"],
                   "verify_ms": statistics.mean(r["verify_commit_ms"] for r in values),
                   "draft_ms": statistics.mean(r["draft_ms"] for r in values),
                   "round_ms": statistics.mean(r["round_ms"] for r in values),
@@ -233,6 +240,13 @@ def compare_block(block, expected_widths, curves):
     fixed = [actions["fixed:" + str(width)] for width in expected_widths]
     if not fixed or expected_widths != list(range(1, reference["legal_rows"] + 1)):
         return {"comparable": False, "errors": ["incomplete_legal_width_sweep"]}
+    # Width changes may legitimately select a different kernel. A policy's
+    # selected width must still match the executed kernel in its fixed arm.
+    for action in ("adaptive", "cut", "max"):
+        receipt = actions[action]["round"]
+        fixed_receipt = actions["fixed:" + str(receipt["rows"])]["round"]
+        if receipt["variant"] != fixed_receipt["variant"]:
+            return {"comparable": False, "errors": ["different_executed_variant_for_selected_width:" + action]}
     costs = {row["action"]: row["round"]["round_ms"] / (row["round"]["accepted"] + 1) for row in fixed}
     winner = min(costs, key=costs.get)
     best = costs[winner]
@@ -261,7 +275,8 @@ def compare_block(block, expected_widths, curves):
             "predicted_winner": predicted_winner,
             "predicted_winner_agreement": predicted_winner == winner if predicted_winner else None,
             "predicted_winner_regret_ms_per_token": costs[predicted_winner] - best if predicted_winner else None,
-            "oracle_scope": "single noisy measured first-decision alternatives including true no-assistant root; signed realized regret includes policy/candidate overhead and measurement noise, not true optimality or throughput"}
+            "executed_variants": {action: actions[action]["round"]["variant"] for action in required},
+            "oracle_scope": "single noisy measured first-decision alternatives including true no-assistant root; fresh-process matched prefixes are not byte-identical restored KV/SSM/assistant/RNG states; signed realized regret includes policy/candidate overhead and measurement noise, not true optimality or throughput"}
 
 
 def summarize(rows, widths, curves, causal=False):
@@ -300,7 +315,8 @@ def summarize(rows, widths, curves, causal=False):
             block_predictions.setdefault(block_key, {}).setdefault(name, []).append((predicted, actual))
         heldout_predictions.append({"mode": row["mode"], "profile": row["profile"],
             "repetition": row["repetition"], "action": row["action"],
-            "first_offer": offer_key(r), "cost_regime": "no-assistant" if no_assistant_root(r) else "candidate-paid",
+            "first_offer": offer_key(r), "variant": r["variant"],
+            "cost_regime": "no-assistant" if no_assistant_root(r) else "candidate-paid",
             "training_n": cell["n"] if cell else 0, "frozen_prediction": cell,
             "observed": {"verify_ms": r["verify_commit_ms"], "round_ms": r["round_ms"], "tokens": r["accepted"] + 1},
             "host_snapshot": {"verify_ms": r.get("predicted_verify_ms"), "tokens": r.get("predicted_tokens")}})
@@ -341,6 +357,8 @@ def summarize(rows, widths, curves, causal=False):
             "comparisons": comparisons, "boot_block_uncertainty": uncertainty,
             "uncertainty_method": "2000 deterministic percentile bootstrap resamples within profile over eligible fresh-process matched action blocks; one block has no CI; causal scope additionally requires declared isolation and shared observed power/thermal/pressure/swap stability; no direct GPU monitoring or llmprobe loadDrift certification",
             "generalization_scope": "held-out boot repetitions of prescribed prompts, not unseen prompts",
+            "same_state_counterfactual_valid": False,
+            "same_state_limit": "Matching token prefixes, offers, and priming across fresh processes does not attest identical KV/SSM/assistant/RNG state or per-variant warmup; observed variant labels are not dispatch hashes.",
             "host_prediction_unavailable": {key: sum(not finite(row["round"].get(field), True) for row in valid_rows)
                 for key, field in (("verify_ms", "predicted_verify_ms"), ("tokens", "predicted_tokens"))},
             "no_assistant": [row for row in (valid_rows if causal else rows)
@@ -444,7 +462,7 @@ def execute(args, binary, model, out, mode, profile, phase, repetition, action, 
         with runner.Server(args, binary, model, actual_mode, arm / "server.log", corpus_for_mode(mode, corpus), store,
                            experiment=experiment) as server:
             runner.atomic_json(arm / "launch.json", {"command": server.command, "environment":
-                {k: v for k, v in server.env.items() if k.startswith(("MLX_", "HF_", "TRANSFORMERS_"))},
+                runner.evidence_environment(server.env),
                 "pid": server.proc.pid, "starting_store": starting})
             for prime in range(args.priming):
                 server.assert_owned()
@@ -479,7 +497,9 @@ def execute(args, binary, model, out, mode, profile, phase, repetition, action, 
                 row["errors"].append("unexpected_verify_kind")
             if row["round"] and profile["max_tokens"] <= row["round"].get("legal_rows", MAX_ROWS):
                 row["errors"].append("insufficient_output_budget_for_complete_offer")
-            row["cost_scope"] = ("no-assistant root verify+commit, no candidate construction"
+            row["cost_scope"] = ("unsettled native pipeline entry; not a settled cost observation"
+                if row["round"] and row["round"].get("timing_scope") == "native_entry_unsettled"
+                else "no-assistant root verify+commit, no candidate construction"
                 if row["round"] and no_assistant_root(row["round"])
                 else "settled candidate construction plus selected verification+commit")
             if store is not None:
@@ -522,21 +542,32 @@ def prepare_profiles(args, server, cases):
 def price_files(out, curves):
     if any(cell.get("context_bucket") != CONTEXT_BUCKET for cell in curves.values()):
         raise runner.BenchError("price curves require current runtime context-bucket evidence")
-    tables, plain = {}, {}
+    tables = {}
     for key, cell in curves.items():
-        mode, _profile, kind, cls, rows, cost_regime = json.loads(key)
-        tables.setdefault(mode, {}).setdefault(str(cls), {}).setdefault(kind, {}).setdefault(str(rows), []).append(cell)
+        try:
+            parts = json.loads(key)
+        except (TypeError, ValueError) as exc:
+            raise runner.BenchError("price curves require an explicit observed variant key") from exc
+        if not isinstance(parts, list) or len(parts) != 7:
+            raise runner.BenchError("price curves require an explicit observed variant key")
+        mode, _profile, kind, variant, cls, rows, cost_regime = parts
+        if variant not in VERIFY_VARIANTS or cell.get("variant") != variant:
+            raise runner.BenchError("price curves require unambiguous observed executed variant evidence")
+        kinds = tables.setdefault(mode, {}).setdefault(str(cls), {})
+        kinds.setdefault(kind, {}).setdefault(variant, {}).setdefault(str(rows), []).append(cell)
         if rows == 1 and cost_regime == "no-assistant":
-            plain.setdefault(mode, {}).setdefault(str(cls), []).append(cell)
+            kinds.setdefault("plain", {}).setdefault(variant, {}).setdefault("1", []).append(cell)
     paths = {}
     for mode, table in tables.items():
-        result = {"schema": 2, "context_bucket": CONTEXT_BUCKET}
+        result = {"schema": 3, "context_bucket": CONTEXT_BUCKET}
         for cls, kinds in table.items():
-            result[cls] = {kind: {rows: sum(c["verify_ms"] * c["n"] for c in cells) / sum(c["n"] for c in cells)
-                                  for rows, cells in widths.items()} for kind, widths in kinds.items()}
-            roots = plain.get(mode, {}).get(cls, [])
-            if roots:
-                result[cls]["plain"] = {"1": sum(c["verify_ms"] * c["n"] for c in roots) / sum(c["n"] for c in roots)}
+            result[cls] = {
+                kind: {
+                    variant: {
+                        rows: sum(c["verify_ms"] * c["n"] for c in cells) / sum(c["n"] for c in cells)
+                        for rows, cells in widths.items()}
+                    for variant, widths in variants.items()}
+                for kind, variants in kinds.items()}
         path = out / (mode + "-training-prices.json")
         runner.atomic_json(path, result)
         paths[mode] = path

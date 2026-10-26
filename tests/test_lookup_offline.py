@@ -302,6 +302,25 @@ class RequestedControls(unittest.TestCase):
 
 
 class ExplicitNumericalMode(unittest.TestCase):
+    def test_launch_evidence_does_not_serialize_inherited_credentials(self):
+        from bench_lookup_staircut import evidence_environment
+        environment = {
+            "HOME": "/private/owned-server",
+            "MLX_SERVE_ROW_EXACT": "1",
+            "MLX_SERVE_LOOKUP_SELECTION": "adaptive",
+            "HF_HUB_OFFLINE": "1",
+            "INCO_API_KEY": "provider-secret",
+            "HF_TOKEN": "hub-secret",
+            "HF_CUSTOM_TOKEN": "unknown-hub-secret",
+            "MLX_SERVE_API_KEY": "server-secret",
+            "UNFAMILIAR_CREDENTIAL": "future-provider-secret",
+        }
+        self.assertEqual(evidence_environment(environment), {
+            "HOME": "/private/owned-server", "MLX_SERVE_ROW_EXACT": "1",
+            "MLX_SERVE_LOOKUP_SELECTION": "adaptive", "HF_HUB_OFFLINE": "1",
+        })
+        self.assertEqual(environment["INCO_API_KEY"], "provider-secret")
+
     def test_diagnostic_price_trace_is_never_inherited(self):
         import os
         from unittest.mock import patch
@@ -312,6 +331,19 @@ class ExplicitNumericalMode(unittest.TestCase):
             self.assertEqual(clean_environment("persistent", experiment={key: "1"})[key], "1")
         with self.assertRaises(BenchError):
             clean_environment("persistent", experiment={key: "true"})
+
+    def test_counterfactual_preparation_must_be_declared_and_supported(self):
+        import os
+        from unittest.mock import patch
+        from bench_lookup_staircut import clean_environment
+        key = "MLX_SERVE_LOOKUP_COUNTERFACTUAL_PREPARATION"
+        with patch.dict(os.environ, {key: "production-neural"}):
+            self.assertNotIn(key, clean_environment("persistent"))
+        for value in ("merged16", "production-neural", "production-combined"):
+            self.assertEqual(clean_environment("persistent", experiment={key: value})[key], value)
+        for value in ("", "production", "neural", "merged8", "1"):
+            with self.subTest(value=value), self.assertRaises(BenchError):
+                clean_environment("persistent", experiment={key: value})
 
     def test_environment_requires_declared_exact_opt_in(self):
         import os

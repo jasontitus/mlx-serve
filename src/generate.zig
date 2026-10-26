@@ -1633,6 +1633,10 @@ const LookupRoute = struct {
     /// Historical costs per token and counters, captured before routing mutates the cut.
     decision: speculation.RouteDecision,
     alternative_source: ?AlternativeSource,
+    lookup_rows: u32,
+    lookup_expected_tokens: f32,
+    lookup_variant: ?speculation.Variant,
+    lookup_verify_ms: ?f32,
 };
 
 const PreparedLookupTree = struct {
@@ -1645,14 +1649,25 @@ const PreparedLookupTree = struct {
     source: token_history.Source,
     route: ?LookupRoute = null,
 
-    fn routeBeforeAssistant(self: *PreparedLookupTree, cut: *speculation.Policy, class: i64, query_ms: f32, row_limit: u32) void {
-        const routing = lookup_adapter.route(cut, &self.execution, class, query_ms, row_limit);
+    fn routeBeforeAssistant(self: *PreparedLookupTree, cut: *speculation.Policy, class: i64, query_ms: f32, row_limit: u32, dispatch: speculation.TreeDispatch, anchor_pos: usize) void {
+        var evaluation: lookup_adapter.RouteEvaluation = .{};
+        const tracing = lookupPriceTraceEnabled();
+        const routing = lookup_adapter.route(cut, &self.execution, class, query_ms, row_limit, dispatch, if (tracing) &evaluation else null);
+        if (tracing) for (evaluation.entries[0..evaluation.len]) |entry| {
+            log.info("[lookup-route-price] {{\"family\":\"dflash\",\"anchor_pos\":{d},\"class\":{d},\"rows\":{d},\"variant\":\"{s}\",\"query_ms\":{d:.6},\"verify_ms\":{?d:.6},\"expected_tokens\":{d:.6},\"ms_per_token\":{?d:.6}}}\n", .{
+                anchor_pos, class, entry.rows, @tagName(entry.variant), query_ms, entry.verify_ms, entry.expected_tokens, entry.ms_per_token,
+            });
+        };
         self.route = .{
             .decision = routing.decision,
             .alternative_source = switch (routing.source) {
                 .plain => if (routing.plain_ms != null) .plain else null,
                 .lookup => .lookup,
             },
+            .lookup_rows = routing.lookup_rows,
+            .lookup_expected_tokens = routing.lookup_expected_tokens,
+            .lookup_variant = routing.lookup_variant,
+            .lookup_verify_ms = routing.lookup_verify_ms,
         };
     }
 
@@ -1665,6 +1680,7 @@ const PreparedLookupTree = struct {
 pub const LookupRound = struct {
     drafter: token_history.Drafter,
     cut: *speculation.Policy,
+    candidates_enabled: bool = true,
     persistent: ?*token_history.PersistentStore = null,
     corpus_lease: ?token_history.CorpusLease = null,
     persistent_lease: ?token_history.PersistentLease = null,
@@ -1704,6 +1720,10 @@ pub const LookupRound = struct {
 
     /// Query once before assistant routing; retain the same proposals for merging.
     fn prepareTree(self: *LookupRound, prompt: []const u32, generated: []const u32, anchor: u32, depth_limit: u32, watch: io_util.Stopwatch, out: *PreparedLookupTree) !void {
+        if (!self.candidates_enabled) {
+            out.* = .{ .tree = speculation.Tree.init(anchor), .execution = speculation.Tree.init(anchor), .watch = watch, .order = 0, .confidence = 0, .source = .local };
+            return;
+        }
         if (generated.len > self.gen) {
             try self.drafter.observe(generated[self.gen..]);
             self.gen = generated.len;
@@ -1745,6 +1765,12 @@ fn lookupTiersEnabled() bool {
     const on = raw != null and !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     lookup_tiers_cache = on;
     return on;
+}
+
+/// Isolate neural tree pruning without suffix indexing, queries, or external stores.
+fn lookupCandidatesEnabled() bool {
+    const value = lookupEnvPath("MLX_SERVE_LOOKUP_CANDIDATES") orelse return true;
+    return !std.mem.eql(u8, value, "0");
 }
 
 /// `MLX_SERVE_LOOKUP_TRACE=1`: one line a round with what the lookup proposed and what the cut
@@ -1812,6 +1838,8 @@ const LookupReceipt = struct {
     context_bucket: []const u8 = "floor-power-of-two-2048",
     family: []const u8,
     kind: []const u8,
+    variant: speculation.Variant = .generic,
+    lookup_candidates: bool = true,
     class: i64,
     anchor_pos: usize,
     prefix_hash: u64,
@@ -1858,7 +1886,7 @@ const LookupReceipt = struct {
         self.rows = rows;
         self.legal_rows = @min(self.legal_rows, max_rows);
         self.admissible = self.admissible and (self.requested_rows == 0 or self.requested_rows == rows);
-        self.predicted_verify_ms = policy.predictVerify(@intCast(rows), .chain, self.class);
+        self.predicted_verify_ms = policy.predictVerify(@intCast(rows), .chain, self.class, .generic);
         var expected: f32 = 0;
         for (tree.scores[0..rows]) |reach| expected += reach;
         self.predicted_tokens = expected;
@@ -1927,6 +1955,69 @@ test "lookup specTreeFor: only proven chains enable no-restart GDN" {
 }
 
 pub const Generator = struct {
+    pub const PldBackoff = struct {
+        pub const Action = enum { lookup, native, drain, cold };
+        left: u8 = 0,
+        window: u8 = 0,
+        /// Actual emitted skip tokens, including drains (never counted twice).
+        plain_tokens: u64 = 0,
+        native_tokens: u64 = 0,
+        drain_tokens: u64 = 0,
+        cold_tokens: u64 = 0,
+        misses: u64 = 0,
+        resets: u64 = 0,
+
+        pub fn enabled() bool {
+            const value = lookupEnvPath("MLX_SERVE_LOOKUP_BACKOFF") orelse return true;
+            return !std.mem.eql(u8, value, "0");
+        }
+
+        fn action(self: PldBackoff, pending: bool) Action {
+            if (self.left == 0) return .lookup;
+            if (self.left > 1) return .native;
+            // A clean one-token block cannot launch next() then drain without
+            // emitting twice. Only this boundary uses the existing cold step.
+            return if (pending) .drain else .cold;
+        }
+
+        /// The miss token is outside the skip budget; next() seeds its successor.
+        fn beginNativeMiss(self: *PldBackoff, backoff_enabled: bool, absent: bool, selection_rows: u32) bool {
+            if (!backoff_enabled or !absent or selection_rows != 0) return false;
+            self.miss("no_match");
+            return true;
+        }
+
+        fn miss(self: *PldBackoff, reason: []const u8) void {
+            self.window = @min(@as(u8, 8), @max(@as(u8, 1), self.window * 2));
+            self.left = self.window;
+            self.misses += 1;
+            self.trace(reason);
+        }
+
+        fn success(self: *PldBackoff) void {
+            self.window = 0;
+            self.left = 0;
+            self.resets += 1;
+            self.trace("accepted");
+        }
+
+        fn emitted(self: *PldBackoff, kind: []const u8) void {
+            std.debug.assert(self.left > 0);
+            self.left -= 1;
+            self.plain_tokens += 1;
+            if (std.mem.eql(u8, kind, "native")) self.native_tokens += 1
+            else if (std.mem.eql(u8, kind, "drain")) self.drain_tokens += 1
+            else self.cold_tokens += 1;
+            self.trace(kind);
+        }
+
+        fn trace(self: PldBackoff, event: []const u8) void {
+            if (lookupReceiptsEnabled() or lookupTraceEnabled())
+                log.info("[lookup-backoff] {{\"family\":\"pld\",\"event\":\"{s}\",\"window\":{d},\"left\":{d},\"plain_tokens\":{d},\"native_tokens\":{d},\"drain_tokens\":{d},\"cold_tokens\":{d},\"misses\":{d},\"resets\":{d}}}\n", .{
+                    event, self.window, self.left, self.plain_tokens, self.native_tokens, self.drain_tokens, self.cold_tokens, self.misses, self.resets,
+                });
+        }
+    };
     /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
     /// -1) at `depth`: the GDN tree table and each row's ancestor path.
     pub fn specTreeFor(parents: []const i32, depth: []const i32, max_depth: i32) transformer_mod.SpecTree {
@@ -2188,6 +2279,8 @@ pub const Generator = struct {
     mtp_kept: u32 = 0,
     mtp_tried: u32 = 0,
     mtp_cycle_watch: ?io_util.Stopwatch = null,
+    mtp_cycle_depth: u32 = 0,
+    mtp_cycle_shape: MtpCycleShape = .ineligible,
     /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
     model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
@@ -2214,6 +2307,9 @@ pub const Generator = struct {
     lookup_mtp_probe_gaps: u8 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     mtp_accepted_tokens: u64 = 0,
+    /// Fresh ordinary native cycles supersede inherited depth costs within this request.
+    mtp_request_depth_ms: [3]f32 = @splat(0),
+    mtp_request_depth_class: ?i64 = null,
     /// Adaptive-depth moving window: per-round drafted/accepted counts.
     mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
     mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
@@ -2396,6 +2492,8 @@ pub const Generator = struct {
     /// fresh economic evaluation instead of inheriting the bad early yield.
     yield_steps: u64 = 0,
     yield_accepted: u64 = 0,
+    /// Standalone tiered PLD only; drain emissions count inside the skip budget.
+    pld_backoff: PldBackoff = .{},
     /// Steps spent in disabled mode since the gate tripped (drives the
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
@@ -3099,7 +3197,7 @@ pub const Generator = struct {
         options_in: InitOptions,
     ) !Generator {
         if (lookupCounterfactualEnabled()) {
-            _ = try lookupCounterfactualAction();
+            try (try cf.preparation()).validate(try lookupCounterfactualAction(), lookupCandidatesEnabled());
             if (options_in.diagnostic_request_sha256 == null) return error.DiagnosticPreconditions;
             if (!options_in.diagnostic_owned_slot or !options_in.diagnostic_cache_off or options_in.diagnostic_model_sha256 == null or
                 !xfm.config.rowExactDecode() or !options_in.dflash_enabled or options_in.dflash == null or
@@ -5130,13 +5228,44 @@ pub const Generator = struct {
         // dispatch bug ever routes such a request here.
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
+        const tiered = lookupTiersEnabled();
+        const backoff_enabled = tiered and PldBackoff.enabled();
+        // Candidate ablation never queries and retains the ordinary pipeline.
+        if (tiered and !lookupCandidatesEnabled()) {
+            const tok = (try self.next(allocator)) orelse return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok;
+            return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+        }
+        var clean_backoff_step = false;
+        if (backoff_enabled and self.pld_backoff.left > 0) {
+            const action = self.pld_backoff.action(self.has_pending_logits or self.has_pending_token);
+            switch (action) {
+                .lookup => unreachable,
+                .cold => clean_backoff_step = true,
+                .native, .drain => {
+                    const tok = if (action == .native)
+                        (try self.next(allocator)) orelse return null
+                    else switch (try self.drainPipelineForSpec(allocator)) {
+                        .drained => |token| token,
+                        .stopped => return null,
+                        .already_clean, .stay_disabled => return error.PipelineHalfState,
+                    };
+                    self.pld_backoff.emitted(@tagName(action));
+                    const tokens = try allocator.alloc(u32, 1);
+                    tokens[0] = tok;
+                    return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+                },
+            }
+        }
+
         // Runtime acceptance gate: if a prior step set the flag, fall back
         // to the regular `next()` path. Under v2, PLD's exit invariant has
         // `t1 NOT in cache` (matches `nextDrafter`) — `next()`'s transition
         // shim seeds `pending_logits` synchronously via `forward([t1])` when
         // it sees `!has_pending_logits and !has_pending_token`. So the
         // hand-off works even though pending state is empty.
-        if (self.spec_disabled_runtime) {
+        if (!tiered and self.spec_disabled_runtime) {
             self.disabled_steps += 1;
             // Periodic re-enable check: when the generated tail turns
             // repetitive (file/tool echo after a novel preamble), PLD pays
@@ -5196,6 +5325,7 @@ pub const Generator = struct {
             }
         }
 
+        const pad_before_stop = self.consecutive_pad;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
@@ -5204,14 +5334,12 @@ pub const Generator = struct {
         // ── INVARIANT going INTO this call (mirrors `nextDrafter`) ──
         //   cache.step = prompt_len + tokens_emitted   (NOT + 1)
         //   t1 = next_token_id (= "this step's first emit"); NOT in cache yet.
-        //   pending_logits / pending_token are empty (init's PLD branch and
-        //   every nextPld exit leave them empty under v2).
+        //   pending_logits / pending_token are empty here: native backoff
+        //   returns above until its terminal drain restores this invariant.
         //
-        // Cold path (no n-gram match): forward([t1]) length 1 advances cache
-        // by 1, produces logits at position +1 → sample lookahead → emit t1,
-        // set next_token_id = lookahead. Loses A's lazy pipeline overlap on
-        // cold steps; the prompt-time n-gram gate disables PLD on novel
-        // content where cold-path dominates.
+        // An adaptive absent-proposal round enters next() and leaves a native
+        // successor pending. Other root-only rounds retain the settled cold
+        // forward/sample path (including fixed/max diagnostic controls).
         //
         // Verify path: input = `[t1, draft[0..m-1]]` length 1+m. Walk
         // verify_logits[i] vs draft[i] for i=0..m-1; full accept commits 1+m
@@ -5230,28 +5358,36 @@ pub const Generator = struct {
         const prompt = self.prompt_ids_owned;
         const generated = self.generated_ids.items;
         const total_len = prompt.len + generated.len + 1;
+        // Backoff skips the query, not the verifier's context-cost transition.
+        if (self.lookup_tiers) |*lr| lr.cls = lookupCtxClass(total_len);
 
-        var committed = try allocator.alloc(u32, total_len);
-        defer allocator.free(committed);
-        @memcpy(committed[0..prompt.len], prompt);
-        @memcpy(committed[prompt.len .. prompt.len + generated.len], generated);
-        committed[total_len - 1] = t1;
-
+        // Only legacy PLD searches the whole token buffer. Tiered lookup owns
+        // bounded suffix scratch; context pricing still uses the full length.
+        var committed: ?[]u32 = null;
+        defer if (committed) |buffer| allocator.free(buffer);
+        var lookup_miss = false;
         var draft_slice: ?[]const u32 = null;
-        if (lookupTiersEnabled()) {
-            const remaining_drafts = self.max_tokens -| self.completion_tokens -| 1;
-            draft_slice = try self.pldTiersDraft(allocator, committed, @min(max_draft, remaining_drafts));
+        if (tiered) {
+            if (!clean_backoff_step) {
+                const remaining_drafts = self.max_tokens -| self.completion_tokens -| 1;
+                draft_slice = try self.pldTiersDraft(allocator, t1, @min(max_draft, remaining_drafts), &lookup_miss);
+            }
         } else if (klen <= total_len - 1) {
+            const buffer = try allocator.alloc(u32, total_len);
+            committed = buffer;
+            @memcpy(buffer[0..prompt.len], prompt);
+            @memcpy(buffer[prompt.len .. prompt.len + generated.len], generated);
+            buffer[total_len - 1] = t1;
             const key_start = total_len - klen;
-            const key = committed[key_start..total_len];
-            const lookup = pld_index.PldLookup{ .committed = committed, .key_len = klen };
+            const key = buffer[key_start..total_len];
+            const lookup = pld_index.PldLookup{ .committed = buffer, .key_len = klen };
             draft_slice = lookup.findMatch(key, max_draft);
         }
         if (draft_slice) |d| {
             if (d.len == 0) draft_slice = null;
         }
         var pld_receipt: ?LookupReceipt = null;
-        if (lookupReceiptsEnabled()) {
+        if (lookupReceiptsEnabled() and !clean_backoff_step) {
             pld_receipt = if (self.lookup_tiers) |lr| lr.receipt else null;
             if (pld_receipt == null) {
                 var proposal = speculation.Tree.chain(t1, draft_slice orelse &.{}, 0, 0);
@@ -5268,11 +5404,36 @@ pub const Generator = struct {
 
         const stochastic = self.sampling.temperature > 0.01;
 
-        // ── Phase 2: Cold path (no n-gram match) ──
+        // ── Phase 2: Root-only path (absent or economically declined draft) ──
         // Forward([t1]) length 1: cache.step += 1, produces logits at that
         // position. Sample the lookahead, emit t1, set next_token_id =
         // lookahead. Cache exits at prompt_len + TE_new where TE_new = TE + 1.
         if (draft_slice == null) {
+            if (self.pld_backoff.beginNativeMiss(backoff_enabled, lookup_miss, lookupSelection().rows)) {
+                // next() rechecks stops after lookup; do not count this same
+                // token twice toward the consecutive-pad stop condition.
+                self.consecutive_pad = pad_before_stop;
+                const tok = (try self.next(allocator)) orelse return null;
+                // This emission owns the lookup round, NOT a skipped token.
+                // In particular the first one-token window now drains the
+                // pending successor instead of paying another cold forward.
+                if (pld_receipt) |*r| {
+                    r.committed = 1;
+                    r.round_ms = if (tiers_watch) |watch| lookupRoundMs(watch.read(), 0, false) else null;
+                    r.timing_scope = "native_entry_unsettled";
+                    r.verify_commit_ms = null;
+                    r.other_ms = null;
+                    r.predicted_verify_ms = null;
+                    r.priced = false;
+                    // Never settle or observe a kernel price here: next() may
+                    // still be executing the successor after this return.
+                    self.recordLookupReceipt(allocator, r.*);
+                }
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok;
+                return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+            }
+
             const t1_i32: i32 = @intCast(t1);
             const t1_shape = [_]c_int{ 1, 1 };
             const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
@@ -5301,13 +5462,16 @@ pub const Generator = struct {
                 }
             }
             if (pld_receipt) |r| self.recordLookupReceipt(allocator, self.lookupChainOutcome(r, 0, 1, cold_ms));
+            if (backoff_enabled) {
+                if (clean_backoff_step) self.pld_backoff.emitted("cold") else if (lookup_miss) self.pld_backoff.miss("no_match");
+            }
 
             // Yield gate: cold steps pay the unpipelined forward; if the
             // workload isn't yielding accepted drafts to pay for it, fall
             // back to the pipelined `next()` (re-enable check above can
             // bring PLD back when the tail turns repetitive).
             self.yield_steps += 1;
-            if (yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
+            if (!tiered and yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
                 log.info(
                     "  pld=disabled (yield gate: {d} drafted tokens over {d} steps < {d:.2}/step)\n",
                     .{ self.yield_accepted, self.yield_steps, YIELD_GATE_MIN_YIELD },
@@ -5568,6 +5732,9 @@ pub const Generator = struct {
         }
         if (pld_receipt) |r| self.recordLookupReceipt(allocator, self.lookupChainOutcome(r, verified_accepted, num_emit, round_ms));
         self.advanceStep(num_emit);
+        if (backoff_enabled) {
+            if (accepted > 0) self.pld_backoff.success() else self.pld_backoff.miss("zero_accepted");
+        }
 
         // No post-step forward — `next_token_id = new_t1` and exit. The next
         // nextPld call sees t1 NOT in cache (new invariant).
@@ -5589,7 +5756,7 @@ pub const Generator = struct {
         // upper-bound draft length (`max_draft`); matches with shorter accepts
         // still divide by this max so a workload with consistently-short
         // n-gram matches DOES get throttled.
-        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
+        if (!tiered and runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
             const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
             const rate: f32 = if (drafts_proposed > 0)
                 @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
@@ -6156,8 +6323,9 @@ pub const Generator = struct {
         // (serial = width 0 is a candidate, so "serial wins" is the gate),
         // the fixed block until it has data.
         var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-        // Both assistant contrasts prepare the same full-width offer before cutting.
-        if (lookupCounterfactualEnabled()) round_width = 16;
+        // Each predeclared preparation has one horizon, independent of the cut.
+        // The neural control preserves the production horizon and 15-node budget.
+        if (lookupCounterfactualEnabled()) round_width = (try cf.preparation()).horizon(round_width);
         if (!tiers_tree and self.dflash_chooser != null) {
             const ch = &self.dflash_chooser.?;
             if (ch.rounds >= dflashGateWarmup()) {
@@ -6286,7 +6454,7 @@ pub const Generator = struct {
             try lr.prepareTree(self.prompt_ids_owned, self.generated_ids.items, t1, depth_limit, io_util.Stopwatch.init(self.timer.io), &prepared_lookup);
             lookup_proposal = &prepared_lookup;
             const query_ms = lookupRoundMs(prepared_lookup.watch.read(), 0, false);
-            prepared_lookup.routeBeforeAssistant(lr.cut, cls, query_ms, DFLASH_TREE_W);
+            prepared_lookup.routeBeforeAssistant(lr.cut, cls, query_ms, DFLASH_TREE_W, .linear_gdn, anchor_pos);
             if (prepared_lookup.route.?.decision.skip)
                 return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, &.{}, null, false, lookup_proposal);
         }
@@ -7215,8 +7383,10 @@ pub const Generator = struct {
         const tracing = dflashTraceEnabled();
         var ph = io_util.Stopwatch.init(self.timer.io);
         const round_watch = if (prepared_lookup) |look| look.watch else draft_watch orelse io_util.Stopwatch.init(self.timer.io);
-        const max_nodes = dflashTreeNodes(m);
         const tiers: ?*LookupRound = if (lookupTiersEnabled()) try self.lookupTiersArm(allocator) else null;
+        // Native's architecture heuristic limits executed rows. The cost-aware
+        // selector needs the full bounded offer before it can compare widths.
+        const max_nodes = if (tiers != null) DFLASH_TREE_W - 1 else dflashTreeNodes(m);
         const cls = lookupCtxClass(anchor_pos + 1);
         if (tiers) |lr| lr.cls = cls;
         const row_limit: u32 = MAX_W;
@@ -7300,9 +7470,9 @@ pub const Generator = struct {
                 chosen = if (routed)
                     prepared_lookup.?.execution
                 else if (draft_logits != null)
-                    lr.cut.chooseTreeBootstrapControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, m + 1, if (price_trace) &evaluation else null)
+                    lr.cut.chooseTreeBootstrapControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, m + 1, if (price_trace) &evaluation else null, .linear_gdn)
                 else
-                    lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, if (price_trace) &evaluation else null);
+                    lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, if (price_trace) &evaluation else null, .linear_gdn);
                 // Unknown-width penalties must not permanently lock out a useful
                 // wider offer. One real upper-width trial and one exact-shape
                 // cold retry per model/context learn its cost; neither is a win.
@@ -7310,22 +7480,18 @@ pub const Generator = struct {
                     std.mem.eql(u8, lookupSelection().name, "adaptive") and self.spec_cost_solo)
                 {
                     const trial_cap: u32 = @intCast(@min(candidate.len, @min(row_limit, self.max_tokens -| self.completion_tokens)));
-                    if (lr.cut.prices.upperTrialWidth(m + 1, trial_cap, .tree, cls)) |trial_rows| {
-                        const wider = lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, trial_rows, null);
-                        const native = lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, m + 1, null);
+                    const native = lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, m + 1, null, .linear_gdn);
+                    const maximum = lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, trial_cap, null, .linear_gdn);
+                    const native_shape: speculation.Shape = .{ .rows = @intCast(native.len), .variant = native.variant(.linear_gdn) };
+                    if (lr.cut.prices.upperTrialWidth(native_shape, .{ .rows = @intCast(maximum.len), .variant = maximum.variant(.linear_gdn) }, .tree, cls)) |trial_rows| {
+                        const wider = lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, trial_rows, null, .linear_gdn);
                         var wide_yield: f32 = 0;
                         var native_yield: f32 = 0;
                         for (wider.scores[0..wider.len]) |reach| wide_yield += reach;
                         for (native.scores[0..native.len]) |reach| native_yield += reach;
-                        // Host-only dispatch metadata; no GPU arrays are constructed.
-                        const shape = transformer_mod.SpecTree{
-                            .parents = .{ .ctx = null },
-                            .attn = .{ .depth = .{ .ctx = null }, .path = .{ .ctx = null }, .max_depth = 0 },
-                            .linear = gdn_decode.linearParents(wider.parents[0..wider.len]),
-                        };
-                        const variant: speculation.Variant = if (shape.usesLinearGdn(wider.len)) .linear_gdn else .generic;
+                        const variant = wider.variant(.linear_gdn);
                         if (wider.len == trial_rows and wide_yield > native_yield and
-                            lr.cut.prices.reserveUpperTrial(m + 1, trial_rows, .tree, cls, variant))
+                            lr.cut.prices.reserveUpperTrial(native_shape, .{ .rows = trial_rows, .variant = variant }, .tree, cls))
                         {
                             chosen = wider;
                             if (lookupReceiptsEnabled()) log.info("[lookup-width-probe] {{\"family\":\"dflash\",\"class\":{d},\"rows\":{d},\"variant\":\"{s}\",\"reason\":\"upper_width_learning\",\"reservation_consumed\":true,\"max_forced_executions\":2}}\n", .{ cls, trial_rows, @tagName(variant) });
@@ -7333,8 +7499,8 @@ pub const Generator = struct {
                     }
                 }
                 if (price_trace) for (evaluation.entries[0..evaluation.len]) |entry| {
-                    log.info("[lookup-prices] class={d} anchor_pos={d} anchor={d} candidate_rows={d} rows={d} verify_ms={d:.3} preparation_ms={d:.3} expected_tokens={d:.3} tokens_per_ms={d:.5} selected={any}\n", .{
-                        cls, self.prompt_ids_owned.len + self.generated_ids.items.len, t1, candidate.len, entry.rows,
+                    log.info("[lookup-prices] class={d} anchor_pos={d} anchor={d} candidate_rows={d} rows={d} variant={s} verify_ms={d:.3} preparation_ms={d:.3} expected_tokens={d:.3} tokens_per_ms={d:.5} selected={any}\n", .{
+                        cls, self.prompt_ids_owned.len + self.generated_ids.items.len, t1, candidate.len, entry.rows, @tagName(entry.variant),
                         entry.verify_ms, overhead_ms, entry.expected_tokens, entry.tokens_per_ms, entry.rows == chosen.len,
                     });
                 };
@@ -7371,6 +7537,7 @@ pub const Generator = struct {
             }
             if (!plain_probe) draft_ms = lookupRoundMs(round_watch.read(), 0, false);
             receipt = self.lookupReceipt("dflash", "tree", cls, t1, &candidate, &chosen, row_limit);
+            receipt.?.variant = chosen.variant(.linear_gdn);
             receipt.?.selection_overhead_ms = selection_overhead_ms;
             receipt.?.assistant = draft_watch != null;
             receipt.?.root_no_assistant = draft_watch == null and w == 1;
@@ -7380,7 +7547,7 @@ pub const Generator = struct {
                     receipt.?.lookup_order = lookup_order;
                     receipt.?.lookup_confidence = lookup_conf;
                 }
-                receipt.?.predicted_verify_ms = lr.cut.predictVerify(@intCast(w), .tree, cls);
+                receipt.?.predicted_verify_ms = lr.cut.predictVerify(@intCast(w), .tree, cls, chosen.variant(.linear_gdn));
                 var gain: f32 = 1;
                 for (chosen.scores[1..chosen.len]) |q| gain += q;
                 receipt.?.predicted_tokens = gain;
@@ -7393,12 +7560,16 @@ pub const Generator = struct {
         // Separate from assistant drafting: includes the exact target tree forward,
         // path compaction, SSM commit and evaluated assistant-context append.
         if (diagnostic) |probe| {
-            if (candidate.len < 16) return error.DiagnosticInvalidOffer;
+            if (candidate.len < requested_rows or chosen.len != requested_rows) return error.DiagnosticInvalidOffer;
             const readback_watch = io_util.Stopwatch.init(self.timer.io);
             const prepared = cf.PreparedState{
                 .target_kv = try cf.fingerprintKV(self.ctx.cache, s),
                 .target_ssm = try cf.fingerprintSSM(self.ctx.ssm_entries orelse &.{}, s),
                 .assistant = try cf.fingerprintAssistant(if (self.dflash_ctx) |*context| context else null, self.dflash_pending.items, self.dflash_pending_rounds, s),
+                .preparation = try cf.preparation(),
+                .assistant_horizon = if (draft_logits != null) m else 0,
+                .suffix_candidates = lookupCandidatesEnabled(),
+                .context_length = anchor_pos,
             };
             try probe.captureOffer(&candidate, &chosen, draft_logits != null, prepared);
             self.diagnostic_readback_ns += readback_watch.read();
@@ -7583,12 +7754,19 @@ pub const Generator = struct {
             const hash_watch = io_util.Stopwatch.init(self.timer.io);
             if (dispatch.layers != xfm.config.num_hidden_layers or dispatch.events <= dispatch.layers)
                 return error.DiagnosticMissingDispatch;
+            var geometry: cf.Geometry = .{ .committed_count = n_commit, .kv_compacted = moved };
+            @memcpy(geometry.selected_parents[0..w], parents[0..w]);
+            @memcpy(geometry.selected_depths[0..w], depth[0..w]);
+            for (path_rows[0..n_commit], 0..) |row, i| geometry.committed_rows[i] = @intCast(row);
             const kernel = cf.Kernel{
                 .rows = @intCast(w),
                 .variant = dispatch.variant,
-                .kind = if (spec_tree.linear) .chain else .tree,
+                // Price kind names the executed verifier, not the selected topology.
+                // Linear GDN is a variant of this tree-verifier path.
+                .kind = .tree,
                 .class = cls,
                 .dispatch = dispatch.hash.finish(),
+                .geometry = geometry,
             };
             const hash_ns = hash_watch.read();
             self.diagnostic_pending = .{
@@ -7611,7 +7789,7 @@ pub const Generator = struct {
             if (self.spec_cost_solo and !lookupCounterfactualEnabled()) {
                 if (plain_probe) {
                     if (lr.cut.observePlainProbe(verify_ms, cls, MTP_ADAPTIVE_PROBE_WARM))
-                        lr.cut.prices.observe(@intCast(w), verify_ms, .tree, cls);
+                        lr.cut.prices.observe(@intCast(w), verify_ms, .tree, cls, .generic);
                 } else {
                     const warmed = lr.cut.prices.observeKernel(@intCast(w), verify_ms, .tree, cls, if (spec_tree.usesLinearGdn(w)) .linear_gdn else .generic);
                     if (w == 1 and warmed) {
@@ -7983,6 +8161,7 @@ pub const Generator = struct {
     fn mtpRoundUntimed(self: *Generator, lookup: bool, drafts: u32, accepted: u32) void {
         if (self.mtp_regime_clock) |*c| c.reset();
         self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
         self.mtp_serial_clock = null;
         self.mtp_serial_warm = 0;
         // The first native round after lookup pays head-history recovery, so
@@ -8058,15 +8237,16 @@ pub const Generator = struct {
             var lr = LookupRound{
                 .drafter = token_history.Drafter.init(allocator),
                 .cut = &policy.*.?,
+                .candidates_enabled = lookupCandidatesEnabled(),
                 .trust_active = self.sampling.temperature == 0 and self.xfm.config.rowExactDecode(),
             };
             errdefer lr.deinit();
             const policy_ns = if (setup_watch) |watch| watch.read() else 0;
             lr.drafter.vocab_limit = @intCast(self.tok.definedVocabSize());
-            try lr.drafter.prime(self.prompt_ids_owned);
+            if (lr.candidates_enabled) try lr.drafter.prime(self.prompt_ids_owned);
             const local_ns = if (setup_watch) |watch| watch.read() else 0;
             var corpus_ns = local_ns;
-            if (self.tok.content_sha256) |identity| {
+            if (if (lr.candidates_enabled) self.tok.content_sha256 else null) |identity| {
                 if (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS")) |path| {
                     lr.corpus_lease = cache.acquireCorpus(self.timer.io, path, identity) catch |err| blk: {
                         log.warn("[lookup] corpus unavailable: {s}\n", .{@errorName(err)});
@@ -8110,7 +8290,7 @@ pub const Generator = struct {
                         }
                     };
                 }
-            } else if (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null or lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null) {
+            } else if (lr.candidates_enabled and (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null or lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null)) {
                 log.warn("[lookup] external stores require a tokenizer fingerprint\n", .{});
             }
             if (setup_watch) |watch| {
@@ -8132,8 +8312,8 @@ pub const Generator = struct {
             }
             if (lookupCounterfactualEnabled()) {
                 if (!self.dflashTiersTreeEnabled() or !self.spec_cost_solo or lr.persistent != null or
-                    (lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null and lr.persistent_lease == null) or
-                    (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null and lr.corpus_lease == null))
+                    (lr.candidates_enabled and lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null and lr.persistent_lease == null) or
+                    (lr.candidates_enabled and lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null and lr.corpus_lease == null))
                     return error.DiagnosticPreconditions;
                 const conditions = cf.Preconditions{
                     .row_exact = self.xfm.config.rowExactDecode(),
@@ -8172,6 +8352,9 @@ pub const Generator = struct {
         if (self.generated_ids.items.len != 0 or self.has_pending_logits or self.has_pending_token or self.spec_disabled_runtime)
             return error.DiagnosticInvalidState;
         var controls: cf.Hasher = .{};
+        controls.bytes(@tagName(try cf.preparation()));
+        controls.flag(lookupCandidatesEnabled());
+        controls.integer(self.dflash_block_size);
         controls.bytes(&self.diagnostic_model_sha256.?);
         controls.bytes(&self.diagnostic_request_sha256.?);
         controls.bytes(&self.tok.content_sha256.?);
@@ -8254,6 +8437,7 @@ pub const Generator = struct {
         var receipt = LookupReceipt{
             .family = family,
             .kind = kind,
+            .lookup_candidates = lookupCandidatesEnabled(),
             .class = cls,
             .anchor_pos = self.prompt_ids_owned.len + self.generated_ids.items.len,
             .prefix_hash = self.lookupPrefix(anchor),
@@ -8283,7 +8467,7 @@ pub const Generator = struct {
         var r = self.lookupReceipt(family, "chain", lr.cls, candidate.tokens[0], candidate, &lr.chain, @intCast(candidate.len));
         r.lookup_order = look.order;
         r.lookup_confidence = look.confidence;
-        r.predicted_verify_ms = lr.cut.predictVerify(choice.rows + 1, .chain, lr.cls);
+        r.predicted_verify_ms = lr.cut.predictVerify(choice.rows + 1, .chain, lr.cls, .generic);
         r.predicted_tokens = choice.expected + 1;
         lr.receipt = r;
     }
@@ -8325,16 +8509,19 @@ pub const Generator = struct {
         r.root_no_assistant = true;
         r.draft_ms = 0;
         r.predicted_tokens = 1;
-        r.predicted_verify_ms = lr.cut.predictVerify(1, .chain, cls);
+        r.predicted_verify_ms = lr.cut.predictVerify(1, .chain, cls, .generic);
         lr.receipt = r;
     }
 
     /// The PLD arm's draft: the same three-tier lookup, cut to the rows its value pays for.
-    fn pldTiersDraft(self: *Generator, allocator: std.mem.Allocator, committed: []const u32, cap: u32) !?[]const u32 {
+    fn pldTiersDraft(self: *Generator, allocator: std.mem.Allocator, anchor: u32, cap: u32, miss: *bool) !?[]const u32 {
+        miss.* = false;
+        if (!lookupCandidatesEnabled()) return null;
         const preparation_watch = io_util.Stopwatch.init(self.timer.io);
         const lr = try self.lookupTiersArm(allocator);
-        if (lookupSelection().rows == 1) {
-            self.lookupRootReceipt("pld", lr, committed[committed.len - 1], lookupCtxClass(committed.len));
+        const cls = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+        if (lookupSelection().rows == 1 or cap == 0) {
+            self.lookupRootReceipt("pld", lr, anchor, cls);
             return null;
         }
         const gen = self.generated_ids.items;
@@ -8342,12 +8529,21 @@ pub const Generator = struct {
             try lr.drafter.observe(gen[lr.gen..]);
             lr.gen = gen.len;
         }
-        const look = try lr.drafter.look(committed, 16, &lr.look);
-        const cls = lookupCtxClass(committed.len);
+        const context = try lr.tailContext(self.prompt_ids_owned, gen, anchor);
+        const look = try lr.drafter.look(context, 16, &lr.look);
+        // Economic decline is not a match failure: retain prompt retry cadence
+        // while prices learn. Only absent proposals or zero acceptance back off.
+        miss.* = look.tokens.len == 0;
         lr.cls = cls;
         lr.receipt = null;
-        const candidate = lookup_adapter.lookupChain(committed[committed.len - 1], look.tokens, look.nodes, look.order, &lr.cut.cal, cap + 1);
-        const choice = try lr.cut.chooseLookPreparedControlled(&candidate, cls, lookupRoundMs(preparation_watch.read(), 0, false), &lr.pick, lookupSelection().rows, .plain);
+        const candidate = lookup_adapter.lookupChain(anchor, look.tokens, look.nodes, look.order, &lr.cut.cal, cap + 1);
+        const trial_width = if (self.spec_cost_solo and lookupSelection().rows == 0 and !lookupCounterfactualEnabled())
+            lr.cut.reservePlainWidthTrial(&candidate, cls)
+        else
+            null;
+        const choice = try lr.cut.chooseLookPreparedControlled(&candidate, cls, lookupRoundMs(preparation_watch.read(), 0, false), &lr.pick, trial_width orelse lookupSelection().rows, .plain);
+        if (trial_width) |rows| if (lookupReceiptsEnabled())
+            log.info("[lookup-width-probe] {{\"family\":\"pld\",\"class\":{d},\"rows\":{d},\"reason\":\"upper_width_learning\",\"reservation_consumed\":true,\"max_forced_executions\":2}}\n", .{ cls, rows });
         if (choice.rows == 0) {
             self.lookupChainReceipt("pld", lr, look, &candidate, choice);
             return null;
@@ -8366,6 +8562,7 @@ pub const Generator = struct {
     /// One three-tier lookup round: the request's own index, the corpus and the persistent log,
     /// then the independent policy's chain selection. 0 retains native MTP.
     fn mtpLookupTiers(self: *Generator, allocator: std.mem.Allocator, t1: u32, native_prepared: bool) !u32 {
+        if (!lookupCandidatesEnabled()) return 0;
         const preparation_watch = io_util.Stopwatch.init(self.timer.io);
         const lr = try self.lookupTiersArm(allocator);
         if (lookupSelection().rows == 1) {
@@ -8382,13 +8579,21 @@ pub const Generator = struct {
         const context_len = self.prompt_ids_owned.len + gen.len + 1;
         const context = try lr.tailContext(self.prompt_ids_owned, gen, t1);
         const look = try lr.drafter.look(context, 16, &lr.look);
-        lr.offered = if (lr.trust_active) lookup_adapter.lookupTree(t1, look.nodes, look.order, &lr.cut.cal, 16) else null;
+        lr.offered = if (lr.trust_active and look.nodes.len > 0) lookup_adapter.lookupTree(t1, look.nodes, look.order, &lr.cut.cal, 16) else null;
         lr.offered_position = self.generated_ids.items.len;
         const cls = lookupCtxClass(context_len);
         lr.cls = cls;
         lr.receipt = null;
         lr.controlled_root = false;
         const controlled = !std.mem.eql(u8, lookupSelection().name, "adaptive");
+        // An absent proposal cannot beat native MTP. Keep indexing and context
+        // bookkeeping, but do not build/calibrate/price a root-only alternative.
+        // Controlled arms still need their explicit root-verification receipts.
+        if (!controlled and look.tokens.len == 0) {
+            lr.pick.clearRetainingCapacity();
+            if (lookupTraceEnabled()) log.info("[lookup] mtp order=0 rows=0 decision=empty preparation_ms={d:.3}\n", .{lookupRoundMs(preparation_watch.read(), 0, false)});
+            return 0;
+        }
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const cap = @min(remaining, depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active));
         // The shared native table includes query and successor-predraft work.
@@ -9928,6 +10133,7 @@ pub const Generator = struct {
     pub fn invalidateRoundClock(self: *Generator) void {
         self.mtp_regime_clock = null;
         self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
         self.spec_round_prev_width = null;
     }
 
@@ -10352,6 +10558,7 @@ pub const Generator = struct {
     ) !MtpRoundState {
         var chain = chain_in;
         errdefer chain.deinit(allocator);
+        self.mtpExactContext(lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1));
         var ph = ph_in;
         const s = self.xfm.s;
         const plan = chain.plan;
@@ -10798,9 +11005,9 @@ pub const Generator = struct {
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
-        // A lookup round is no MTP width sample, nor is the MTP round after one:
-        // its first head step consumes a wider history stash than MTP makes.
-        const times_round = !chain.lookup and !self.mtp_after_lookup;
+        // Lookup/recovery and deliberately settled clean probes are not ordinary
+        // pipelined native width samples. Their acceptance remains useful.
+        const times_round = !chain.lookup and !self.mtp_after_lookup and chain.lookup_native_watch == null;
         self.mtp_after_lookup = chain.lookup;
         if (chain.lookup) {
             self.mtp_lookup_rounds += 1;
@@ -11259,6 +11466,7 @@ pub const Generator = struct {
             }
             try self.observeLookupNativeRemaining(chain, m + 1, true);
             try self.observeLookupRound(chain, verified_accepted, m, round_watch);
+            const lazy_built = lazy != null;
             try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
             if (tracing) {
                 self.mtp_trace.add(.predraft, ph.read());
@@ -11266,6 +11474,7 @@ pub const Generator = struct {
             }
             self.mtpTraceRoundEnd(m, m, m_lo);
             if (times_round) {
+                if (self.mtp_serial_accept) self.mtpExactObserve(m, m, self.mtpExactCycleShape(chain, lazy_built));
                 self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
                 if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
             } else {
@@ -11371,6 +11580,7 @@ pub const Generator = struct {
         }
         try self.observeLookupNativeRemaining(chain, accepted + 1, stop_prefix.stop == null and accepted == verified_accepted);
         try self.observeLookupRound(chain, verified_accepted, accepted, round_watch);
+        const lazy_built = lazy != null;
         try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
         if (tracing) {
             self.mtp_trace.add(.predraft, ph.read());
@@ -11378,6 +11588,7 @@ pub const Generator = struct {
         }
         self.mtpTraceRoundEnd(m, accepted, m_lo);
         if (times_round) {
+            if (self.mtp_serial_accept) self.mtpExactObserve(m, accepted, self.mtpExactCycleShape(chain, lazy_built));
             self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
             if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
@@ -11899,14 +12110,30 @@ pub const Generator = struct {
     /// the kv term, the regime gate and the round-cost table all read ONE
     /// inter-round wall clock (tok/s is measured between round ends, so
     /// per-round work outside the round stopwatch belongs to the width).
-    /// The depth (1 or 2) with the most expected tokens per ms: this request's
-    /// acceptance against the model's measured round ms per depth. A depth
-    /// never measured on this model runs first; every MTP_EXACT_PROBE rounds
-    /// on the model the other depth runs, so both costs stay current.
+    /// Choose depth from fresh request-local cycles, falling back to shared prices.
+    /// Existing model-wide challenges refresh the alternative every 64 rounds;
+    /// a useful challenge must not remain hidden behind an inherited slow EMA.
+    fn mtpExactContext(self: *Generator, class: i64) void {
+        if (self.mtp_request_depth_class == class) return;
+        self.mtp_request_depth_class = class;
+        self.mtp_request_depth_ms = @splat(0);
+        // The first executed chain in a new class cannot price an old interval.
+        self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
+    }
+
+    fn mtpExactPrice(self: *const Generator, depth: u32) f32 {
+        const class = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+        if (self.mtp_request_depth_class == class and depth < self.mtp_request_depth_ms.len) {
+            const fresh = self.mtp_request_depth_ms[depth];
+            if (fresh > 0) return fresh;
+        }
+        return self.xfm.mtp_depth_ms[depth];
+    }
+
     fn mtpExactDepth(self: *Generator, cap: u32) u32 {
-        const ms = &self.xfm.mtp_depth_ms;
         var d: u32 = 1;
-        while (d <= cap) : (d += 1) if (ms[d] == 0) {
+        while (d <= cap) : (d += 1) if (self.mtpExactPrice(d) == 0) {
             self.traceMtpExactDepth(d, true, false);
             return d;
         };
@@ -11917,7 +12144,7 @@ pub const Generator = struct {
         const a = self.mtpExactAcceptance();
         const tok1 = 1 + a;
         const tok2 = tok1 + a * a;
-        const best: u32 = if (tok2 / ms[2] > tok1 / ms[1]) 2 else 1;
+        const best: u32 = if (tok2 / self.mtpExactPrice(2) > tok1 / self.mtpExactPrice(1)) 2 else 1;
         self.xfm.mtp_depth_rounds +%= 1;
         const trial = self.xfm.mtp_depth_rounds % MTP_EXACT_PROBE == 0;
         const selected = if (trial) 3 - best else best;
@@ -11928,9 +12155,10 @@ pub const Generator = struct {
 
     fn traceMtpExactDepth(self: *const Generator, depth: u32, cold: bool, trial: bool) void {
         if (!lookupReceiptsEnabled()) return;
-        log.info("[lookup-native-depth] {{\"family\":\"mtp\",\"anchor_pos\":{d},\"depth\":{d},\"cold\":{any},\"trial\":{any},\"acceptance\":{d:.6},\"one_ms\":{d:.6},\"two_ms\":{d:.6},\"request_tried\":{d},\"request_kept\":{d}}}\n", .{
+        log.info("[lookup-native-depth] {{\"family\":\"mtp\",\"anchor_pos\":{d},\"depth\":{d},\"cold\":{any},\"trial\":{any},\"acceptance\":{d:.6},\"one_ms\":{d:.6},\"two_ms\":{d:.6},\"shared_one_ms\":{d:.6},\"shared_two_ms\":{d:.6},\"request_tried\":{d},\"request_kept\":{d}}}\n", .{
             self.prompt_ids_owned.len + self.generated_ids.items.len,
             depth, cold, trial, self.mtpExactAcceptance(),
+            self.mtpExactPrice(1), self.mtpExactPrice(2),
             self.xfm.mtp_depth_ms[1], self.xfm.mtp_depth_ms[2], self.mtp_tried, self.mtp_kept,
         });
     }
@@ -12057,24 +12285,47 @@ pub const Generator = struct {
         });
     }
 
+    const MtpCycleShape = enum { ineligible, cold, pipelined };
+
+    /// Inter-end timing includes outgoing preparation, not the incoming chain.
+    /// Only homogeneous carried/native successors or entirely cold rounds can
+    /// replace a depth's inherited price. Discarded lazy work is never free.
+    fn mtpExactCycleShape(self: *const Generator, chain: *const MtpPreDraft, lazy_built: bool) MtpCycleShape {
+        if (chain.lookup) return .ineligible;
+        if (self.mtp_pre_draft) |*prepared| {
+            if (!chain.lookup_prepared_before_round or prepared.lookup or prepared.m != chain.m or
+                prepared.n_drafted != prepared.m or prepared.plan.m_lo != prepared.plan.m_hi) return .ineligible;
+            return .pipelined;
+        }
+        return if (!chain.lookup_prepared_before_round and !lazy_built) .cold else .ineligible;
+    }
+
     /// `m` drafts, `accepted` kept. A round's cost is the wall time since the
     /// previous round ended: everything a round adds to the request, streaming included.
-    fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
+    fn mtpExactObserve(self: *Generator, m: u32, accepted: u32, shape: MtpCycleShape) void {
         if (m == 0 or m >= self.xfm.mtp_depth_ms.len) return;
         if (self.spec_cost_solo) {
             if (self.mtp_cycle_watch) |*w| {
                 const cycle_ms = @as(f32, @floatFromInt(w.read())) / std.time.ns_per_ms;
                 const ms = &self.xfm.mtp_depth_ms[m];
                 // A stall (streaming, another request) is not this depth's cost.
-                if (cycle_ms > 0 and std.math.isFinite(cycle_ms)) {
-                    if (ms.* == 0) ms.* = cycle_ms else if (cycle_ms < 2 * ms.*) ms.* += 0.2 * (cycle_ms - ms.*);
+                if (cycle_ms > 0 and std.math.isFinite(cycle_ms) and (ms.* == 0 or cycle_ms < 2 * ms.*)) {
+                    if (ms.* == 0) ms.* = cycle_ms else ms.* += 0.2 * (cycle_ms - ms.*);
+                    if (m < self.mtp_request_depth_ms.len and shape != .ineligible and
+                        self.mtp_cycle_shape == shape and self.mtp_cycle_depth == m) {
+                        const fresh = &self.mtp_request_depth_ms[m];
+                        if (fresh.* == 0) fresh.* = cycle_ms else fresh.* += 0.2 * (cycle_ms - fresh.*);
+                    }
                 }
                 w.reset();
             } else self.mtp_cycle_watch = io_util.Stopwatch.init(self.timer.io);
+            self.mtp_cycle_depth = m;
+            self.mtp_cycle_shape = shape;
         } else {
             // Acceptance remains useful, but a contended interval must neither
             // seed a depth price nor leak into the next solo observation.
             self.mtp_cycle_watch = null;
+            self.mtp_cycle_shape = .ineligible;
         }
         self.mtpExactAccept(accepted);
     }
@@ -12086,7 +12337,6 @@ pub const Generator = struct {
     }
 
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
-        if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
         if (group_planner.enabled() and self.mtp_planner_width != null) return;
         // An interval spanning a speculative round is neither arm's number.
         self.mtp_serial_clock = null;
@@ -13802,7 +14052,9 @@ pub const Generator = struct {
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         if (self.mtp_serial_accept) {
-            const d = depth_bounds.clampWidth(self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2)), depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
+            const cap = @min(@max(@as(u32, 1), self.mtp_depth), 2);
+            const floor = depth_bounds.floorFor(depth_bounds.active, self.mtp_depth);
+            const d = depth_bounds.clampWidth(self.mtpExactDepth(cap), floor, self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
@@ -25816,8 +26068,8 @@ test "lookup carried preparation is charged once and outcome excludes later rece
     try testing.expect(outcome.priced);
     var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
     defer cut.deinit();
-    cut.prices.observe(3, outcome.verify_commit_ms.?, .chain, 0);
-    try testing.expectEqual(outcome.verify_commit_ms.?, cut.prices.price(3, .chain, 0));
+    cut.prices.observe(3, outcome.verify_commit_ms.?, .chain, 0, .generic);
+    try testing.expectEqual(outcome.verify_commit_ms.?, cut.prices.price(3, .chain, 0, .generic));
 }
 
 test "lookup suffix query preserves configured corpus order across history boundaries" {
@@ -25837,6 +26089,20 @@ test "lookup suffix query preserves configured corpus order across history bound
     try testing.expectEqual(@as(u32, 12), look.order);
     try testing.expectEqualSlices(u32, &.{77}, look.tokens);
     try testing.expectEqualSlices(u32, &.{ 10, 11, 12 }, try lr.tailContext(&.{10}, &.{11}, 12));
+}
+
+test "lookup candidate ablation skips indexing and preserves neural proposals" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.failing_allocator), .cut = &cut, .candidates_enabled = false };
+    defer lr.deinit();
+    var prepared: PreparedLookupTree = undefined;
+    try lr.prepareTree(&.{ 1, 2, 3, 4 }, &.{ 1, 2 }, 3, 16, io_util.Stopwatch.init(testing.io), &prepared);
+    try testing.expectEqualSlices(u32, &.{3}, prepared.tree.tokens[0..prepared.tree.len]);
+    try testing.expectEqual(@as(usize, 0), lr.gen);
+    var neural = speculation.Tree.chain(3, &.{ 7, 8 }, 0.8, 0.8);
+    prepared.mergeInto(&neural);
+    try testing.expectEqualSlices(u32, &.{ 3, 7, 8 }, neural.tokens[0..neural.len]);
 }
 
 test "lookup tree producer separates entry and continuation probability before merging" {
@@ -25925,44 +26191,45 @@ test "lookup exact MTP prices exclude lookup, prefill and contended intervals" {
     gen.xfm = &xfm;
     gen.timer = io_util.Stopwatch.init(io);
     gen.mtp_cycle_watch = null;
+    gen.mtp_request_depth_ms = @splat(0);
     gen.mtp_regime_clock = null;
     gen.mtp_tried = 0;
     gen.mtp_kept = 0;
     gen.spec_cost_solo = true;
 
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     now_ns = 100 * std.time.ns_per_ms;
     gen.mtpRoundUntimed(true, 14, 14); // Lookup duration and acceptance are not native evidence.
     now_ns = 1500 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 0);
+    gen.mtpExactObserve(1, 0, .cold);
     try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[1]);
     now_ns = 1540 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
 
     gen.spec_cost_solo = false;
     now_ns = 2540 * std.time.ns_per_ms;
     const tried_before = gen.mtp_tried;
     const kept_before = gen.mtp_kept;
-    gen.mtpExactObserve(2, 1);
+    gen.mtpExactObserve(2, 1, .cold);
     try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
     try testing.expectEqual(tried_before + 1, gen.mtp_tried);
     try testing.expectEqual(kept_before + 1, gen.mtp_kept);
     gen.spec_cost_solo = true;
     now_ns = 3540 * std.time.ns_per_ms;
-    gen.mtpExactObserve(2, 1);
+    gen.mtpExactObserve(2, 1, .cold);
     try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
     now_ns = 3600 * std.time.ns_per_ms;
-    gen.mtpExactObserve(2, 1);
+    gen.mtpExactObserve(2, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 60), xfm.mtp_depth_ms[2], 1e-5);
 
     now_ns = 4000 * std.time.ns_per_ms;
     gen.invalidateRoundClock(); // an intervening prefill is not a head cycle
     now_ns = 5100 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
     now_ns = 5140 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
 }
 
@@ -25984,6 +26251,7 @@ test "lookup native recovery retains acceptance and rearms only clean solo prici
     gen.xfm = &xfm;
     gen.timer = io_util.Stopwatch.init(io);
     gen.mtp_cycle_watch = io_util.Stopwatch.init(io);
+    gen.mtp_request_depth_ms = @splat(0);
     gen.mtp_regime_clock = null;
     gen.mtp_serial_accept = true;
     gen.mtp_tried = 0;
@@ -26002,7 +26270,7 @@ test "lookup native recovery retains acceptance and rearms only clean solo prici
     try testing.expectApproxEqAbs(@as(f32, 0.51), xfm.mtp_depth_acc, 1e-6);
     try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
     now_ns = 2040 * std.time.ns_per_ms;
-    gen.mtpExactObserve(2, 1);
+    gen.mtpExactObserve(2, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[2], 1e-5);
     try testing.expectEqual(@as(u32, 2), gen.mtp_tried);
 
@@ -26014,10 +26282,10 @@ test "lookup native recovery retains acceptance and rearms only clean solo prici
     try testing.expect(gen.mtp_cycle_watch == null);
     gen.spec_cost_solo = true;
     now_ns = 4000 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[1]);
     now_ns = 4050 * std.time.ns_per_ms;
-    gen.mtpExactObserve(1, 1);
+    gen.mtpExactObserve(1, 1, .cold);
     try testing.expectApproxEqAbs(@as(f32, 50), xfm.mtp_depth_ms[1], 1e-5);
     gen.mtpRoundUntimed(true, 14, 14);
     try testing.expect(gen.mtp_cycle_watch == null);
@@ -26064,7 +26332,7 @@ test "MTP lookup chain receipts and delayed learning retain selected per-edge su
         var flight: Generator.MtpPreDraft = undefined;
         flight.lookup_receipt = .{ .class = lr.cls, .tree = lr.chain, .round = lr.receipt };
         flight.m = 1;
-        cut.prices.observe(2, 12, .chain, lr.cls);
+        cut.prices.observe(2, 12, .chain, lr.cls, .generic);
         if (flight.lookup_receipt.?.round) |*r| {
             r.limitChain(&flight.lookup_receipt.?.tree, &cut, flight.m, 2);
             try testing.expectEqual(@as(usize, 2), r.rows);
@@ -26109,8 +26377,8 @@ test "DFlash routing preserves full lookup evidence when execution keeps only ro
         const original = try cf.fingerprintOffer(&prepared.tree);
         cut.observePlain(if (lookup_route) 10 else 1, 0);
         _ = cut.observeSpecRemainingProbe(20, 1, 0, 0);
-        for (2..5) |rows| cut.prices.observe(@intCast(rows), if (lookup_route and rows == 2) 1 else 100, .tree, 0);
-        prepared.routeBeforeAssistant(&cut, 0, 0, 4);
+        for (2..5) |rows| cut.prices.observe(@intCast(rows), if (lookup_route and rows == 2) 1 else 100, .tree, 0, .generic);
+        prepared.routeBeforeAssistant(&cut, 0, 0, 4, .generic, prompt.len);
         try testing.expect(prepared.route.?.decision.skip);
         try testing.expectEqual(@as(usize, if (lookup_route) 2 else 1), prepared.execution.len);
         try testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6 }, prepared.tree.tokens[0..prepared.tree.len]);
@@ -26244,4 +26512,285 @@ test "lookup native target bootstrap excludes carried grouped contended and unma
     try gen.beginLookupNativeTarget(&chain); // Qwen4 state is intentionally unmapped.
     try testing.expect(chain.lookup_target_watch == null);
     try testing.expectEqual(@as(u64, 0), chain.lookup_head_settle_ns);
+}
+
+test "tiered PLD miss backoff emits exactly 1 2 4 8 plain tokens including drains" {
+    const Action = Generator.PldBackoff.Action;
+    for ([_]bool{ false, true }) |native_entry| {
+        var backoff = Generator.PldBackoff{};
+        var total: u64 = 0;
+        for ([_]u8{ 1, 2, 4, 8, 8 }) |budget| {
+            if (native_entry) {
+                try testing.expect(backoff.beginNativeMiss(true, true, 0));
+            } else backoff.miss("no_match");
+            try testing.expectEqual(budget, backoff.left);
+            // The miss emission is not a skip; native entry leaves a successor.
+            try testing.expectEqual(total, backoff.plain_tokens);
+            var pending = native_entry;
+            var emitted: u8 = 0;
+            while (backoff.action(pending) != .lookup) {
+                const action = backoff.action(pending);
+                if (emitted == budget - 1)
+                    try testing.expectEqual(if (pending) Action.drain else Action.cold, action);
+                pending = action == .native;
+                backoff.emitted(@tagName(action));
+                emitted += 1;
+            }
+            total += budget;
+            try testing.expectEqual(budget, emitted);
+            try testing.expect(!pending);
+            try testing.expectEqual(total, backoff.plain_tokens);
+            try testing.expectEqual(backoff.plain_tokens, backoff.native_tokens + backoff.drain_tokens + backoff.cold_tokens);
+        }
+        try testing.expectEqual(@as(u64, if (native_entry) 5 else 4), backoff.drain_tokens);
+        try testing.expectEqual(@as(u64, if (native_entry) 0 else 1), backoff.cold_tokens);
+        backoff.success();
+        try testing.expectEqual(@as(u8, 0), backoff.window);
+        try testing.expectEqual(Action.lookup, backoff.action(false));
+        backoff.miss("zero_accepted");
+        try testing.expectEqual(@as(u8, 1), backoff.left);
+    }
+}
+
+test "tiered PLD native miss excludes declines disabled backoff and width controls" {
+    var backoff = Generator.PldBackoff{};
+    try testing.expect(!backoff.beginNativeMiss(false, true, 0));
+    try testing.expect(!backoff.beginNativeMiss(true, false, 0));
+    for ([_]u32{ 1, 2, 4, 16, std.math.maxInt(u32) }) |rows|
+        try testing.expect(!backoff.beginNativeMiss(true, true, rows));
+    try testing.expectEqual(@as(u64, 0), backoff.misses);
+    try testing.expectEqual(@as(u8, 0), backoff.left);
+    try testing.expect(backoff.beginNativeMiss(true, true, 0));
+    try testing.expectEqual(@as(u64, 1), backoff.misses);
+    try testing.expectEqual(@as(u8, 1), backoff.left);
+    try testing.expectEqual(@as(u64, 0), backoff.plain_tokens);
+    try testing.expectEqual(Generator.PldBackoff.Action.drain, backoff.action(true));
+    // Decline must not change the miss streak or learn an unexecuted proposal.
+    try testing.expect(!backoff.beginNativeMiss(true, false, 0));
+    try testing.expectEqual(@as(u64, 1), backoff.misses);
+    try testing.expectEqual(@as(u8, 1), backoff.window);
+}
+
+test "tiered PLD native miss stop conditions leave unspent skips uncounted" {
+    for ([_]bool{ false, true }) |at_cap| {
+        var gen: Generator = undefined;
+        gen.pld_backoff = .{};
+        try testing.expect(gen.pld_backoff.beginNativeMiss(true, true, 0));
+        gen.done = false;
+        gen.max_tokens = 2;
+        gen.step = if (at_cap) 2 else 1;
+        gen.next_token_id = if (at_cap) 42 else 2;
+        gen.eos_token_ids = &.{2};
+        gen.consecutive_pad = 0;
+        gen.timer = io_util.Stopwatch.init(testing.io);
+        gen.timeout_ns = 0;
+        gen.stall = .{};
+        gen.generated_ids = .empty;
+        // The same stop check guards native emission and terminal drain.
+        // A stopped successor is not an emitted token or a consumed skip.
+        try testing.expect(try gen.checkStop());
+        try testing.expect(gen.done);
+        try testing.expectEqualStrings(if (at_cap) "length" else "stop", gen.finish_reason);
+        try testing.expectEqual(@as(u8, 1), gen.pld_backoff.left);
+        try testing.expectEqual(@as(u64, 0), gen.pld_backoff.plain_tokens);
+    }
+
+    // Entry and native handoff both check the same root; only one check's
+    // pad advance may survive. The third actual pad, not the second, stops.
+    var pads: u32 = 1;
+    const before_stop = pads;
+    try testing.expect(!tokenStops(0, &.{2}, &pads));
+    pads = before_stop;
+    try testing.expect(!tokenStops(0, &.{2}, &pads));
+    try testing.expectEqual(@as(u32, 2), pads);
+    try testing.expect(tokenStops(0, &.{2}, &pads));
+}
+
+test "tiered PLD backoff boundary handles shim pending and clean slow paths" {
+    var backoff = Generator.PldBackoff{};
+    backoff.miss("zero_accepted");
+    // A pending-logits-only shim and a full lazy pipeline both owe one token.
+    try testing.expectEqual(Generator.PldBackoff.Action.drain, backoff.action(true));
+    backoff.emitted("drain");
+    try testing.expectEqual(@as(u64, 1), backoff.plain_tokens);
+    try testing.expectEqual(@as(u8, 0), backoff.left);
+    // A native slow path may leave no pending state: the final token still
+    // uses a clean cold step rather than creating an unbudgeted pipeline tail.
+    backoff.miss("no_match");
+    try testing.expectEqual(Generator.PldBackoff.Action.native, backoff.action(false));
+    backoff.emitted("native");
+    try testing.expectEqual(Generator.PldBackoff.Action.cold, backoff.action(false));
+    backoff.emitted("cold");
+    try testing.expectEqual(@as(u64, 3), backoff.plain_tokens);
+    // An economic decline does not call miss or success and keeps the streak.
+    try testing.expectEqual(@as(u8, 2), backoff.window);
+    try testing.expectEqual(Generator.PldBackoff.Action.lookup, backoff.action(false));
+}
+
+test "lookup native prices replace inherited costs only after stable depth cycles" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    var now_ns: i96 = 0;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    var xfm: Transformer = undefined;
+    xfm.mtp_depth_ms = @splat(0);
+    xfm.mtp_depth_ms[1] = 131;
+    xfm.mtp_depth_ms[2] = 256;
+    xfm.mtp_depth_acc = 0.92;
+    xfm.mtp_depth_rounds = 0;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.mtp_cycle_watch = null;
+    gen.mtp_request_depth_ms = @splat(0);
+    gen.mtp_request_depth_class = null;
+    gen.prompt_ids_owned = &.{};
+    gen.generated_ids = .empty;
+    gen.mtp_tried = 0;
+    gen.mtp_kept = 0;
+    gen.spec_cost_solo = true;
+    gen.mtpExactContext(0);
+    try testing.expectEqual(@as(u32, 1), gen.mtpExactDepth(2));
+    gen.mtpExactObserve(1, 1, .pipelined); // No preceding cycle: no fabricated local price.
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[1]);
+    now_ns += 146 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .pipelined);
+    xfm.mtp_depth_rounds = Generator.MTP_EXACT_PROBE - 1;
+    try testing.expectEqual(@as(u32, 2), gen.mtpExactDepth(2));
+    now_ns += 191 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 243), xfm.mtp_depth_ms[2], 0.0001);
+    // A one-round challenge contains a width transition, not a fresh full-cycle price.
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+    try testing.expectApproxEqAbs(@as(f32, 243), gen.mtpExactPrice(2), 0.0001);
+    // Ordinary cycles continue updating the request estimate; no extra probes.
+    now_ns += 181 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 181), gen.mtpExactPrice(2), 0.0001);
+    try testing.expectEqual(@as(u32, 2), gen.mtpExactDepth(2));
+    try testing.expectEqual(@as(u32, 1), gen.mtpExactDepth(1));
+    gen.spec_cost_solo = false;
+    now_ns += 400 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 181), gen.mtpExactPrice(2), 0.0001);
+    gen.spec_cost_solo = true;
+    var longer_prompt: [2047]u32 = @splat(0);
+    gen.prompt_ids_owned = &longer_prompt;
+    // Future-class planning uses shared prices, not old-class local evidence.
+    try testing.expectEqual(xfm.mtp_depth_ms[2], gen.mtpExactPrice(2));
+    gen.mtpExactContext(2048);
+    try testing.expect(gen.mtp_cycle_watch == null);
+    now_ns += 1000 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+    now_ns += 190 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 190), gen.mtpExactPrice(2), 0.0001);
+}
+
+test "lookup native cycle shape excludes missing, replaced and discarded preparation" {
+    var gen: Generator = undefined;
+    var current: Generator.MtpPreDraft = undefined;
+    current.lookup = false;
+    current.m = 2;
+    current.lookup_prepared_before_round = true;
+    var successor: Generator.MtpPreDraft = undefined;
+    successor.lookup = false;
+    successor.m = 2;
+    successor.n_drafted = 2;
+    successor.plan = .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 };
+    gen.mtp_pre_draft = successor;
+    try testing.expectEqual(.pipelined, gen.mtpExactCycleShape(&current, false));
+    try testing.expectEqual(.pipelined, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft.?.m = 1;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.n_drafted = 1;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.lookup = true;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.plan.m_hi = 3;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = null;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    current.lookup_prepared_before_round = false;
+    try testing.expectEqual(.cold, gen.mtpExactCycleShape(&current, false));
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft = successor;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+}
+
+test "lookup mixed successor costs never seed a request-local depth price" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    for ([_]u32{ 10, 70 }) |successor_ms| {
+        var now_ns: i96 = 0;
+        var vtable: std.Io.VTable = undefined;
+        vtable.now = Clock.now;
+        const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+        var xfm: Transformer = undefined;
+        xfm.mtp_depth_ms = @splat(200);
+        xfm.mtp_depth_acc = 0.9;
+        var gen: Generator = undefined;
+        gen.xfm = &xfm;
+        gen.timer = io_util.Stopwatch.init(io);
+        gen.mtp_cycle_watch = null;
+        gen.mtp_request_depth_ms = @splat(0);
+        gen.mtp_tried = 0;
+        gen.mtp_kept = 0;
+        gen.spec_cost_solo = true;
+        var current: Generator.MtpPreDraft = undefined;
+        current.lookup = false;
+        current.m = 1;
+        current.lookup_prepared_before_round = true;
+        var successor: Generator.MtpPreDraft = undefined;
+        successor.lookup = false;
+        successor.m = 1;
+        successor.n_drafted = 1;
+        successor.plan = .{ .m_lo = 1, .m_hi = 1, .tau_ln = 0 };
+        gen.mtp_pre_draft = successor;
+        gen.mtpExactObserve(1, 1, gen.mtpExactCycleShape(&current, false));
+        // The current chain was built before the preceding boundary. Only
+        // outgoing width-two preparation varies within this width-one interval.
+        gen.mtp_pre_draft.?.m = 2;
+        gen.mtp_pre_draft.?.n_drafted = 2;
+        gen.mtp_pre_draft.?.plan = .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 };
+        now_ns += @as(i96, 100 + successor_ms) * std.time.ns_per_ms;
+        gen.mtpExactObserve(1, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[1]);
+        try testing.expectEqual(@as(u32, 2), gen.mtp_tried);
+        try testing.expectEqual(@as(u32, 2), gen.mtp_kept);
+        current.m = 2;
+        now_ns += 180 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 2, gen.mtpExactCycleShape(&current, true));
+        try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+        now_ns += 160 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 2, gen.mtpExactCycleShape(&current, true));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        // A discarded lazy successor must not masquerade as a cold full cycle.
+        current.lookup_prepared_before_round = false;
+        gen.mtp_pre_draft = null;
+        now_ns += 170 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, true));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        now_ns += 150 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        now_ns += 140 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectApproxEqAbs(@as(f32, 156), gen.mtp_request_depth_ms[2], 0.0001);
+        try testing.expectEqual(@as(u32, 7), gen.mtp_tried);
+    }
 }

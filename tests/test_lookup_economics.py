@@ -15,7 +15,7 @@ import bench_lookup_economics as economics
 
 def observation(action, phase="heldout", repetition=0):
     width = int(action.split(":")[1]) if action.startswith("fixed:") else (2 if action in ("adaptive", "cut") else 3)
-    receipt = {"version": 1, "family": "dflash", "kind": "tree", "class": 0,
+    receipt = {"version": 1, "family": "dflash", "kind": "tree", "variant": "generic", "class": 0,
                "context_bucket": economics.CONTEXT_BUCKET,
                "anchor_pos": 10, "prefix_hash": "prefix", "candidate_hash": "offer",
                "candidate_probability_hash": "scores", "candidate_rows": 3, "legal_rows": 3,
@@ -191,6 +191,18 @@ class ReceiptBoundaryTests(unittest.TestCase):
         for action in ("fixed:1", "fixed:2", "fixed:3", "adaptive", "cut", "max"):
             self.assertEqual(economics.receipt_errors(observation(action)["round"], action), [])
 
+    def test_executed_variant_is_required_not_inferred_from_width(self):
+        receipt = observation("max")["round"]
+        receipt.update(rows=16, candidate_rows=16, legal_rows=16)
+        receipt.pop("variant")
+        self.assertIn("missing_variant", economics.receipt_errors(receipt, "max"))
+        for value in ("", "auto", "generic/linear_gdn", ["generic", "linear_gdn"], 1):
+            receipt["variant"] = value
+            self.assertIn("unsupported_executed_variant", economics.receipt_errors(receipt, "max"))
+        for variant in economics.VERIFY_VARIANTS:
+            receipt["variant"] = variant
+            self.assertEqual(economics.receipt_errors(receipt, "max"), [])
+
     def test_cap_is_not_an_exact_measurement(self):
         receipt = observation("fixed:3")["round"]
         receipt.update(rows=2, accepted=1, committed=2)
@@ -206,6 +218,17 @@ class ReceiptBoundaryTests(unittest.TestCase):
         receipt["verify_commit_ms"] = None
         self.assertIn("missing_verify_commit_ms", economics.receipt_errors(receipt, "fixed:1"))
         self.assertEqual(economics.receipt_errors(None, "adaptive"), ["missing_round_receipt"])
+
+    def test_unsettled_native_entry_never_becomes_a_price_observation(self):
+        receipt = observation("adaptive")["round"]
+        receipt.update(family="pld", kind="chain", rows=1, accepted=0, committed=1,
+                       timing_scope="native_entry_unsettled", verify_commit_ms=None, priced=False)
+        self.assertIn("unsettled_native_entry_noncomparable",
+                      economics.receipt_errors(receipt, "adaptive"))
+        # A populated number does not make an asynchronous interval settled.
+        receipt.update(verify_commit_ms=1.0, round_ms=2.0, priced=True)
+        self.assertIn("unsettled_native_entry_noncomparable",
+                      economics.receipt_errors(receipt, "adaptive"))
 
     def test_invalid_numbers_and_contention(self):
         for value in (float("nan"), float("inf"), -1, True, "4"):
@@ -264,6 +287,23 @@ class ControlledComparisonTests(unittest.TestCase):
             result = economics.compare_block(rows, [1, 2, 3], {})
             self.assertFalse(result["comparable"], key)
             self.assertNotIn("adaptive_regret_ms_per_token", result)
+
+    def test_width_dependent_variants_are_allowed_but_selected_kernel_must_match(self):
+        rows = block()
+        # Recorded execution is authoritative, not a width-based guess.
+        for row in rows:
+            if row["round"]["rows"] == 3:
+                row["round"]["variant"] = "linear_gdn"
+        result = economics.compare_block(rows, [1, 2, 3], {})
+        self.assertTrue(result["comparable"])
+        self.assertEqual(result["executed_variants"]["max"], "linear_gdn")
+        for action in ("adaptive", "cut", "max"):
+            changed = copy.deepcopy(rows)
+            receipt = next(row["round"] for row in changed if row["action"] == action)
+            receipt["variant"] = "generic" if receipt["variant"] == "linear_gdn" else "linear_gdn"
+            result = economics.compare_block(changed, [1, 2, 3], {})
+            self.assertFalse(result["comparable"])
+            self.assertIn("different_executed_variant_for_selected_width:" + action, result["errors"])
 
     def test_missing_or_duplicate_alternatives_never_shrink_oracle(self):
         self.assertFalse(economics.compare_block(block()[:-1], [1, 2, 3], {})["comparable"])
@@ -333,8 +373,9 @@ class ControlledComparisonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = economics.price_files(Path(directory), curves)
             table = json.loads(paths["dflash-local"].read_text())
-            self.assertEqual(table["0"]["plain"], {"1": 4.0})
-            self.assertEqual(table["0"]["tree"]["2"], 5.0)
+            self.assertEqual(table["schema"], 3)
+            self.assertEqual(table["0"]["plain"], {"generic": {"1": 4.0}})
+            self.assertEqual(table["0"]["tree"]["generic"]["2"], 5.0)
             paid_only = {key: cell for key, cell in curves.items()
                          if json.loads(key)[-1] != "no-assistant"}
             paths = economics.price_files(Path(directory), paid_only)
@@ -354,6 +395,57 @@ class ControlledComparisonTests(unittest.TestCase):
                 economics.price_files(Path(directory), mixed)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_variant_prices_never_pool_or_backfill_at_identical_width(self):
+        generic = block("train", 0)
+        linear = block("train", 1)
+        for row in linear:
+            if row["round"]["rows"] == 3:
+                row["round"].update(variant="linear_gdn", verify_commit_ms=18.0, round_ms=19.0)
+        curves = economics.fit_curves(generic + linear, WIDTHS)
+        self.assertEqual(curves[economics.curve_key(generic[2])]["verify_ms"], 9.0)
+        self.assertEqual(curves[economics.curve_key(linear[2])]["verify_ms"], 18.0)
+        self.assertEqual(curves[economics.curve_key(linear[2])]["n"], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = economics.price_files(Path(directory), curves)
+            table = json.loads(paths["dflash-local"].read_text())
+            self.assertEqual(table["0"]["tree"]["generic"]["3"], 9.0)
+            self.assertEqual(table["0"]["tree"]["linear_gdn"], {"3": 18.0})
+            self.assertEqual(table["0"]["plain"], {"generic": {"1": 4.0}})
+        heldout = copy.deepcopy(linear)
+        for row in heldout:
+            row["phase"] = "heldout"
+        summary = economics.summarize(heldout, WIDTHS, economics.fit_curves(generic, WIDTHS))
+        self.assertFalse(summary["frozen_prediction_evidence_valid"])
+        self.assertFalse(summary["same_state_counterfactual_valid"])
+        missing = [row for row in summary["heldout_predictions"] if row["variant"] == "linear_gdn"]
+        self.assertEqual(len(missing), 2)
+        self.assertTrue(all(row["training_n"] == 0 for row in missing))
+
+    def test_old_missing_ambiguous_or_conflicting_variant_evidence_is_rejected(self):
+        historical = block("train")
+        for row in historical:
+            row["round"].pop("variant")
+        self.assertEqual(economics.fit_curves(historical, WIDTHS), {})
+        current = economics.fit_curves(block("train"), WIDTHS)
+        key, cell = next(iter(current.items()))
+        legacy_key = json.loads(key)
+        del legacy_key[3]
+        invalid = [
+            {json.dumps(legacy_key): cell},
+            {key: {k: v for k, v in cell.items() if k != "variant"}},
+            {key: {**cell, "variant": "linear_gdn"}},
+        ]
+        for variant in (None, "auto", ["generic", "linear_gdn"]):
+            parts = json.loads(key)
+            parts[3] = variant
+            invalid.append({json.dumps(parts): {**cell, "variant": variant}})
+        with tempfile.TemporaryDirectory() as directory:
+            for curves in invalid:
+                with self.subTest(curves=curves):
+                    with self.assertRaises(economics.runner.BenchError):
+                        economics.price_files(Path(directory), {**current, **curves})
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_training_is_disjoint_and_complete(self):
         training = block("train")
         heldout = block("heldout")
@@ -366,10 +458,10 @@ class ControlledComparisonTests(unittest.TestCase):
         invalid[1]["round"]["candidate_hash"] = "different"
         self.assertEqual(economics.fit_curves(invalid, WIDTHS), {})
 
-    def test_no_cross_family_kind_or_context_price_fallback(self):
+    def test_no_cross_family_kind_variant_or_context_price_fallback(self):
         training = block("train")
         curves = economics.fit_curves(training, WIDTHS)
-        for field, value in (("kind", "chain"), ("class", 4096)):
+        for field, value in (("kind", "chain"), ("class", 4096), ("variant", "linear_gdn")):
             changed = observation("fixed:1")
             changed["round"][field] = value
             self.assertNotIn(economics.curve_key(changed), curves)
@@ -388,6 +480,9 @@ class ControlledComparisonTests(unittest.TestCase):
         self.assertEqual(summary["prediction_errors"]["verify_ms"]["n"], 6)
         self.assertEqual(summary["prediction_errors"]["host_verify_ms"]["n"], 0)
         self.assertFalse(summary["canonical_speedup_claim"])
+        self.assertFalse(summary["same_state_counterfactual_valid"])
+        self.assertTrue(all(prediction["variant"] == "generic"
+                            for prediction in summary["heldout_predictions"]))
 
     def test_contended_evidence_stays_diagnostic_not_hardware_calibration(self):
         train = stable_block("train", isolation="contended")

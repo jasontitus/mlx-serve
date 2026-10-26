@@ -194,7 +194,10 @@ fn transition(scenario: Scenario) !void {
     var cut = stair.Policy.init(stair.PriceModel.init(a));
     defer cut.deinit();
     // Equal measured costs isolate verifier/commit behavior from width economics.
-    for (1..17) |rows| cut.prices.observe(@intCast(rows), 1, .tree, 0);
+    for (1..17) |rows| {
+        cut.prices.observe(@intCast(rows), 1, .tree, 0, .generic);
+        cut.prices.observe(@intCast(rows), 1, .tree, 0, .linear_gdn);
+    }
     cut.observePlain(1, 0);
     tree.lookup_tiers = .{ .drafter = lookup.Drafter.init(a), .cut = &cut };
     try tree.lookup_tiers.?.drafter.prime(&prompt);

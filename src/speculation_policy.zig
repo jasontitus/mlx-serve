@@ -8,6 +8,16 @@ pub const MAX_TREE_ROWS = 32;
 pub const Kind = enum { chain, tree, plain, spec };
 pub const NodeSource = enum { draft, look, both };
 pub const Variant = enum { generic, linear_gdn };
+/// Capability of the tree verifier, not an inference from token-chain geometry.
+pub const TreeDispatch = enum {
+    generic,
+    linear_gdn,
+
+    pub fn variant(self: TreeDispatch, rows: usize, linear: bool) Variant {
+        return if (self == .linear_gdn and rows > 8 and linear) .linear_gdn else .generic;
+    }
+};
+pub const Shape = struct { rows: u32, variant: Variant };
 
 fn probability(p: f32) f32 {
     return if (std.math.isFinite(p)) std.math.clamp(p, 0, 1) else 0;
@@ -50,6 +60,17 @@ pub const Tree = struct {
         tree.confidence[0] = 1;
         tree.len = 1;
         return tree;
+    }
+
+    pub fn variant(self: *const Tree, dispatch: TreeDispatch) Variant {
+        var linear = true;
+        for (1..self.len) |row| {
+            if (self.parents[row] != @as(i32, @intCast(row - 1))) {
+                linear = false;
+                break;
+            }
+        }
+        return dispatch.variant(self.len, linear);
     }
 
     /// Normalize siblings while retaining each descendant's previous conditional reach.
@@ -160,8 +181,7 @@ const Settled = struct {
     }
 };
 
-const PriceKey = struct { class: i64, rows: u32, kind: Kind };
-const ColdKey = struct { price: PriceKey, variant: Variant };
+const PriceKey = struct { class: i64, rows: u32, kind: Kind, variant: Variant };
 const ColdState = enum { seen, retry_reserved };
 const TrialKey = struct { class: i64, kind: Kind };
 const WidthTrial = struct { rows: u32, variant: Variant, retry_reserved: bool = false };
@@ -170,7 +190,7 @@ pub const PriceModel = struct {
     allocator: Allocator,
     priors: std.AutoHashMap(PriceKey, f32),
     settled: std.AutoHashMap(PriceKey, Settled),
-    warmed: std.AutoHashMap(ColdKey, ColdState),
+    warmed: std.AutoHashMap(PriceKey, ColdState),
     width_trials: std.AutoHashMap(TrialKey, WidthTrial),
     step_ms: ?f32 = null,
 
@@ -179,7 +199,7 @@ pub const PriceModel = struct {
             .allocator = allocator,
             .priors = std.AutoHashMap(PriceKey, f32).init(allocator),
             .settled = std.AutoHashMap(PriceKey, Settled).init(allocator),
-            .warmed = std.AutoHashMap(ColdKey, ColdState).init(allocator),
+            .warmed = std.AutoHashMap(PriceKey, ColdState).init(allocator),
             .width_trials = std.AutoHashMap(TrialKey, WidthTrial).init(allocator),
         };
     }
@@ -221,7 +241,7 @@ pub const PriceModel = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return result;
         const schema = parsed.value.object.get("schema") orelse return result;
-        if (schema != .integer or schema.integer != 2) return result;
+        if (schema != .integer or schema.integer != 3) return result;
         const buckets = parsed.value.object.get("context_bucket") orelse return result;
         if (buckets != .string or !std.mem.eql(u8, buckets.string, "floor-power-of-two-2048")) return result;
         if (parsed.value.object.get("step_ms")) |value| result.step_ms = number(value);
@@ -233,95 +253,103 @@ pub const PriceModel = struct {
             while (kinds.next()) |kind_entry| {
                 const kind = std.meta.stringToEnum(Kind, kind_entry.key_ptr.*) orelse continue;
                 if (kind_entry.value_ptr.* != .object) continue;
-                var widths = kind_entry.value_ptr.object.iterator();
-                while (widths.next()) |width_entry| {
-                    const rows = std.fmt.parseInt(u32, width_entry.key_ptr.*, 10) catch continue;
-                    if (rows == 0) continue;
-                    const ms = number(width_entry.value_ptr.*) orelse continue;
-                    result.priors.put(.{ .class = class, .rows = rows, .kind = kind }, ms) catch {};
+                var variants = kind_entry.value_ptr.object.iterator();
+                while (variants.next()) |variant_entry| {
+                    const variant = std.meta.stringToEnum(Variant, variant_entry.key_ptr.*) orelse continue;
+                    if (variant_entry.value_ptr.* != .object) continue;
+                    var widths = variant_entry.value_ptr.object.iterator();
+                    while (widths.next()) |width_entry| {
+                        const rows = std.fmt.parseInt(u32, width_entry.key_ptr.*, 10) catch continue;
+                        if (rows == 0) continue;
+                        const ms = number(width_entry.value_ptr.*) orelse continue;
+                        result.priors.put(.{ .class = class, .rows = rows, .kind = kind, .variant = variant }, ms) catch {};
+                    }
                 }
             }
         }
         return result;
     }
 
-    pub fn prior(self: *const PriceModel, rows: u32, kind: Kind, class: i64) ?f32 {
-        return self.priors.get(.{ .class = class, .rows = rows, .kind = kind });
+    pub fn prior(self: *const PriceModel, rows: u32, kind: Kind, class: i64, variant: Variant) ?f32 {
+        return self.priors.get(.{ .class = class, .rows = rows, .kind = kind, .variant = variant });
     }
     /// Exact evidence only: unlike price(), this never invents a timing estimate.
-    pub fn known(self: *const PriceModel, rows: u32, kind: Kind, class: i64) ?f32 {
-        if (self.settled.get(.{ .class = class, .rows = rows, .kind = kind })) |sample| {
+    pub fn known(self: *const PriceModel, rows: u32, kind: Kind, class: i64, variant: Variant) ?f32 {
+        if (self.settled.get(.{ .class = class, .rows = rows, .kind = kind, .variant = variant })) |sample| {
             if (sample.estimate()) |ms| return ms;
         }
-        return self.prior(rows, kind, class);
+        return self.prior(rows, kind, class, variant);
     }
-    pub fn price(self: *const PriceModel, rows: u32, kind: Kind, class: i64) f32 {
+    pub fn price(self: *const PriceModel, rows: u32, kind: Kind, class: i64, variant: Variant) f32 {
         const width = @max(rows, 1);
-        const key: PriceKey = .{ .class = class, .rows = width, .kind = kind };
+        const key: PriceKey = .{ .class = class, .rows = width, .kind = kind, .variant = variant };
         if (self.settled.get(key)) |sample| if (sample.estimate()) |ms| return ms;
-        if (self.prior(width, kind, class)) |ms| return ms;
-        // Within-kind/context extrapolation never assumes a wider action is cheaper.
+        if (self.prior(width, kind, class, variant)) |ms| return ms;
+        // Within-kind/context/variant extrapolation never assumes a wider action is cheaper.
         // Unknown widths carry a factor-two uncertainty penalty; this is not a timing prior.
         var nearest_distance: u32 = std.math.maxInt(u32);
         var nearest: ?f32 = null;
-        // Probe only executable widths in this exact context/kind. Prediction work is
+        // Probe only executable widths in this exact context/kind/variant. Prediction work is
         // bounded independently of the number of historical contexts in the maps.
         for (1..MAX_TREE_ROWS + 1) |candidate_width| {
             const old_width: u32 = @intCast(candidate_width);
             const distance = if (width > old_width) width - old_width else old_width - width;
             if (distance >= nearest_distance) continue;
-            const ms = self.known(old_width, kind, class) orelse continue;
+            const ms = self.known(old_width, kind, class, variant) orelse continue;
             nearest_distance = distance;
             nearest = ms * @max(1, @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(old_width)));
         }
         return cost((nearest orelse ((self.step_ms orelse 1) * @as(f32, @floatFromInt(width)))) * 2);
     }
-    pub fn observe(self: *PriceModel, rows: u32, ms: f32, kind: Kind, class: i64) void {
+    pub fn observe(self: *PriceModel, rows: u32, ms: f32, kind: Kind, class: i64, variant: Variant) void {
         if (rows == 0 or !positive(ms)) return;
-        const entry = self.settled.getOrPut(.{ .class = class, .rows = rows, .kind = kind }) catch return;
+        const entry = self.settled.getOrPut(.{ .class = class, .rows = rows, .kind = kind, .variant = variant }) catch return;
         if (!entry.found_existing) entry.value_ptr.* = .{};
         entry.value_ptr.observe(ms);
     }
     pub fn observeKernel(self: *PriceModel, rows: u32, ms: f32, kind: Kind, class: i64, variant: Variant) bool {
         if (rows == 0 or !positive(ms)) return false;
-        const key: ColdKey = .{ .price = .{ .class = class, .rows = rows, .kind = kind }, .variant = variant };
+        const key: PriceKey = .{ .class = class, .rows = rows, .kind = kind, .variant = variant };
         const entry = self.warmed.getOrPut(key) catch return false;
         if (!entry.found_existing) {
             entry.value_ptr.* = .seen;
             return false;
         }
-        self.observe(rows, ms, kind, class);
-        return self.settled.contains(key.price);
+        self.observe(rows, ms, kind, class, variant);
+        return self.settled.contains(key);
     }
 
 
     /// One wider real shape per context/kind, with at most one matching cold retry.
-    /// The caller must compare calibrated yields and check execution eligibility.
-    pub fn upperTrialWidth(self: *const PriceModel, native_rows: u32, maximum: u32, kind: Kind, class: i64) ?u32 {
-        if (self.known(native_rows, kind, class) == null) return null;
+    /// Both shapes must be classified from actual executable selected parents.
+    /// A retry proposal retains its original variant; reserveUpperTrial checks the
+    /// current offer's geometry before consuming the remaining attempt.
+    pub fn upperTrialWidth(self: *const PriceModel, native: Shape, maximum: Shape, kind: Kind, class: i64) ?u32 {
+        if (self.known(native.rows, kind, class, native.variant) == null) return null;
         if (self.width_trials.get(.{ .class = class, .kind = kind })) |trial| {
-            if (trial.retry_reserved or trial.rows > maximum or self.known(trial.rows, kind, class) != null) return null;
+            if (trial.retry_reserved or trial.rows <= native.rows or trial.rows > maximum.rows or self.known(trial.rows, kind, class, trial.variant) != null) return null;
             return trial.rows;
         }
-        const width = @min(MAX_TREE_ROWS, maximum);
-        return if (width > native_rows and self.known(width, kind, class) == null) width else null;
+        if (maximum.rows > MAX_TREE_ROWS) return null;
+        return if (maximum.rows > native.rows and self.known(maximum.rows, kind, class, maximum.variant) == null) maximum.rows else null;
     }
 
-    pub fn reserveUpperTrial(self: *PriceModel, native_rows: u32, rows: u32, kind: Kind, class: i64, variant: Variant) bool {
-        if (rows <= native_rows or rows > MAX_TREE_ROWS or self.known(native_rows, kind, class) == null or self.known(rows, kind, class) != null) return false;
+    pub fn reserveUpperTrial(self: *PriceModel, native: Shape, shape: Shape, kind: Kind, class: i64) bool {
+        if (shape.rows <= native.rows or shape.rows > MAX_TREE_ROWS or self.known(native.rows, kind, class, native.variant) == null or self.known(shape.rows, kind, class, shape.variant) != null) return false;
         const key: TrialKey = .{ .class = class, .kind = kind };
+        const price_key: PriceKey = .{ .class = class, .rows = shape.rows, .kind = kind, .variant = shape.variant };
         if (self.width_trials.getPtr(key)) |trial| {
-            if (trial.rows != rows or trial.variant != variant or trial.retry_reserved) return false;
-            const cold = self.warmed.getPtr(.{ .price = .{ .class = class, .rows = rows, .kind = kind }, .variant = variant }) orelse return false;
+            if (trial.rows != shape.rows or trial.variant != shape.variant or trial.retry_reserved) return false;
+            const cold = self.warmed.getPtr(price_key) orelse return false;
             if (cold.* != .seen) return false;
             trial.retry_reserved = true;
             cold.* = .retry_reserved;
             return true;
         }
-        const cold = self.warmed.getPtr(.{ .price = .{ .class = class, .rows = rows, .kind = kind }, .variant = variant });
+        const cold = self.warmed.getPtr(price_key);
         if (cold) |state| if (state.* == .retry_reserved) return false;
         // If this shape already ran cold naturally, reserve only its remaining retry.
-        self.width_trials.put(key, .{ .rows = rows, .variant = variant, .retry_reserved = cold != null }) catch return false;
+        self.width_trials.put(key, .{ .rows = shape.rows, .variant = shape.variant, .retry_reserved = cold != null }) catch return false;
         if (cold) |state| state.* = .retry_reserved;
         return true;
     }
@@ -414,7 +442,7 @@ pub const LookFallback = union(enum) {
     measured: RemainingRound,
 };
 pub const TreeEvaluation = struct {
-    pub const Entry = struct { rows: u32, verify_ms: f32, expected_tokens: f32, tokens_per_ms: f32 };
+    pub const Entry = struct { rows: u32, variant: Variant, verify_ms: f32, expected_tokens: f32, tokens_per_ms: f32 };
     entries: [MAX_TREE_ROWS]Entry = undefined,
     len: usize = 0,
 };
@@ -483,7 +511,7 @@ pub const Policy = struct {
     /// cloning the containers does not change identity. Keys are unique in each map.
     pub fn diagnosticFingerprint(self: *const Policy) [32]u8 {
         var all: Fingerprint = .{};
-        all.hash.update("mlx-serve-independent-policy-state-2");
+        all.hash.update("mlx-serve-independent-policy-state-3");
         all.word(@intFromBool(self.prices.step_ms != null));
         if (self.prices.step_ms) |step| all.float(step);
         for (self.cal.neural) |bin| {
@@ -522,8 +550,7 @@ pub const Policy = struct {
         var warmed = self.prices.warmed.iterator();
         while (warmed.next()) |entry| {
             var one: Fingerprint = .{};
-            one.priceKey(entry.key_ptr.price);
-            one.word(@intFromEnum(entry.key_ptr.variant));
+            one.priceKey(entry.key_ptr.*);
             one.word(@intFromEnum(entry.value_ptr.*));
             const digest = one.finish();
             for (&fold, digest) |*byte, value| byte.* ^= value;
@@ -569,8 +596,8 @@ pub const Policy = struct {
         all.hash.update(&fold);
         return all.finish();
     }
-    pub fn predictVerify(self: *const Policy, rows: u32, kind: Kind, class: i64) f32 {
-        return self.prices.price(rows, kind, class);
+    pub fn predictVerify(self: *const Policy, rows: u32, kind: Kind, class: i64, variant: Variant) f32 {
+        return self.prices.price(rows, kind, class, variant);
     }
 
     fn lookKind(tree: *const Tree, row: usize) Calibration.Kind {
@@ -632,29 +659,34 @@ pub const Policy = struct {
         return result;
     }
 
-    pub fn chooseTree(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32) Tree {
-        return self.chooseTreeControlled(candidate, class, preparation_ms, max_rows, 0, null);
+    pub fn chooseTree(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, dispatch: TreeDispatch) Tree {
+        return self.chooseTreeControlled(candidate, class, preparation_ms, max_rows, 0, null, dispatch);
     }
-    pub fn chooseTreeControlled(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, evaluation: ?*TreeEvaluation) Tree {
-        return self.selectTree(candidate, class, preparation_ms, max_rows, requested, evaluation, .tree);
+    pub fn chooseTreeControlled(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, evaluation: ?*TreeEvaluation, dispatch: TreeDispatch) Tree {
+        return self.selectTree(candidate, class, preparation_ms, max_rows, requested, evaluation, .tree, dispatch);
     }
 
     /// The caller identifies its executable native action; no native width or hardware
     /// latency is guessed here. Bootstrap is a real action, not a root-only calibration probe.
-    pub fn chooseTreeBootstrapControlled(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, native_rows: u32, evaluation: ?*TreeEvaluation) Tree {
-        const native = @min(@max(1, native_rows), @min(@max(1, max_rows), @max(1, @min(MAX_TREE_ROWS, candidate.len))));
-        const effective: u32 = if (requested == 0 and self.prices.known(@intCast(native), .tree, class) == null) @intCast(native) else requested;
-        return self.chooseTreeControlled(candidate, class, preparation_ms, max_rows, effective, evaluation);
+    pub fn chooseTreeBootstrapControlled(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, native_rows: u32, evaluation: ?*TreeEvaluation, dispatch: TreeDispatch) Tree {
+        if (requested == 0) {
+            const native = self.chooseTreeControlled(candidate, class, preparation_ms, max_rows, @max(1, native_rows), evaluation, dispatch);
+            if (self.prices.known(@intCast(native.len), .tree, class, native.variant(dispatch)) == null) {
+                return native;
+            }
+        }
+        return self.chooseTreeControlled(candidate, class, preparation_ms, max_rows, requested, evaluation, dispatch);
     }
 
-    fn selectTree(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, evaluation: ?*TreeEvaluation, kind: Kind) Tree {
+    fn selectTree(self: *const Policy, candidate: *const Tree, class: i64, preparation_ms: f32, max_rows: u32, requested: u32, evaluation: ?*TreeEvaluation, kind: Kind, dispatch: TreeDispatch) Tree {
         const tree = self.calibrated(candidate);
         const cap = @min(tree.len, @min(MAX_TREE_ROWS, @max(1, max_rows)));
         const wanted = @min(cap, @max(1, requested));
         if (evaluation) |log| log.len = 0;
         // A child's marginal reach never exceeds its parent's. Stable descending order
         // therefore has ancestor-closed prefixes, including ties. Each prefix maximizes
-        // summed reach among equal-width subsets; verification cost depends only on width.
+        // summed reach among equal-width subsets. Price each prefix's actual kernel;
+        // this search does not optimize over every possible topology at that width.
         var order: [MAX_TREE_ROWS]usize = undefined;
         for (0..tree.len) |i| {
             var at = i;
@@ -667,15 +699,20 @@ pub const Policy = struct {
         var prefix: u32 = 0;
         var reward: f32 = 0;
         var best_value: f32 = -1;
+        var linear = true;
         for (1..cap + 1) |width| {
             const row = order[width - 1];
             prefix |= @as(u32, 1) << @as(u5, @intCast(row));
             reward += tree.scores[row];
+            // In an ancestor-closed linear prefix, the next node must extend its
+            // sole leaf. Once a sibling enters, every wider prefix remains branched.
+            if (width > 1 and tree.parents[row] != @as(i32, @intCast(order[width - 2]))) linear = false;
             if (requested > 0 and width != wanted) continue;
-            const verify_ms = self.predictVerify(@intCast(width), kind, class);
+            const variant = dispatch.variant(width, linear);
+            const verify_ms = self.predictVerify(@intCast(width), kind, class, variant);
             const value = reward / (preparation(preparation_ms) + verify_ms);
             if (evaluation) |log| {
-                log.entries[log.len] = .{ .rows = @intCast(width), .verify_ms = verify_ms, .expected_tokens = reward, .tokens_per_ms = value };
+                log.entries[log.len] = .{ .rows = @intCast(width), .variant = variant, .verify_ms = verify_ms, .expected_tokens = reward, .tokens_per_ms = value };
                 log.len += 1;
             }
             if (value > best_value) {
@@ -705,6 +742,23 @@ pub const Policy = struct {
         return result;
     }
 
+    /// Standalone lookup otherwise cannot learn any wider chain from root-only
+    /// execution: conservative unknown-width prices keep selecting the root.
+    /// The caller admits only unconstrained, solo PLD rounds with a capped offer.
+    pub fn reservePlainWidthTrial(self: *Policy, candidate: *const Tree, class: i64) ?u32 {
+        if (!candidate.scores_calibrated or candidate.len < 2 or candidate.len > MAX_TREE_ROWS) return null;
+        const root: Shape = .{ .rows = 1, .variant = .generic };
+        const trial = self.prices.upperTrialWidth(root, .{ .rows = @intCast(candidate.len), .variant = .generic }, .chain, class) orelse return null;
+        var gain: f32 = 0;
+        for (candidate.scores[1..trial], 1..) |reach, row| {
+            if (!std.math.isFinite(reach) or reach < 0 or reach > 1 or
+                candidate.parents[row] != @as(i32, @intCast(row - 1))) return null;
+            gain += reach;
+        }
+        if (gain <= 0 or !self.prices.reserveUpperTrial(root, .{ .rows = trial, .variant = .generic }, .chain, class)) return null;
+        return trial;
+    }
+
     /// Bounded chain-width learning uses actual known prices and the current offer's
     /// calibrated yields, even when ordinary selection has fallen back to native.
     /// The caller enforces solo/adaptive/fresh-native execution eligibility.
@@ -714,13 +768,13 @@ pub const Policy = struct {
         const native = self.specRemainingFor(class) orelse return null;
         var reference_rows: ?u32 = null;
         for (floor..candidate.len) |rows| {
-            if (self.prices.known(@intCast(rows), .chain, class) != null) {
+            if (self.prices.known(@intCast(rows), .chain, class, .generic) != null) {
                 reference_rows = @intCast(rows);
                 break;
             }
         }
         const reference = reference_rows orelse return null;
-        const trial = self.prices.upperTrialWidth(reference, @intCast(candidate.len), .chain, class) orelse return null;
+        const trial = self.prices.upperTrialWidth(.{ .rows = reference, .variant = .generic }, .{ .rows = @intCast(candidate.len), .variant = .generic }, .chain, class) orelse return null;
         var expected: f32 = 0;
         var reference_expected: f32 = 0;
         for (candidate.scores[0..trial], 0..) |reach, row| {
@@ -730,7 +784,7 @@ pub const Policy = struct {
             if (row < reference) reference_expected += reach;
         }
         if (expected <= reference_expected or expected <= native.expected_tokens) return null;
-        if (!self.prices.reserveUpperTrial(reference, trial, .chain, class, .generic)) return null;
+        if (!self.prices.reserveUpperTrial(.{ .rows = reference, .variant = .generic }, .{ .rows = trial, .variant = .generic }, .chain, class)) return null;
         return trial;
     }
 
@@ -740,17 +794,17 @@ pub const Policy = struct {
         const paid = preparation(preparation_ms);
         const baseline: ?f32 = switch (fallback) {
             .unknown => null,
-            .plain => 1 / (paid + (self.plainFor(class) orelse self.predictVerify(1, .plain, class))),
+            .plain => 1 / (paid + (self.plainFor(class) orelse self.predictVerify(1, .plain, class, .generic))),
             .measured => |value| if (positive(value.round_ms) and positive(value.expected_tokens))
                 value.expected_tokens / (paid + cost(value.round_ms))
             else
                 null,
         };
         if (requested == 0 and baseline == null) return .{ .tokens = out.items, .rows = 0, .source = .spine, .expected = 0, .value = 0 };
-        const selected = self.selectTree(candidate, class, paid, MAX_TREE_ROWS, requested, null, .chain);
+        const selected = self.selectTree(candidate, class, paid, MAX_TREE_ROWS, requested, null, .chain, .generic);
         var expected: f32 = 0;
         for (selected.scores[1..selected.len]) |reach| expected += reach;
-        const value = (1 + expected) / (paid + self.predictVerify(@intCast(selected.len), .chain, class));
+        const value = (1 + expected) / (paid + self.predictVerify(@intCast(selected.len), .chain, class, .generic));
         if (requested == 0 and baseline != null and value <= baseline.?) return .{ .tokens = out.items, .rows = 0, .source = .spine, .expected = 0, .value = baseline.? };
         try out.appendSlice(self.prices.allocator, selected.tokens[1..selected.len]);
         return .{ .tokens = out.items, .rows = @intCast(out.items.len), .source = .look, .expected = expected, .value = value };
@@ -919,15 +973,16 @@ test "cold exclusions are variant kind width and context specific" {
     try std.testing.expect(!prices.observeKernel(3, 900, .tree, 101, .generic));
     try std.testing.expect(prices.observeKernel(3, 6, .tree, 101, .generic));
     try std.testing.expect(!prices.observeKernel(3, 800, .tree, 101, .linear_gdn));
-    try std.testing.expectEqual(@as(f32, 6), prices.price(3, .tree, 101));
+    try std.testing.expectEqual(@as(f32, 6), prices.price(3, .tree, 101, .generic));
+    try std.testing.expect(prices.known(3, .tree, 101, .linear_gdn) == null);
     try std.testing.expect(!prices.observeKernel(3, 700, .chain, 101, .generic));
     try std.testing.expect(!prices.observeKernel(4, 700, .tree, 101, .generic));
     try std.testing.expect(!prices.observeKernel(3, 700, .tree, 102, .generic));
-    prices.observe(3, 60000, .tree, 101);
-    prices.observe(3, 7, .tree, 101);
-    try std.testing.expectEqual(@as(f32, 7), prices.price(3, .tree, 101));
-    try std.testing.expect(prices.prior(3, .tree, 101) == null);
-    try std.testing.expect(positive(prices.price(0, .chain, -10)));
+    prices.observe(3, 60000, .tree, 101, .generic);
+    prices.observe(3, 7, .tree, 101, .generic);
+    try std.testing.expectEqual(@as(f32, 7), prices.price(3, .tree, 101, .generic));
+    try std.testing.expect(prices.prior(3, .tree, 101, .generic) == null);
+    try std.testing.expect(positive(prices.price(0, .chain, -10, .generic)));
     try std.testing.expectEqual(@as(usize, 1), prices.count());
 }
 
@@ -954,21 +1009,21 @@ test "calibration populations censor unreachable descendants" {
 test "root preparation participates and forced widths evaluate only their action" {
     var policy = Policy.init(PriceModel.init(std.testing.allocator));
     defer policy.deinit();
-    policy.prices.observe(1, 1, .tree, 5);
-    policy.prices.observe(2, 3, .tree, 5);
+    policy.prices.observe(1, 1, .tree, 5, .generic);
+    policy.prices.observe(2, 3, .tree, 5, .generic);
     const tree = Tree.chain(8, &.{9}, 0.9, 0.9);
     var log: TreeEvaluation = .{};
-    const free = policy.chooseTreeControlled(&tree, 5, 0, 32, 0, &log);
+    const free = policy.chooseTreeControlled(&tree, 5, 0, 32, 0, &log, .generic);
     try std.testing.expectEqual(@as(usize, 1), free.len);
-    const paid = policy.chooseTreeControlled(&tree, 5, 20, 32, 0, &log);
+    const paid = policy.chooseTreeControlled(&tree, 5, 20, 32, 0, &log, .generic);
     try std.testing.expectEqual(@as(usize, 2), paid.len);
     try std.testing.expectEqual(@as(usize, 2), log.len);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 21.0), log.entries[0].tokens_per_ms, 0.00001);
-    const forced = policy.chooseTreeControlled(&tree, 5, 20, 32, 100, &log);
+    const forced = policy.chooseTreeControlled(&tree, 5, 20, 32, 100, &log, .generic);
     try std.testing.expectEqual(@as(usize, 2), forced.len);
     try std.testing.expectEqual(@as(usize, 1), log.len);
     try std.testing.expectEqual(@as(u32, 2), log.entries[0].rows);
-    const root = policy.chooseTreeControlled(&tree, 5, 20, 0, 100, &log);
+    const root = policy.chooseTreeControlled(&tree, 5, 20, 0, 100, &log, .generic);
     try std.testing.expectEqual(@as(usize, 1), root.len);
 }
 
@@ -980,7 +1035,7 @@ test "width selection preserves ancestors and stable ties across branches" {
     _ = tree.add(0, 22, 0.65, .look, 0.65);
     _ = tree.add(2, 23, 0.65, .look, 1);
     _ = tree.add(3, 24, 0.65, .look, 1);
-    const chosen = policy.chooseTreeControlled(&tree, 0, 0, 32, 4, null);
+    const chosen = policy.chooseTreeControlled(&tree, 0, 0, 32, 4, null, .generic);
     try std.testing.expectEqualSlices(u32, &.{ 20, 22, 23, 24 }, chosen.tokens[0..chosen.len]);
     for (chosen.parents[1..chosen.len], 1..) |parent, row| try std.testing.expect(parent >= 0 and @as(usize, @intCast(parent)) < row);
     try std.testing.expectEqual(@as(f32, 1), chosen.look_confidence[3]);
@@ -1036,7 +1091,7 @@ test "round warmup isolation bounded recovery and changed assistant costs" {
 test "clone owns prices warmups routing and calibration independently" {
     var original = Policy.init(PriceModel.init(std.testing.allocator));
     defer original.deinit();
-    original.prices.observe(2, 7, .tree, 18);
+    original.prices.observe(2, 7, .tree, 18, .generic);
     _ = original.prices.observeKernel(2, 100, .tree, 18, .linear_gdn);
     _ = original.observeSpecRemainingProbe(15, 3, 18, 0);
     _ = original.routeAgainstPrepared(18, 2, 0);
@@ -1044,15 +1099,15 @@ test "clone owns prices warmups routing and calibration independently" {
     original.observeChainAccepted(&candidate, 2, 1);
     var copy = try original.clone(std.testing.allocator);
     defer copy.deinit();
-    try std.testing.expectEqual(original.prices.price(2, .tree, 18), copy.prices.price(2, .tree, 18));
+    try std.testing.expectEqual(original.prices.price(2, .tree, 18, .generic), copy.prices.price(2, .tree, 18, .generic));
     try std.testing.expectEqual(original.cal.samples(.look), copy.cal.samples(.look));
     try std.testing.expectEqual(@as(u32, 2), copy.routeAgainstPrepared(18, 2, 0).skipped);
     try std.testing.expectEqual(@as(u32, 2), original.routeAgainstPrepared(18, 2, 0).skipped);
     try std.testing.expect(copy.prices.observeKernel(2, 2, .tree, 18, .linear_gdn));
-    for (0..7) |_| copy.prices.observe(2, 2, .tree, 18);
+    for (0..7) |_| copy.prices.observe(2, 2, .tree, 18, .generic);
     copy.observeChainAccepted(&candidate, 2, 0);
-    try std.testing.expectEqual(@as(f32, 7), original.prices.price(2, .tree, 18));
-    try std.testing.expectEqual(@as(f32, 2), copy.prices.price(2, .tree, 18));
+    try std.testing.expectEqual(@as(f32, 7), original.prices.price(2, .tree, 18, .generic));
+    try std.testing.expectEqual(@as(f32, 2), copy.prices.price(2, .tree, 18, .generic));
     try std.testing.expectEqual(@as(f32, 1), original.cal.samples(.look));
     try std.testing.expectEqual(@as(f32, 2), copy.cal.samples(.look));
 }
@@ -1064,30 +1119,64 @@ test "optional prior files missing malformed and partially valid remain safe" {
     defer std.testing.allocator.free(path);
     var missing = PriceModel.load(std.testing.io, std.testing.allocator, path);
     defer missing.deinit();
-    try std.testing.expect(missing.known(4, .tree, 77) == null);
-    try std.testing.expect(positive(missing.price(4, .tree, 77)));
+    try std.testing.expect(missing.known(4, .tree, 77, .generic) == null);
+    try std.testing.expect(positive(missing.price(4, .tree, 77, .generic)));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prices.json", .data = "{not-json" });
     var malformed = PriceModel.load(std.testing.io, std.testing.allocator, path);
     defer malformed.deinit();
-    try std.testing.expect(malformed.known(4, .tree, 77) == null);
+    try std.testing.expect(malformed.known(4, .tree, 77, .generic) == null);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "prices.json",
         .data = "{\"step_ms\":2.5,\"77\":{\"tree\":{\"4\":6.25}}}",
     });
     var legacy = PriceModel.load(std.testing.io, std.testing.allocator, path);
     defer legacy.deinit();
-    try std.testing.expect(legacy.known(4, .tree, 77) == null);
+    try std.testing.expect(legacy.known(4, .tree, 77, .generic) == null);
     try std.testing.expect(legacy.step_ms == null);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "prices.json",
         .data = "{\"schema\":2,\"context_bucket\":\"floor-power-of-two-2048\",\"step_ms\":2.5,\"77\":{\"tree\":{\"4\":6.25,\"2\":-7,\"8\":\"bad\"},\"chain\":{\"4\":9.5}},\"78\":false}",
     });
+    var old_schema = PriceModel.load(std.testing.io, std.testing.allocator, path);
+    defer old_schema.deinit();
+    try std.testing.expect(old_schema.known(4, .tree, 77, .generic) == null);
+    try std.testing.expect(old_schema.known(4, .tree, 77, .linear_gdn) == null);
+    try std.testing.expect(old_schema.step_ms == null);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "prices.json",
+        .data = "{\"schema\":3,\"context_bucket\":\"floor-power-of-two-2048\",\"step_ms\":2.5,\"77\":{\"tree\":{\"generic\":{\"4\":6.25,\"2\":-7,\"8\":\"bad\"},\"linear_gdn\":{\"4\":3.25},\"unlabelled\":{\"4\":1},\"5\":1},\"chain\":{\"generic\":{\"4\":9.5}}},\"78\":false}",
+    });
     var loaded = PriceModel.load(std.testing.io, std.testing.allocator, path);
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(?f32, 6.25), loaded.known(4, .tree, 77));
-    try std.testing.expectEqual(@as(?f32, 9.5), loaded.prior(4, .chain, 77));
-    try std.testing.expect(loaded.known(2, .tree, 77) == null);
-    try std.testing.expect(loaded.known(4, .tree, 78) == null);
+    try std.testing.expectEqual(@as(?f32, 6.25), loaded.known(4, .tree, 77, .generic));
+    try std.testing.expectEqual(@as(?f32, 3.25), loaded.known(4, .tree, 77, .linear_gdn));
+    try std.testing.expectEqual(@as(?f32, 9.5), loaded.prior(4, .chain, 77, .generic));
+    try std.testing.expect(loaded.known(2, .tree, 77, .generic) == null);
+    try std.testing.expect(loaded.known(4, .tree, 78, .generic) == null);
+    try std.testing.expect(loaded.known(5, .tree, 77, .generic) == null);
+    try std.testing.expect(loaded.known(4, .chain, 77, .linear_gdn) == null);
+    // Serialize the loaded variant-labelled values and read them back as priors.
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .schema = @as(u32, 3),
+        .context_bucket = "floor-power-of-two-2048",
+        .step_ms = loaded.step_ms,
+        .@"77" = .{
+            .tree = .{
+                .generic = .{ .@"4" = loaded.prior(4, .tree, 77, .generic).? },
+                .linear_gdn = .{ .@"4" = loaded.prior(4, .tree, 77, .linear_gdn).? },
+            },
+            .chain = .{ .generic = .{ .@"4" = loaded.prior(4, .chain, 77, .generic).? } },
+        },
+    }, .{});
+    defer std.testing.allocator.free(encoded);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prices.json", .data = encoded });
+    var roundtrip = PriceModel.load(std.testing.io, std.testing.allocator, path);
+    defer roundtrip.deinit();
+    try std.testing.expectEqual(loaded.step_ms, roundtrip.step_ms);
+    for ([_]Variant{ .generic, .linear_gdn }) |variant| {
+        try std.testing.expectEqual(loaded.prior(4, .tree, 77, variant), roundtrip.prior(4, .tree, 77, variant));
+    }
+    try std.testing.expectEqual(loaded.prior(4, .chain, 77, .generic), roundtrip.prior(4, .chain, 77, .generic));
 }
 
 test "cold adaptive selection retains caller native width until its cost is known" {
@@ -1095,17 +1184,17 @@ test "cold adaptive selection retains caller native width until its cost is know
     defer policy.deinit();
     const tree = Tree.chain(30, &.{ 31, 32, 33, 34, 35, 36 }, 0.9, 0.9);
     var log: TreeEvaluation = .{};
-    const cold = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, &log);
+    const cold = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, &log, .generic);
     try std.testing.expectEqual(@as(usize, 5), cold.len);
     try std.testing.expectEqual(@as(usize, 1), log.len);
-    try std.testing.expect(policy.prices.known(5, .tree, 81) == null);
+    try std.testing.expect(policy.prices.known(5, .tree, 81, .generic) == null);
     _ = policy.prices.observeKernel(5, 400, .tree, 81, .generic);
-    const still_cold = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, null);
+    const still_cold = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, null, .generic);
     try std.testing.expectEqual(@as(usize, 5), still_cold.len);
     _ = policy.prices.observeKernel(5, 10, .tree, 81, .generic);
-    _ = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, &log);
+    _ = policy.chooseTreeBootstrapControlled(&tree, 81, 0, 16, 0, 5, &log, .generic);
     try std.testing.expectEqual(tree.len, log.len);
-    const forced = policy.chooseTreeBootstrapControlled(&tree, 82, 0, 16, 2, 5, null);
+    const forced = policy.chooseTreeBootstrapControlled(&tree, 82, 0, 16, 2, 5, null, .generic);
     try std.testing.expectEqual(@as(usize, 2), forced.len);
 }
 
@@ -1124,6 +1213,7 @@ const Fingerprint = struct {
         self.word(@bitCast(key.class));
         self.word(key.rows);
         self.word(@intFromEnum(key.kind));
+        self.word(@intFromEnum(key.variant));
     }
     fn window(self: *Fingerprint, sample: Settled) void {
         self.word(sample.len);
@@ -1142,10 +1232,10 @@ test "diagnostic identity includes cold markers and is independent of insertion 
     defer left.deinit();
     var right = Policy.init(PriceModel.init(std.testing.allocator));
     defer right.deinit();
-    left.prices.observe(2, 8, .tree, 65);
-    left.prices.observe(4, 11, .chain, 66);
-    right.prices.observe(4, 11, .chain, 66);
-    right.prices.observe(2, 8, .tree, 65);
+    left.prices.observe(2, 8, .tree, 65, .generic);
+    left.prices.observe(4, 11, .chain, 66, .generic);
+    right.prices.observe(4, 11, .chain, 66, .generic);
+    right.prices.observe(2, 8, .tree, 65, .generic);
     try std.testing.expectEqual(left.diagnosticFingerprint(), right.diagnosticFingerprint());
     var copy = try left.clone(std.testing.allocator);
     defer copy.deinit();
@@ -1161,7 +1251,7 @@ test "already projected pruning retains excluded sibling mass and raw evidence" 
     _ = tree.add(0, 301, 0.2, .look, 0.8);
     _ = tree.add(1, 302, 0.1, .look, 0.7);
     tree.scores_calibrated = true;
-    const selected = policy.chooseTreeControlled(&tree, 0, 0, 32, 3, null);
+    const selected = policy.chooseTreeControlled(&tree, 0, 0, 32, 3, null, .generic);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), selected.scores[1], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), selected.scores[2], 0.00001);
     try std.testing.expectEqual(@as(f32, 0.8), selected.look_confidence[1]);
@@ -1172,8 +1262,8 @@ test "already projected pruning retains excluded sibling mass and raw evidence" 
 test "paid preparation is amortized over the native round yield" {
     var controller = Policy.init(PriceModel.init(std.testing.allocator));
     defer controller.deinit();
-    controller.prices.observe(1, 4, .chain, 0);
-    controller.prices.observe(2, 4, .chain, 0);
+    controller.prices.observe(1, 4, .chain, 0, .generic);
+    controller.prices.observe(2, 4, .chain, 0, .generic);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(std.testing.allocator);
     const candidate = Tree.chain(0, &.{7}, 0.5, 0.5);
@@ -1205,16 +1295,16 @@ test "lookup width learning escapes narrow-price starvation without synthetic ti
     const candidate = policy.calibrated(&raw);
     const fallback: LookFallback = .{ .measured = .{ .round_ms = 90, .expected_tokens = 2 } };
     try std.testing.expect(policy.observeSpecRemainingProbe(90, 2, 0, 0));
-    policy.prices.observe(3, 84, .chain, 0);
+    policy.prices.observe(3, 84, .chain, 0, .generic);
     const locked = try policy.chooseLookPreparedControlled(&candidate, 0, 1, &selected, 0, fallback);
     try std.testing.expectEqual(@as(u32, 2), locked.rows);
     const first = policy.reserveLookWidthTrial(&candidate, 0, 2).?;
     try std.testing.expectEqual(@as(u32, 15), first);
-    try std.testing.expect(policy.prices.known(first, .chain, 0) == null);
+    try std.testing.expect(policy.prices.known(first, .chain, 0, .generic) == null);
     try std.testing.expect(policy.reserveLookWidthTrial(&candidate, 0, 2) == null);
     try std.testing.expect(!policy.prices.observeKernel(first, 400, .chain, 0, .generic));
     try std.testing.expectEqual(@as(?u32, 15), policy.reserveLookWidthTrial(&candidate, 0, 2));
-    try std.testing.expect(policy.prices.known(first, .chain, 0) == null);
+    try std.testing.expect(policy.prices.known(first, .chain, 0, .generic) == null);
     try std.testing.expect(policy.prices.observeKernel(first, 140, .chain, 0, .generic));
     const learned = try policy.chooseLookPreparedControlled(&candidate, 0, 1, &selected, 0, fallback);
     try std.testing.expectEqual(@as(u32, 14), learned.rows);
@@ -1228,7 +1318,7 @@ test "lookup width trials respect floors caps declining yield and failed retries
     const strong = policy.calibrated(&raw);
     const weak_raw = Tree.chain(0, &.{ 11, 12, 13, 14, 15, 16, 17, 18 }, 0.05, 1);
     const weak = policy.calibrated(&weak_raw);
-    policy.prices.observe(3, 84, .chain, 0);
+    policy.prices.observe(3, 84, .chain, 0, .generic);
     try std.testing.expect(policy.reserveLookWidthTrial(&strong, 0, 2) == null);
     try std.testing.expect(policy.observeSpecRemainingProbe(90, 2, 0, 0));
     try std.testing.expect(policy.reserveLookWidthTrial(&strong, 0, 4) == null);
@@ -1254,40 +1344,44 @@ test "lookup width trials respect floors caps declining yield and failed retries
 test "upper width exploration is one shape and one real cold retry" {
     var policy = Policy.init(PriceModel.init(std.testing.allocator));
     defer policy.deinit();
-    try std.testing.expect(policy.prices.upperTrialWidth(4, 12, .tree, 0) == null);
-    policy.prices.observe(4, 50, .tree, 0);
-    try std.testing.expectEqual(@as(?u32, 12), policy.prices.upperTrialWidth(4, 12, .tree, 0));
-    try std.testing.expect(policy.prices.reserveUpperTrial(4, 12, .tree, 0, .generic));
-    try std.testing.expect(!policy.prices.reserveUpperTrial(4, 12, .tree, 0, .generic));
-    try std.testing.expect(!policy.prices.reserveUpperTrial(4, 10, .tree, 0, .generic));
-    try std.testing.expect(policy.prices.known(12, .tree, 0) == null);
+    const native: Shape = .{ .rows = 4, .variant = .generic };
+    const upper: Shape = .{ .rows = 12, .variant = .generic };
+    try std.testing.expect(policy.prices.upperTrialWidth(native, upper, .tree, 0) == null);
+    policy.prices.observe(4, 50, .tree, 0, .generic);
+    try std.testing.expectEqual(@as(?u32, 12), policy.prices.upperTrialWidth(native, upper, .tree, 0));
+    try std.testing.expect(policy.prices.reserveUpperTrial(native, upper, .tree, 0));
+    try std.testing.expect(!policy.prices.reserveUpperTrial(native, upper, .tree, 0));
+    try std.testing.expect(!policy.prices.reserveUpperTrial(native, .{ .rows = 10, .variant = .generic }, .tree, 0));
+    try std.testing.expect(policy.prices.known(12, .tree, 0, .generic) == null);
     try std.testing.expect(!policy.prices.observeKernel(12, 500, .tree, 0, .generic));
-    try std.testing.expect(policy.prices.upperTrialWidth(4, 11, .tree, 0) == null);
-    try std.testing.expect(!policy.prices.reserveUpperTrial(4, 12, .tree, 0, .linear_gdn));
+    try std.testing.expect(policy.prices.upperTrialWidth(native, .{ .rows = 11, .variant = .generic }, .tree, 0) == null);
+    try std.testing.expect(!policy.prices.reserveUpperTrial(native, .{ .rows = 12, .variant = .linear_gdn }, .tree, 0));
     var copy = try policy.clone(std.testing.allocator);
     defer copy.deinit();
     const before = policy.diagnosticFingerprint();
-    try std.testing.expect(copy.prices.reserveUpperTrial(4, 12, .tree, 0, .generic));
+    try std.testing.expect(copy.prices.reserveUpperTrial(native, upper, .tree, 0));
     try std.testing.expect(!std.mem.eql(u8, &before, &copy.diagnosticFingerprint()));
     try std.testing.expectEqualDeep(before, policy.diagnosticFingerprint());
-    try std.testing.expect(copy.prices.upperTrialWidth(4, 16, .tree, 0) == null);
+    try std.testing.expect(copy.prices.upperTrialWidth(native, .{ .rows = 16, .variant = .generic }, .tree, 0) == null);
     try std.testing.expect(!copy.prices.observeKernel(12, std.math.inf(f32), .tree, 0, .generic));
-    try std.testing.expect(!copy.prices.reserveUpperTrial(4, 12, .tree, 0, .generic));
-    try std.testing.expect(policy.prices.reserveUpperTrial(4, 12, .tree, 0, .generic));
+    try std.testing.expect(!copy.prices.reserveUpperTrial(native, upper, .tree, 0));
+    try std.testing.expect(policy.prices.reserveUpperTrial(native, upper, .tree, 0));
     try std.testing.expect(policy.prices.observeKernel(12, 95, .tree, 0, .generic));
-    try std.testing.expectEqual(@as(?f32, 95), policy.prices.known(12, .tree, 0));
-    try std.testing.expect(policy.prices.upperTrialWidth(4, 16, .tree, 0) == null);
+    try std.testing.expectEqual(@as(?f32, 95), policy.prices.known(12, .tree, 0, .generic));
+    try std.testing.expect(policy.prices.upperTrialWidth(native, .{ .rows = 16, .variant = .generic }, .tree, 0) == null);
 }
 
 test "a naturally cold width has only one remaining trial attempt" {
     var prices = PriceModel.init(std.testing.allocator);
     defer prices.deinit();
-    prices.observe(3, 84, .chain, 0);
+    const native: Shape = .{ .rows = 3, .variant = .generic };
+    const upper: Shape = .{ .rows = 15, .variant = .generic };
+    prices.observe(3, 84, .chain, 0, .generic);
     try std.testing.expect(!prices.observeKernel(15, 300, .chain, 0, .generic));
-    try std.testing.expect(prices.reserveUpperTrial(3, 15, .chain, 0, .generic));
+    try std.testing.expect(prices.reserveUpperTrial(native, upper, .chain, 0));
     try std.testing.expect(!prices.observeKernel(15, std.math.nan(f32), .chain, 0, .generic));
-    try std.testing.expect(!prices.reserveUpperTrial(3, 15, .chain, 0, .generic));
-    try std.testing.expect(prices.upperTrialWidth(3, 15, .chain, 0) == null);
+    try std.testing.expect(!prices.reserveUpperTrial(native, upper, .chain, 0));
+    try std.testing.expect(prices.upperTrialWidth(native, upper, .chain, 0) == null);
 }
 
 test "strong suffix history cannot wash out weak suffix mismatches" {
@@ -1307,8 +1401,8 @@ test "strong suffix history cannot wash out weak suffix mismatches" {
     try std.testing.expectEqual(@as(f32, 1), controller.cal.q(.look_continuation, 1, 1));
     try std.testing.expectEqual(@as(f32, 1), controller.cal.q(.neural, 1, 0));
     // The same measured action remains useful for the strong context only.
-    controller.prices.observe(1, 50, .chain, 0);
-    for (2..16) |width| controller.prices.observe(@intCast(width), 150, .chain, 0);
+    controller.prices.observe(1, 50, .chain, 0, .generic);
+    for (2..16) |width| controller.prices.observe(@intCast(width), 150, .chain, 0, .generic);
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(std.testing.allocator);
     const fallback: LookFallback = .{ .measured = .{ .round_ms = 100, .expected_tokens = 4 } };
@@ -1373,7 +1467,7 @@ test "lookup request support enables bounded reuse only after actual native widt
     const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
     var raw = Tree.chain(0, &tokens, 1, 1);
     raw.look_order = @splat(8);
-    const offer = controller.chooseTreeControlled(&raw, 0, 0, 15, 15, null);
+    const offer = controller.chooseTreeControlled(&raw, 0, 0, 15, 15, null, .generic);
     var request: RequestTrust = .{};
     _ = controller.observeSpecRemainingProbe(100, 2, 0, 1);
     _ = controller.observeSpecRemainingProbe(90, 2, 0, 1);
@@ -1416,4 +1510,184 @@ test "lookup bounded shadow offer preserves nonoverlapping executed chain eviden
     // One continuation hit and its first rejection, never the unreached 14.
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), trust.q(.look_continuation, 0.6), 0.00001);
     try std.testing.expectEqual(@as(f32, 0), trust.q(.look_continuation, 0.3));
+}
+
+test "settled prices and nearest width extrapolation never cross kernel variants" {
+    var prices = PriceModel.init(std.testing.allocator);
+    defer prices.deinit();
+    try std.testing.expect(!prices.observeKernel(9, 900, .tree, 0, .generic));
+    try std.testing.expect(prices.observeKernel(9, 90, .tree, 0, .generic));
+    try std.testing.expectEqual(@as(?f32, 90), prices.known(9, .tree, 0, .generic));
+    try std.testing.expect(prices.known(9, .tree, 0, .linear_gdn) == null);
+    // No linear timing exists: retain the unmeasured default, not generic 90ms.
+    try std.testing.expectEqual(@as(f32, 20), prices.price(10, .tree, 0, .linear_gdn));
+    try std.testing.expectEqual(@as(f32, 180), prices.price(8, .tree, 0, .generic));
+    try std.testing.expect(!prices.observeKernel(9, 600, .tree, 0, .linear_gdn));
+    try std.testing.expect(prices.known(9, .tree, 0, .linear_gdn) == null);
+    try std.testing.expect(prices.observeKernel(9, 9, .tree, 0, .linear_gdn));
+    try std.testing.expectEqual(@as(?f32, 9), prices.known(9, .tree, 0, .linear_gdn));
+    try std.testing.expectEqual(@as(?f32, 90), prices.known(9, .tree, 0, .generic));
+    try std.testing.expectEqual(@as(f32, 18), prices.price(8, .tree, 0, .linear_gdn));
+    try std.testing.expectEqual(@as(f32, 180), prices.price(8, .tree, 0, .generic));
+    try prices.priors.put(.{ .class = 1, .rows = 9, .kind = .tree, .variant = .generic }, 90);
+    try std.testing.expect(prices.prior(9, .tree, 1, .linear_gdn) == null);
+    try std.testing.expectEqual(@as(f32, 20), prices.price(10, .tree, 1, .linear_gdn));
+}
+
+test "ranked prefixes price their remapped shape and preserve forced geometry" {
+    var policy = Policy.init(PriceModel.init(std.testing.allocator));
+    defer policy.deinit();
+    var tree = Tree.init(100);
+    _ = tree.add(0, 101, 0.1, .draft, 0.1);
+    _ = tree.add(0, 102, 0.9, .draft, 0.9);
+    for (3..10) |row| _ = tree.add(row - 1, @intCast(100 + row), 0.9, .draft, 1);
+    try std.testing.expectEqual(Variant.generic, tree.variant(.linear_gdn));
+    for (1..11) |width| policy.prices.observe(@intCast(width), if (width == 9) 0.01 else 100, .tree, 0, .generic);
+    policy.prices.observe(9, 1, .tree, 0, .linear_gdn);
+    var log: TreeEvaluation = .{};
+    const chosen = policy.chooseTreeControlled(&tree, 0, 0, 32, 0, &log, .linear_gdn);
+    try std.testing.expectEqual(@as(usize, 9), chosen.len);
+    try std.testing.expectEqual(Variant.linear_gdn, chosen.variant(.linear_gdn));
+    try std.testing.expectEqual(Variant.generic, log.entries[7].variant);
+    try std.testing.expectEqual(Variant.linear_gdn, log.entries[8].variant);
+    try std.testing.expectEqual(@as(f32, 1), log.entries[8].verify_ms);
+    try std.testing.expectEqual(Variant.generic, log.entries[9].variant);
+    try std.testing.expectEqual(@as(f32, 100), log.entries[9].verify_ms);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 102, 103, 104, 105, 106, 107, 108, 109 }, chosen.tokens[0..chosen.len]);
+    for (chosen.parents[1..chosen.len], 1..) |parent, row| try std.testing.expectEqual(@as(i32, @intCast(row - 1)), parent);
+    const before = policy.chooseTreeControlled(&tree, 0, 0, 32, 9, null, .linear_gdn);
+    for (0..7) |_| policy.prices.observe(9, 1000, .tree, 0, .linear_gdn);
+    const after = policy.chooseTreeControlled(&tree, 0, 0, 32, 9, &log, .linear_gdn);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expectEqual(@as(usize, 1), log.len);
+    try std.testing.expectEqual(@as(f32, 1000), log.entries[0].verify_ms);
+    _ = policy.chooseTreeControlled(&tree, 0, 0, 32, 9, &log, .generic);
+    try std.testing.expectEqual(Variant.generic, log.entries[0].variant);
+    try std.testing.expectEqual(@as(f32, 0.01), log.entries[0].verify_ms);
+}
+
+test "native bootstrap requires the actual selected prefix variant" {
+    var policy = Policy.init(PriceModel.init(std.testing.allocator));
+    defer policy.deinit();
+    var tree = Tree.chain(0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, 0.9, 1);
+    _ = tree.add(0, 9, 0.1, .draft, 0.1);
+    policy.prices.observe(1, 0.01, .tree, 0, .generic);
+    policy.prices.observe(9, 90, .tree, 0, .generic);
+    var log: TreeEvaluation = .{};
+    const cold = policy.chooseTreeBootstrapControlled(&tree, 0, 0, 32, 0, 9, &log, .linear_gdn);
+    try std.testing.expectEqual(@as(usize, 9), cold.len);
+    try std.testing.expectEqual(Variant.linear_gdn, cold.variant(.linear_gdn));
+    try std.testing.expectEqual(@as(usize, 1), log.len);
+    try std.testing.expect(!policy.prices.observeKernel(9, 900, .tree, 0, .linear_gdn));
+    const still_cold = policy.chooseTreeBootstrapControlled(&tree, 0, 0, 32, 0, 9, null, .linear_gdn);
+    try std.testing.expectEqual(@as(usize, 9), still_cold.len);
+    try std.testing.expect(policy.prices.observeKernel(9, 9, .tree, 0, .linear_gdn));
+    _ = policy.chooseTreeBootstrapControlled(&tree, 0, 0, 32, 0, 9, &log, .linear_gdn);
+    try std.testing.expectEqual(tree.len, log.len);
+}
+
+test "upper width eligibility uses both actual variants without renewing the trial budget" {
+    var prices = PriceModel.init(std.testing.allocator);
+    defer prices.deinit();
+    const native: Shape = .{ .rows = 9, .variant = .linear_gdn };
+    const upper: Shape = .{ .rows = 12, .variant = .linear_gdn };
+    prices.observe(9, 90, .tree, 0, .generic);
+    prices.observe(12, 120, .tree, 0, .generic);
+    try std.testing.expect(prices.upperTrialWidth(native, upper, .tree, 0) == null);
+    try std.testing.expect(!prices.reserveUpperTrial(native, upper, .tree, 0));
+    prices.observe(9, 9, .tree, 0, .linear_gdn);
+    try std.testing.expectEqual(@as(?u32, 12), prices.upperTrialWidth(native, upper, .tree, 0));
+    try std.testing.expect(prices.reserveUpperTrial(native, upper, .tree, 0));
+    try std.testing.expect(!prices.observeKernel(12, 1200, .tree, 0, .linear_gdn));
+    try std.testing.expectEqual(@as(?u32, 12), prices.upperTrialWidth(native, upper, .tree, 0));
+    try std.testing.expect(prices.reserveUpperTrial(native, upper, .tree, 0));
+    try std.testing.expect(prices.upperTrialWidth(native, .{ .rows = 16, .variant = .generic }, .tree, 0) == null);
+    try std.testing.expect(!prices.reserveUpperTrial(native, .{ .rows = 16, .variant = .generic }, .tree, 0));
+    // A reference and wider action need not use the same kernel.
+    prices.observe(8, 80, .tree, 1, .generic);
+    const generic_native: Shape = .{ .rows = 8, .variant = .generic };
+    try std.testing.expectEqual(@as(?u32, 12), prices.upperTrialWidth(generic_native, upper, .tree, 1));
+    try std.testing.expect(prices.reserveUpperTrial(generic_native, upper, .tree, 1));
+}
+
+test "policy identity separates otherwise identical price and cold variants" {
+    var generic = Policy.init(PriceModel.init(std.testing.allocator));
+    defer generic.deinit();
+    var linear = Policy.init(PriceModel.init(std.testing.allocator));
+    defer linear.deinit();
+    generic.prices.observe(9, 9, .tree, 0, .generic);
+    linear.prices.observe(9, 9, .tree, 0, .linear_gdn);
+    try std.testing.expect(!std.mem.eql(u8, &generic.diagnosticFingerprint(), &linear.diagnosticFingerprint()));
+    var copy = try linear.clone(std.testing.allocator);
+    defer copy.deinit();
+    try std.testing.expectEqual(linear.diagnosticFingerprint(), copy.diagnosticFingerprint());
+    // Equalize settled state, then isolate the prior-key contribution.
+    generic.prices.observe(9, 9, .tree, 0, .linear_gdn);
+    linear.prices.observe(9, 9, .tree, 0, .generic);
+    try std.testing.expectEqual(generic.diagnosticFingerprint(), linear.diagnosticFingerprint());
+    try generic.prices.priors.put(.{ .class = 0, .rows = 10, .kind = .tree, .variant = .generic }, 10);
+    try linear.prices.priors.put(.{ .class = 0, .rows = 10, .kind = .tree, .variant = .linear_gdn }, 10);
+    try std.testing.expect(!std.mem.eql(u8, &generic.diagnosticFingerprint(), &linear.diagnosticFingerprint()));
+    generic.prices.priors.clearRetainingCapacity();
+    linear.prices.priors.clearRetainingCapacity();
+    try std.testing.expect(!generic.prices.observeKernel(11, 100, .tree, 0, .generic));
+    try std.testing.expect(!linear.prices.observeKernel(11, 100, .tree, 0, .linear_gdn));
+    try std.testing.expect(!std.mem.eql(u8, &generic.diagnosticFingerprint(), &linear.diagnosticFingerprint()));
+}
+
+test "ordinary lookup chain pricing stays generic above the tree dispatch threshold" {
+    var policy = Policy.init(PriceModel.init(std.testing.allocator));
+    defer policy.deinit();
+    const tree = Tree.chain(0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, 1, 1);
+    policy.prices.observe(9, 90, .chain, 0, .generic);
+    policy.prices.observe(9, 1, .chain, 0, .linear_gdn);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const chosen = try policy.chooseLookPreparedControlled(&tree, 0, 0, &out, 9, .unknown);
+    try std.testing.expectEqual(@as(u32, 8), chosen.rows);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), chosen.value, 0.00001);
+}
+
+test "standalone lookup escapes root-only prices with one shape and one cold retry" {
+    var policy = Policy.init(PriceModel.init(std.testing.allocator));
+    defer policy.deinit();
+    var candidate = Tree.chain(10, &.{ 11, 12, 13, 14, 15 }, 1, 1);
+    candidate.scores_calibrated = true;
+    var selected: std.ArrayList(u32) = .empty;
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expect(policy.reservePlainWidthTrial(&candidate, 0) == null);
+    // Tree-verifier prices must not unlock a different chain verifier.
+    policy.prices.observe(1, 50, .tree, 0, .generic);
+    try std.testing.expect(policy.reservePlainWidthTrial(&candidate, 0) == null);
+    try std.testing.expect(!policy.prices.observeKernel(1, 50, .chain, 0, .generic));
+    try std.testing.expect(policy.reservePlainWidthTrial(&candidate, 0) == null);
+    try std.testing.expect(policy.prices.observeKernel(1, 50, .chain, 0, .generic));
+    policy.observePlain(50, 0);
+    const locked = try policy.chooseLookPreparedControlled(&candidate, 0, 0.2, &selected, 0, .plain);
+    try std.testing.expectEqual(@as(u32, 0), locked.rows);
+    const first = policy.reservePlainWidthTrial(&candidate, 0).?;
+    try std.testing.expectEqual(@as(u32, 6), first);
+    const forced = try policy.chooseLookPreparedControlled(&candidate, 0, 0.2, &selected, first, .plain);
+    try std.testing.expectEqual(@as(u32, 5), forced.rows);
+    try std.testing.expect(policy.reservePlainWidthTrial(&candidate, 0) == null);
+    try std.testing.expect(!policy.prices.observeKernel(first, 100, .chain, 0, .generic));
+    var shorter = candidate;
+    shorter.len = 5;
+    const before = policy.diagnosticFingerprint();
+    try std.testing.expect(policy.reservePlainWidthTrial(&shorter, 0) == null);
+    var empty = Tree.init(10);
+    empty.scores_calibrated = true;
+    try std.testing.expect(policy.reservePlainWidthTrial(&empty, 0) == null);
+    var no_gain = candidate;
+    @memset(no_gain.scores[1..no_gain.len], 0);
+    try std.testing.expect(policy.reservePlainWidthTrial(&no_gain, 0) == null);
+    try std.testing.expectEqualDeep(before, policy.diagnosticFingerprint());
+    try std.testing.expectEqual(@as(?u32, 6), policy.reservePlainWidthTrial(&candidate, 0));
+    try std.testing.expect(policy.prices.observeKernel(first, 60, .chain, 0, .generic));
+    const learned = try policy.chooseLookPreparedControlled(&candidate, 0, 0.2, &selected, 0, .plain);
+    try std.testing.expectEqual(@as(u32, 5), learned.rows);
+    try std.testing.expect(policy.reservePlainWidthTrial(&candidate, 0) == null);
+    var longer = Tree.chain(10, &.{ 11, 12, 13, 14, 15, 16, 17 }, 1, 1);
+    longer.scores_calibrated = true;
+    try std.testing.expect(policy.reservePlainWidthTrial(&longer, 0) == null);
 }

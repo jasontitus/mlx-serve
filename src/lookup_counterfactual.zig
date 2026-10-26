@@ -7,12 +7,40 @@ const dflash = @import("dflash.zig");
 const policy = @import("speculation_policy.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Digest = [32]u8;
-pub const Action = enum {
-    assistant8, assistant16, lookup8, lookup16,
-    pub fn rows(self: Action) u32 { return switch (self) { .assistant8, .lookup8 => 8, .assistant16, .lookup16 => 16 }; }
-    pub fn assistant(self: Action) bool { return self == .assistant8 or self == .assistant16; }
+pub const Action = enum(u8) {
+    assistant1 = 1, assistant2, assistant3, assistant4,
+    assistant5, assistant6, assistant7, assistant8,
+    assistant9, assistant10, assistant11, assistant12,
+    assistant13, assistant14, assistant15, assistant16,
+    lookup1, lookup2, lookup3, lookup4,
+    lookup5, lookup6, lookup7, lookup8,
+    lookup9, lookup10, lookup11, lookup12,
+    lookup13, lookup14, lookup15, lookup16,
+    pub fn rows(self: Action) u32 { return (@as(u32, @intFromEnum(self)) - 1) % 16 + 1; }
+    pub fn assistant(self: Action) bool { return @intFromEnum(self) <= 16; }
 };
 pub const Phase = enum { warmup, measured };
+
+pub const Preparation = enum {
+    merged16,
+    @"production-neural",
+    @"production-combined",
+
+    pub fn validate(self: Preparation, action: Action, suffix_candidates: bool) !void {
+        if (suffix_candidates != (self != .@"production-neural") or
+            (self == .@"production-neural" and !action.assistant()))
+            return error.DiagnosticPreparationMismatch;
+    }
+
+    pub fn horizon(self: Preparation, production: u32) u32 {
+        return if (self == .merged16) 16 else production;
+    }
+};
+
+pub fn preparation() !Preparation {
+    const raw = std.c.getenv("MLX_SERVE_LOOKUP_COUNTERFACTUAL_PREPARATION") orelse return error.DiagnosticMissingPreparation;
+    return std.meta.stringToEnum(Preparation, std.mem.span(raw)) orelse error.DiagnosticInvalidPreparation;
+}
 
 pub fn enabled() bool {
     const value = std.c.getenv("MLX_SERVE_LOOKUP_COUNTERFACTUAL") orelse return false;
@@ -281,8 +309,23 @@ pub const Preconditions = struct {
 
 /// The dispatch digest records the kernels ACTUALLY dispatched (variant, dtype,
 /// geometry and implementation identifier), not requested flags or `priced=true`.
-pub const Kernel = struct { rows: u32, variant: policy.Variant, kind: policy.Kind, class: i64, dispatch: Digest };
-pub const PreparedState = struct { target_kv: Digest, target_ssm: Digest, assistant: Digest };
+pub const Geometry = struct {
+    selected_parents: [16]i32 = @splat(0),
+    selected_depths: [16]i32 = @splat(0),
+    committed_rows: [16]u32 = @splat(0),
+    committed_count: usize = 0,
+    kv_compacted: bool = false,
+};
+pub const Kernel = struct { rows: u32, variant: policy.Variant, kind: policy.Kind, class: i64, dispatch: Digest, geometry: Geometry = .{} };
+pub const PreparedState = struct {
+    target_kv: Digest,
+    target_ssm: Digest,
+    assistant: Digest,
+    preparation: Preparation,
+    assistant_horizon: u32,
+    suffix_candidates: bool,
+    context_length: usize,
+};
 pub const Timing = struct {
     verify_commit_ns: u64,
     /// Null unless all prep/selection/publish costs are settled and readback gaps excluded.
@@ -363,6 +406,16 @@ pub const Probe = struct {
         if (selected_tree.len != self.action.rows() or candidate.len < self.action.rows() or assistant_ran != self.action.assistant()) return error.DiagnosticActionMismatch;
         const offered = try fingerprintOffer(candidate);
         const selected = try fingerprintOffer(selected_tree);
+        try prepared.preparation.validate(self.action, prepared.suffix_candidates);
+        if (prepared.context_length == 0 or
+            (assistant_ran and prepared.assistant_horizon == 0) or
+            (!assistant_ran and prepared.assistant_horizon != 0) or
+            (assistant_ran and prepared.preparation == .merged16 and prepared.assistant_horizon != 16))
+            return error.DiagnosticPreparationMismatch;
+        if (prepared.preparation == .@"production-neural") {
+            for (candidate.sources[1..candidate.len]) |source|
+                if (source != .draft) return error.DiagnosticPreparationMismatch;
+        }
         if (self.warmup) |w| {
             if (!std.meta.eql(w.offer, offered) or !std.meta.eql(w.selected, selected)) return error.DiagnosticOfferMismatch;
             if (!std.meta.eql(w.prepared, prepared)) return error.DiagnosticStateMismatch;
@@ -410,6 +463,8 @@ pub const Probe = struct {
 /// Assistant-vs-lookup deliberately differs in preparation and candidate set.
 pub fn compare(a: *const Receipt, b: *const Receipt, serial_tokens: []const u32) !void {
     if (a.phase != .measured or b.phase != .measured or !a.warmup_proven or !b.warmup_proven or a.first_offer != 0 or b.first_offer != 0) return error.DiagnosticInvalidComparison;
+    if (a.prepared.preparation != b.prepared.preparation or a.prepared.suffix_candidates != b.prepared.suffix_candidates)
+        return error.DiagnosticPreparationMismatch;
     if (!std.meta.eql(a.identity, b.identity)) return error.DiagnosticStateMismatch;
     if (!std.mem.eql(u8, &a.prepared.target_kv, &b.prepared.target_kv) or !std.mem.eql(u8, &a.prepared.target_ssm, &b.prepared.target_ssm)) return error.DiagnosticStateMismatch;
     if (a.action.assistant() == b.action.assistant() and !std.meta.eql(a.prepared, b.prepared)) return error.DiagnosticStateMismatch;
@@ -455,7 +510,19 @@ test "excluded warmup restores every policy field before measured first offer" {
     const id: Identity = .{ .prefix = @splat(1), .target_kv = @splat(2), .target_ssm = @splat(3), .assistant = @splat(4), .controls = @splat(5), .training = @splat(6), .learner = baseline_hash, .request_lookup = trust.diagnosticFingerprint() };
     try probe.captureCommon(id);
     const tree = policy.Tree.chain(71, &.{ 73, 79, 83, 89, 97, 101, 103 }, 0.8, 0.7);
-    const prepared: PreparedState = .{ .target_kv = id.target_kv, .target_ssm = id.target_ssm, .assistant = id.assistant };
+    const prepared: PreparedState = .{
+        .target_kv = id.target_kv, .target_ssm = id.target_ssm, .assistant = id.assistant,
+        .preparation = .merged16, .assistant_horizon = 16, .suffix_candidates = true, .context_length = 384,
+    };
+    const insufficient = policy.Tree.chain(71, &.{73}, 0.8, 0.7);
+    try std.testing.expectError(error.DiagnosticActionMismatch, probe.captureOffer(&insufficient, &insufficient, true, prepared));
+    var neural_prepared = prepared;
+    neural_prepared.preparation = .@"production-neural";
+    neural_prepared.assistant_horizon = 7;
+    neural_prepared.suffix_candidates = false;
+    var contaminated = tree;
+    contaminated.sources[1] = .both;
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, probe.captureOffer(&contaminated, &contaminated, true, neural_prepared));
     try probe.captureOffer(&tree, &tree, true, prepared);
     const kernel: Kernel = .{ .rows = 8, .variant = .generic, .kind = .chain, .class = 0, .dispatch = @splat(7) };
     const timing: Timing = .{ .verify_commit_ns = 19000, .diagnostic_readback_ns = 11000 };
@@ -474,4 +541,20 @@ test "excluded warmup restores every policy field before measured first offer" {
     const measured = try probe.finishFirstRound(kernel, timing, &.{ 71, 73 }, 1, true);
     try std.testing.expect(measured.warmup_proven);
     try std.testing.expectError(error.DiagnosticRequestOrder, probe.beginRequest(&learner, &trust, conditions));
+}
+
+test "diagnostic preparation preserves production horizon and rejects lookup neural controls" {
+    try std.testing.expectEqual(@as(u32, 7), Preparation.@"production-neural".horizon(7));
+    try std.testing.expectEqual(@as(u32, 16), Preparation.merged16.horizon(7));
+    try Preparation.@"production-neural".validate(.assistant16, false);
+    try Preparation.merged16.validate(.lookup16, true);
+    try std.testing.expectEqual(@as(u32, 7), Preparation.@"production-combined".horizon(7));
+    try std.testing.expectEqual(@as(u32, 11), Preparation.@"production-combined".horizon(11));
+    try Preparation.@"production-combined".validate(.assistant16, true);
+    try Preparation.@"production-combined".validate(.lookup16, true);
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, Preparation.@"production-combined".validate(.assistant8, false));
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, Preparation.@"production-combined".validate(.lookup8, false));
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, Preparation.@"production-neural".validate(.lookup1, false));
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, Preparation.@"production-neural".validate(.assistant8, true));
+    try std.testing.expectError(error.DiagnosticPreparationMismatch, Preparation.merged16.validate(.assistant8, false));
 }

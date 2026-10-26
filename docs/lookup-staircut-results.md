@@ -987,4 +987,19 @@ Adversarial review caught the clock mismatch before integration. Parent integrat
 
 `runs/independent-v29-native-copy-diagnostic` completed **sixteen exact responses** across the four coding cases and both exposures, with zero validation errors. Editing offered nine native copies in each exposure. First exposure selected six copies—two with unknown economics and four with known economics—committing 42 tokens with 36 accepted drafts. Repeat selected one known copy, committing two tokens with one accepted draft. No native-copy opportunities appeared in the other three cases. The diagnostic proves unknown/known execution and complete output, not a latency gain; its price tracing perturbs the measured populations.
 
-Measured state growth is **960 bytes per existing context-map value**, excluding spare map capacity; query scratch is **256 KiB of bounded stack space**. No new disk file or second estimator map is added. Native-copy selected geometry has its own identity and is not falsely counted as pruning the lookup offer. The subsequent four-quartet v28/v29 comparison uses full receipts without price tracing.
+Measured state growth is **960 bytes per existing context-map value**, excluding spare map capacity; query scratch is **256 KiB of bounded stack space**. No new disk file or second estimator map is added. Native-copy selected geometry has its own identity; the repository component reducer excludes it from lookup-offer pruning counts. The subsequent four-quartet v28/v29 comparison uses full receipts without price tracing.
+
+The isolated `runs/independent-v29-native-copy-abba` comparison completed **136 exact responses**. Its full-workload ratio is **1.00506 (+0.51%)**, quartet-bootstrap interval **0.99533–1.01366**; quartet ratios are 0.98990, 1.00321, 1.01181 and 1.01552. Swap usage, swap-ins and swap-outs changed, failing hardware qualification. The interval also includes no improvement. This does not establish acceleration from the correction.
+
+| Coding case | v29 versus v28: first | Repeat |
+|---|---:|---:|
+| Fresh function | −0.48% | +1.24% |
+| Related helper | +2.01% | +1.43% |
+| Related edit | −1.88% | +1.37% |
+| Related completion | +0.36% | +0.02% |
+
+Editing first exposure regresses in all four quartets. Across eight such requests, the correction saves assistant-bearing rounds (172→143), but increases total rounds (204→211) and verifier rows (1,640→1,704). Its 64 selected copies commit 445 tokens, including 381 accepted drafts. Summed assistant draft duration falls 2,212.64→1,906.45 ms while verification/commit duration rises 24,808.77→26,268.97 ms. Preserving a cheap draft source is therefore not sufficient: its realized coverage and verifier work can outweigh the draft saving. These are executed-work observations, not same-state alternative timings.
+
+Edit repeat instead changes 200→199 rounds, 1,632→1,624 verifier rows and 199→191 assistant-bearing rounds. Five selected copies accept all 35 draft tokens. Copy opportunities remain absent from the other three cases; their timing changes cannot be attributed to copy execution. The comparison also contains the shared remaining-clock correction. Raw `published_width_reductions` from this private driver are not isolated StairCut attribution; selected native copies must be excluded before interpreting such counts. Direct native-versus-v29 evaluation is a separate cohort.
+
+Independent adversarial review found no remaining clock, action-identity, low-yield retention or bounded-state defect in the copy integration. Prefix-level work evidence retains the unfavorable outcomes: all eight first-edit copies at anchor 341 accept one draft, while the earlier arm executes four assistant actions accepting seven and four lookup actions accepting one. Later copy selections at anchors 387 and 415 accept three and two drafts respectively. Historical paired economics do not guarantee future copy coverage; the review does not turn this measured regression into a speedup.

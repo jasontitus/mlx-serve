@@ -137,3 +137,22 @@ The experimental branch is **not a minimal production PR**. At the v21/v22 worki
 | Reproducibility and diagnostics | ABBA/BAAB runners, serial replay, runtime/model identity, telemetry, resource accounting and same-state witnesses | Tooling can be reviewed separately, but the production PR must link the exact frozen evidence used for each claim. Diagnostic-only hooks should remain opt-in and distinguish their timing overhead. |
 
 Submission gates remain exact output/state correctness, adversarial review, explicit incremental cost, and appropriately scoped performance evidence. Related-template wins do not justify a universal coding or canonical claim. Do not include unsuccessful experiments merely because they were benchmarked: retain their evidence in the results document and remove unsupported complexity from the final production series. All units retain concept attribution and the independently authored, upstream-based history; no TandemLLM implementation or unrelated submodule change belongs in the series.
+
+## Sushi HEAD compatibility
+
+Checked the exact committed feature patch `191da71de32a65f69ebceeb6cb2e91036ab50b30`→`5245d6ccd34fbcc31b4d479bc1e400a26a8fb530` against a fresh isolated checkout of `beamivalice/sushi` main at **`124cb7d042788478414961f1772192e857b7bc5b`**. Both direct `git apply --check` and alternate-index three-way application failed. Per-file checks classify 38 clean paths, 11 conflicts and two absent modified files. The patch contains 51 files, +27,680/−186 lines; patch SHA-256 is `87eabec59cc64ede2ad1d661235f9d149a2fb956bdbbb7dfe1b3a23fe650a5af`.
+
+Conflicts affect `build.zig`, `src/dflash.zig`, `src/gdn_decode.zig`, `src/generate.zig`, `src/model.zig`, `src/qwen4_exp.zig`, `src/scheduler.zig`, `src/server.zig`, `src/transformer.zig`, `src/tests.zig` and `CHANGELOG.md`. Sushi lacks the modified `src/qwen4_ple.zig` and `src/simd_qmm.zig`. Newly added policy/history modules applying cleanly does not establish that Sushi has callers, compatible numerical kernels or a working build.
+
+| Capability | Porting boundary |
+|---|---|
+| Decoded learned-embedding row cache | Smallest independent candidate: adapt narrow affine-row reuse to Sushi's checked gather API, preserving read failures, BF16/sharded tables, wide-prefill dispatch and worker-pool behavior. No inference gain on Sushi has been measured. |
+| Suffix lookup and MTP routing | Integrate with Sushi's existing solo lookup-chain lifecycle, whole-cycle price observations and publication rules. Start request-local; persistent history additionally requires authoritative publication/cancellation reconciliation. |
+| Flash-Next DFlash2 | Sushi already has a native chain-width policy. Preserve its acceptance, correction and assistant-state semantics; do not transplant the dense-Qwen tree verifier or its copy incumbent. |
+| GLM tree/copy routing | Separate architecture-specific adapter. Preserve GLM's own existing copy geometry and eligibility, not dense-Qwen's backing threshold and draft length. |
+
+Sushi serves `qwen4_exp`, `mimo_v2`, `glm5_next` and `deepseek_v41`; the dense Qwen3.8-27B architecture exercised by the current source benchmarks is not in that served-model list. The source's settled MTP target timer requires its `.qwen` head, not Flash-Next's `.qwen4`. Existing dense-Qwen prices, wider-row numerical evidence and performance percentages therefore cannot certify a Sushi port.
+
+Recommended order is the independent narrow PLE cache, request-local MTP-chain lookup, matched-scope routing, then Flash-Next DFlash chain integration. Mixed trees require separate architecture work. Before deployment, compile against Sushi's pinned toolchain and verify exact gathered vectors plus serial/speculative publication and committed-state equivalence through rejection, EOS, cancellation and prefix restore. Resident versus streamed packs, quantization, KV/GDN modes and hardware need separate measurements; no price file should be imported as a measured price for a different configuration.
+
+Only mechanical application and static compatibility were checked. No Sushi build, tests or inference were run; no existing checkout, default index or running Sushi service was changed. Running Sushi as an out-of-process guest under mlx-serve does not automatically execute the host's modified generator.

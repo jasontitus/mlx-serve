@@ -745,11 +745,11 @@ fn replaceLog(guard: *const StoreGuard, identity: [32]u8, tokens: []const u32, c
 
 /// Request-owned writable or read-only view. All opens hold an exclusive
 /// stable-file lock until deinit. `index` and `tokens` borrow this object's data.
+/// A successful final append retires this view; only deinit is then permitted.
 /// On append error the old document set survives, or `usable` becomes false.
 pub const PersistentStore = struct {
     allocator: Allocator,
     read_only: bool,
-    max_order: u32 = default_order,
     tokens: []const u32,
     index: Corpus,
     guard: StoreGuard,
@@ -806,10 +806,15 @@ pub const PersistentStore = struct {
         self.* = undefined;
     }
 
-    pub fn appendTurn(self: *PersistentStore, ids: []const u32) !void {
+    /// Publish the final document without building an index that teardown would
+    /// immediately discard. Borrowed snapshot storage and the lock live to deinit.
+    pub fn appendFinalTurn(self: *PersistentStore, ids: []const u32) !void {
         if (self.read_only) return error.ReadOnly;
         try self.validate();
-        if (ids.len == 0) return;
+        if (ids.len == 0) {
+            self.usable = false;
+            return;
+        }
         if (ids.len >= persistent_capacity) return error.DocumentTooLarge;
         for (ids) |token| if (token >= separator) return error.InvalidToken;
         const document_size = ids.len + 1;
@@ -818,19 +823,16 @@ pub const PersistentStore = struct {
             while (self.tokens[discard] != separator) discard += 1;
             discard += 1;
         }
-        const retained = self.tokens[discard..];
-        const combined = try self.allocator.alloc(u32, retained.len + document_size);
-        @memcpy(combined[0..retained.len], retained);
-        @memcpy(combined[retained.len..][0..ids.len], ids);
-        combined[combined.len - 1] = separator;
-        var next_index = Corpus.fromOwnedTokens(self.allocator, combined, self.max_order) catch |err| {
-            self.allocator.free(combined);
-            return err;
-        };
-        errdefer next_index.deinit();
-        // Every allocation and index construction precedes the first disk write.
         const io = self.guard.io;
         if (discard != 0) {
+            const retained = self.tokens[discard..];
+            const combined = try self.allocator.alloc(u32, retained.len + document_size);
+            defer self.allocator.free(combined);
+            @memcpy(combined[0..retained.len], retained);
+            @memcpy(combined[retained.len..][0..ids.len], ids);
+            combined[combined.len - 1] = separator;
+            // Prepare replacement bytes before any disk mutation, but never
+            // allocate/sort positions for a view that cannot be queried again.
             var committed = false;
             const new_file = replaceLog(&self.guard, self.identity, combined, &committed) catch |err| {
                 if (committed) self.usable = false;
@@ -860,9 +862,7 @@ pub const PersistentStore = struct {
             self.usable = false;
             return err;
         });
-        self.index.deinit();
-        self.index = next_index;
-        self.tokens = self.index.tokens;
+        self.usable = false;
     }
 
     fn appendBytes(self: *PersistentStore, ids: []const u32, offset: u64) !void {
@@ -1264,7 +1264,7 @@ test "read-only store preserves bytes metadata and never creates absent paths" {
     {
         var writer = try PersistentStore.open(io, a, path, identity);
         defer writer.deinit();
-        try writer.appendTurn(&.{ 81, 82, 83 });
+        try writer.appendFinalTurn(&.{ 81, 82, 83 });
     }
     const before = try fileStamp(tmp.dir, io, "tokens.bin");
     const lock_before = try fileStamp(tmp.dir, io, "store.lock");
@@ -1275,7 +1275,7 @@ test "read-only store preserves bytes metadata and never creates absent paths" {
         defer reader.deinit();
         try std.testing.expect(reader.read_only);
         try std.testing.expectEqualSlices(u32, &.{ 81, 82, 83, separator }, reader.tokens);
-        try std.testing.expectError(error.ReadOnly, reader.appendTurn(&.{84}));
+        try std.testing.expectError(error.ReadOnly, reader.appendFinalTurn(&.{84}));
         try std.testing.expectError(error.StoreBusy, PersistentStore.open(io, a, path, identity));
     }
     try std.testing.expect(Stamp.eql(before, try fileStamp(tmp.dir, io, "tokens.bin")));
@@ -1300,7 +1300,7 @@ test "persistent cache releases locks between requests and invalidates on append
     {
         var writer = try PersistentStore.open(io, a, path, identity);
         defer writer.deinit();
-        try writer.appendTurn(&.{ 101, 102 });
+        try writer.appendFinalTurn(&.{ 101, 102 });
     }
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
@@ -1317,7 +1317,7 @@ test "persistent cache releases locks between requests and invalidates on append
     {
         var writer = try PersistentStore.open(io, a, path, identity);
         defer writer.deinit();
-        try writer.appendTurn(&.{ 103, 104 });
+        try writer.appendFinalTurn(&.{ 103, 104 });
     }
     var changed = try cache.acquirePersistent(io, path, identity);
     try std.testing.expect(!changed.cache_hit);
@@ -1370,6 +1370,60 @@ const TestPartialWrite = struct {
     }
 };
 
+test "final append preserves borrowed history without requiring index allocation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    const identity: [32]u8 = @splat(0x61);
+    {
+        var initial = try PersistentStore.open(io, a, path, identity);
+        defer initial.deinit();
+        try initial.appendFinalTurn(&.{ 121, 122 });
+    }
+    {
+        var store = try PersistentStore.open(io, a, path, identity);
+        defer store.deinit();
+        const borrowed = store.tokens[0..2];
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        store.allocator = failing.allocator();
+        try store.appendFinalTurn(borrowed);
+        try std.testing.expectEqualSlices(u32, &.{ 121, 122 }, borrowed);
+        try std.testing.expectError(error.StoreUnusable, store.validate());
+        try std.testing.expectError(error.StoreUnusable, store.appendFinalTurn(&.{123}));
+        try std.testing.expectError(error.StoreBusy, PersistentStore.openReadOnly(io, a, path, identity));
+    }
+    var reopened = try PersistentStore.openReadOnly(io, a, path, identity);
+    defer reopened.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 121, 122, separator, 121, 122, separator }, reopened.tokens);
+}
+
+test "invalid final document preserves the snapshot and empty final document retires it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    const identity: [32]u8 = @splat(0x62);
+    {
+        var store = try PersistentStore.open(io, a, path, identity);
+        defer store.deinit();
+        const before = store.file_stamp;
+        try std.testing.expectError(error.InvalidToken, store.appendFinalTurn(&.{separator}));
+        try store.validate();
+        try std.testing.expect(Stamp.eql(before, try fileStamp(tmp.dir, io, "tokens.bin")));
+        try store.appendFinalTurn(&.{});
+        try std.testing.expectError(error.StoreUnusable, store.validate());
+        try std.testing.expect(Stamp.eql(before, try fileStamp(tmp.dir, io, "tokens.bin")));
+    }
+    var reopened = try PersistentStore.openReadOnly(io, a, path, identity);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reopened.tokens.len);
+}
+
 test "partial append rolls back on IO failure and preserves the prior index" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1378,9 +1432,13 @@ test "partial append rolls back on IO failure and preserves the prior index" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x63);
+    {
+        var initial = try PersistentStore.open(io, a, path, identity);
+        defer initial.deinit();
+        try initial.appendFinalTurn(&.{ 131, 132 });
+    }
     var store = try PersistentStore.open(io, a, path, identity);
     defer store.deinit();
-    try store.appendTurn(&.{ 131, 132 });
     const old_bytes = try readBounded(tmp.dir, io, a, "tokens.bin", 1024);
     defer a.free(old_bytes);
     const old_positions = store.index.positions.ptr;
@@ -1388,7 +1446,7 @@ test "partial append rolls back on IO failure and preserves the prior index" {
     vtable.fileWritePositional = TestPartialWrite.write;
     TestPartialWrite.calls = 0;
     store.guard.io = .{ .userdata = io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.NoSpaceLeft, store.appendTurn(&.{ 141, 142, 143 }));
+    try std.testing.expectError(error.NoSpaceLeft, store.appendFinalTurn(&.{ 141, 142, 143 }));
     store.guard.io = io;
     try std.testing.expect(store.usable);
     try std.testing.expectEqual(old_positions, store.index.positions.ptr);
@@ -1396,7 +1454,7 @@ test "partial append rolls back on IO failure and preserves the prior index" {
     const actual = try readBounded(tmp.dir, io, a, "tokens.bin", 1024);
     defer a.free(actual);
     try std.testing.expectEqualSlices(u8, old_bytes, actual);
-    try store.appendTurn(&.{151});
+    try store.appendFinalTurn(&.{151});
 }
 
 test "failed rollback retires a store rather than serving uncertain data" {
@@ -1414,10 +1472,10 @@ test "failed rollback retires a store rather than serving uncertain data" {
     vtable.fileSetLength = Io.failingFileSetLength;
     TestPartialWrite.calls = 0;
     store.guard.io = .{ .userdata = io.userdata, .vtable = &vtable };
-    try std.testing.expectError(error.RollbackFailed, store.appendTurn(&.{ 161, 162 }));
+    try std.testing.expectError(error.RollbackFailed, store.appendFinalTurn(&.{ 161, 162 }));
     store.guard.io = io;
     try std.testing.expect(!store.usable);
-    try std.testing.expectError(error.StoreUnusable, store.appendTurn(&.{163}));
+    try std.testing.expectError(error.StoreUnusable, store.appendFinalTurn(&.{163}));
 }
 
 test "atomic trim discards whole oldest documents and keeps the stable lock" {
@@ -1428,25 +1486,36 @@ test "atomic trim discards whole oldest documents and keeps the stable lock" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x7f);
-    var store = try PersistentStore.open(io, a, path, identity);
-    defer store.deinit();
     const document = try a.alloc(u32, persistent_capacity / 2 - 1);
     defer a.free(document);
-    @memset(document, 171);
-    try store.appendTurn(document);
-    @memset(document, 172);
-    try store.appendTurn(document);
+    for ([_]u32{ 171, 172 }) |token| {
+        @memset(document, token);
+        var writer = try PersistentStore.open(io, a, path, identity);
+        defer writer.deinit();
+        try writer.appendFinalTurn(document);
+    }
+    var store = try PersistentStore.open(io, a, path, identity);
+    defer store.deinit();
     const old_inode = store.file_stamp.inode;
     const lock_inode = store.guard.lock_stamp.inode;
-    try store.appendTurn(&.{ 181, 182, 183 });
-    try std.testing.expect(store.tokens.len <= persistent_capacity);
-    try std.testing.expectEqual(@as(u32, 172), store.tokens[0]);
-    try std.testing.expectEqualSlices(u32, &.{ 181, 182, 183, separator }, store.tokens[store.tokens.len - 4..]);
-    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(store.tokens, true));
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    store.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, store.appendFinalTurn(&.{ 181, 182, 183 }));
+    store.allocator = a;
+    try store.validate();
+    try std.testing.expectEqual(@as(u32, 171), store.tokens[0]);
+    try store.appendFinalTurn(&.{ 181, 182, 183 });
+    try std.testing.expectError(error.StoreUnusable, store.validate());
+    // Inspect durable contents through the held guard, not the retired snapshot.
+    var stored = try loadPersistent(&store.guard, a, identity);
+    defer stored.deinit();
+    try std.testing.expect(stored.tokens.len <= persistent_capacity);
+    try std.testing.expectEqual(@as(u32, 172), stored.tokens[0]);
+    try std.testing.expectEqualSlices(u32, &.{ 181, 182, 183, separator }, stored.tokens[stored.tokens.len - 4..]);
+    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(stored.tokens, true));
     try std.testing.expect(store.file_stamp.inode != old_inode);
     try std.testing.expectEqual(lock_inode, (try fileStamp(tmp.dir, io, "store.lock")).inode);
     try std.testing.expectError(error.StoreBusy, PersistentStore.openReadOnly(io, a, path, identity));
-    try store.validate();
 }
 
 test "corpus optional counts and file fingerprints follow host metadata" {
@@ -1489,7 +1558,7 @@ test "changed file under a persistent lease is rejected and rebuilt next time" {
     {
         var writer = try PersistentStore.open(io, a, path, identity);
         defer writer.deinit();
-        try writer.appendTurn(&.{ 211, 212 });
+        try writer.appendFinalTurn(&.{ 211, 212 });
     }
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
@@ -1520,7 +1589,7 @@ test "read failure during cache refresh keeps the old allocation safe" {
     {
         var writer = try PersistentStore.open(io, a, path, identity);
         defer writer.deinit();
-        try writer.appendTurn(&.{ 221, 222 });
+        try writer.appendFinalTurn(&.{ 221, 222 });
     }
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
@@ -1621,7 +1690,7 @@ test "writable recovery removes abandoned replacement without changing committed
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(path);
     var original = try PersistentStore.open(io, a, path, @splat(5));
-    try original.appendTurn(&.{ 17, 19, 23 });
+    try original.appendFinalTurn(&.{ 17, 19, 23 });
     original.deinit();
     try testWrite(tmp.dir, pending_log, "interrupted replacement");
     var reader = try PersistentStore.openReadOnly(io, a, path, @splat(5));

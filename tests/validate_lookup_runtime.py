@@ -225,7 +225,7 @@ def storage_gates(args, binary, model, fixture, out, identity):
             offset = server.log_path.stat().st_size
             failed_append = pool.submit(bench.request, server, long_body, args.request_timeout)
             wait_live_round(server, offset, failed_append)
-            # Private deliberate log-length mismatch: appendTurn must refuse before publishing a turn.
+            # Private log-length mismatch: final append must refuse before persisting a turn.
             with path.open("ab") as handle:
                 handle.write(b"\x00")
                 handle.flush()

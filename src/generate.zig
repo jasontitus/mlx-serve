@@ -4835,7 +4835,7 @@ pub const Generator = struct {
         try document.ensureTotalCapacity(allocator, self.prompt_ids_owned.len + self.outputIds().len);
         document.appendSliceAssumeCapacity(self.prompt_ids_owned);
         document.appendSliceAssumeCapacity(self.outputIds());
-        try store.appendTurn(document.items);
+        try store.appendFinalTurn(document.items);
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
@@ -4862,13 +4862,24 @@ pub const Generator = struct {
         }
         // Capture only committed tokens, before releasing either prompt or generated storage.
         if (self.lookup_tiers) |*lr| {
-            if (if (lookupStoreWrites()) lr.persistent else null) |store| {
-                self.persistLookupTurn(allocator, store) catch |err| {
+            // SSE completion can precede this work. Measure append plus history
+            // teardown, not the rest of generator/slot cleanup or observer waits.
+            const finalize_watch = if (lookupPublicationsEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
+            const write_requested = lookupStoreWrites() and lr.persistent != null;
+            var write_succeeded = false;
+            if (write_requested) {
+                const store = lr.persistent.?;
+                if (self.persistLookupTurn(allocator, store)) |_| {
+                    write_succeeded = true;
+                } else |err| {
                     log.warn("[lookup] saving committed tokens failed: {s}\n", .{@errorName(err)});
-                };
+                }
             }
             lr.deinit();
             self.lookup_tiers = null;
+            if (finalize_watch) |watch| log.info("[lookup-finalize] {{\"version\":1,\"write_requested\":{any},\"write_succeeded\":{any},\"elapsed_ns\":{d}}}\n", .{
+                write_requested, write_succeeded, watch.read(),
+            });
         }
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
@@ -26572,8 +26583,6 @@ test "lookup publication excludes an internally committed cancelled tail from du
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    var store = try token_history.PersistentStore.open(io, a, path, @splat(1));
-    defer store.deinit();
     const prompt = [_]u32{ 1, 2 };
     const published = [_]u32{ 10, 11, 12 };
     var gen: Generator = undefined;
@@ -26598,8 +26607,14 @@ test "lookup publication excludes an internally committed cancelled tail from du
     try testing.expectEqualStrings("published", receipt.commit_scope);
     try testing.expect(gen.takePublishedLookupReceipt(published.len) == null);
     try testing.expectEqualStrings("cancelled", gen.outputFinishReason());
-    try gen.persistLookupTurn(a, &store);
-    try testing.expectEqualSlices(u32, &.{ 1, 2, 10, 11, 12, token_history.separator }, store.tokens);
+    {
+        var store = try token_history.PersistentStore.open(io, a, path, @splat(1));
+        defer store.deinit();
+        try gen.persistLookupTurn(a, &store);
+    }
+    var reopened = try token_history.PersistentStore.openReadOnly(io, a, path, @splat(1));
+    defer reopened.deinit();
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 10, 11, 12, token_history.separator }, reopened.tokens);
 }
 
 test "lookup MTP preparation cold closes P and opens V at one timestamp" {

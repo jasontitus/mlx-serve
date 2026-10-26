@@ -2,9 +2,9 @@
 
 ## Latest status and evidence boundary
 
-The v14 adjacent ABBA/BAAB cohorts observed full-request improvements for both drafter families with exact serial-output agreement. Later isolated comparisons found an incremental DFlash2 width-policy benefit, but broader MTP coding and standalone PLD backoff remain mixed or flat. These cohorts fail unchanged-system-swap qualification; no default promotion or universal speedup is claimed. See the [MTP results](#adjacent-mtp-abbabaab-confirmation-v14), [DFlash results](#adjacent-dflash-abbabaab-confirmation-v14), and subsequent versioned experiments below. Earlier failed and diagnostic cohorts remain historical evidence.
+The latest v30 live-history cohorts show substantial observed repeated-workload gains: combined writable features versus native improve **MTP +28.31% / DFlash2 +6.13%** overall; holding adaptive settings fixed, writable versus empty read-only history improves **+32.24% / +7.84%**. Each contrast completed 136 serial-exact responses. First-use regressions remain, and every cohort fails unchanged-system-swap qualification. These are different contrasts, not additive gains or universal/default-promotion claims. See [native-relative live history](#live-completed-response-reuse-mtp-and-dflash2), [isolated MTP history](#isolated-net-live-history-value-mtp), [isolated DFlash2 history](#isolated-net-live-history-value-dflash2), and the [executed regression diagnostic](#executed-mtp-trajectories-admission-delay-not-a-proven-missing-incumbent). Earlier failed and diagnostic cohorts remain historical evidence. No current-build standard llmprobe performance claim is established.
 
-- **v14 binary:** `c83e0cd6f4af08ad6fedd26beb040b91c66199280c48bb5a4ff955f300bb7350`; later sections identify their own binaries.
+- **v30 measured binary:** `81911662b8213edbbc624d196615c4f188b2607e7c4cda1ba1c431cc4f34dcb1`; other sections identify their own binaries.
 - Target: `ddalcu/Qwen3.8-27B-MLX-Serve-4bit`; assistant: `incoai/Qwen3.8-27B-DFlash2`.
 - Every native/feature arm uses explicit **row-exact numerical mode**. These are numerical-mode-controlled references, not unchanged fastest defaults.
 - Each section identifies its measured binary and protocol, not subsequent edits. Full receipt-enabled MTP diagnostics can additionally settle native GPU work before successor resolution; these are not instrumentation-free throughput measurements. Native-depth traces themselves perform no GPU evaluation/readback, but their CPU/I/O cost can enter later wall-clock prices.
@@ -1073,3 +1073,169 @@ These are descriptive sums of the two observations per mode in matched cells, no
 **Decision:** no evidence here supports a large universal exact-mode penalty hiding an otherwise strong adaptive-policy win. DFlash's observed 3.41% cost increases the production hurdle; MTP's work-policy changes and one stock output divergence forbid treating mode removal as a free optimization. Preserve correctness controls and pursue actual useful work per verification rather than weakening the oracle. The frozen plan's top-level family/numerical-mode fields are inherited source metadata; the mixed diagnostic is defined by its schedule and actual per-boot/per-request activation records. Native boots use empty stores and no corpus despite retained seed provenance metadata.
 
 Adversarial review found no lifecycle, ownership, receipt-validation or hidden-treatment defect. This runtime exercise also validates the publication-only validator fix on real native DFlash execution. Evidence root: `runs/independent-v29-native-arithmetic-diagnostic`.
+
+### Next optimization decision: live history versus fresh-miss tuning
+
+For the completed v28 fresh-first population, gross lookup time is 429.86 ms/request. Applying each selected action's logged native milliseconds/token estimate to its actual committed-token count gives a **136.25-ms/request native-equivalent estimate**, leaving approximately **293.62 ms/request** of modeled difference across an 11.22-second mean request. The two upper learning misses contribute 211.02 ms and ordinary lookups 82.60 ms to that difference. This is a historical-rate estimate, **not an executed same-state counterfactual, strict savings bound or measured speedup**; transition costs and subsequent trajectories can change. It does not justify assigning the whole gross lookup interval to removable overhead or adding a second recovery surcharge.
+
+The current coding cohorts freeze per-boot history and disable writes. Their “repeat” exposure therefore does **not** append the preceding answer to the persistent suffix store. Those cohorts remain valid frozen-history transfer tests, but do not answer the live completed-response reuse question. A separate prospective writable-history protocol is being implemented with fresh stores per boot, exact publication-derived append checks, cold/repeat reporting and storage growth. Native versus writable combined features and read-only versus writable combined features must remain distinct contrasts; neither isolates StairCut alone. Prefix/KV cache settings and append/service-completion timing must be explicit.
+
+The independently reviewed PLE CLI protocol has now been freshly declared against the current shared helper source and launched as `runs/independent-v25-ple-cli-assistant-python-current-abba`. The earlier unexecuted declaration is not silently updated after helper changes. This first complete-format cohort is intended to close the cache-only end-to-end question; it does not relax hardware qualification or promise a speedup.
+
+## Completed PLE CLI cache-only cohort
+
+`runs/independent-v25-ple-cli-assistant-python-current-abba` completed **32 exact publications**, four alternating ABBA/BAAB quartets, with no fatal errors. Both complete tasks passed the prospective response-format/structure gate: 59 generated tokens for repeated lines and 165 for the related edit. The primary metric is tokens divided by the CLI's printed decode rate, **not HTTP latency or load-inclusive process wall time**.
+
+| Workload | Cache-on decode throughput change | 95% quartet interval |
+|---|---:|---:|
+| Both complete tasks pooled | +0.28% | −0.34% to +0.98% |
+| Repeated lines | +1.31% | +0.25% to +2.36% |
+| Related coding edit | −0.09% | −0.56% to +0.48% |
+
+Swap usage, swap-ins and swap-outs fail hardware qualification. The pooled interval includes no improvement; neither case meets the declared 5% practical margin. This does **not** establish a full-inference cache speedup. It closes this cohort's end-to-end hypothesis without changing its gates or enlarging the cache.
+
+The cache is genuinely active: every enabled repeated-lines process reports 840 hits / 152 misses; every enabled related-edit process reports 353 hits / 2,335 misses. Those are **table-lifetime counters, including startup/calibration**, not measured-decode hit rates. Related-edit pool rounds fall by eight in each corresponding lifecycle regime (252→244 or 188→180); this is substantially less avoided work than the repeated-lines reductions of 91→39 or 82→30. The earlier +19–28% narrow-gather component results cannot be substituted for these full-decode observations.
+
+Incremental decoded payload remains **655,360 bytes (640 KiB)**, with **8,480 bytes of metadata in both arms**; no extra disk table or workers. Printed MLX allocator peaks are approximately 45.914 GiB for repeated lines and 46.177 GiB for the edit; their three-decimal rounding and scope cannot resolve or attribute the cache's sub-MiB host allocation.
+
+## Terminal persistent-history append optimization
+
+Writable production history previously constructed a complete new sorted index as part of its final append, before the first disk write, then immediately destroyed it during generator teardown. The next request reopens the file and constructs its own index. The terminal `appendFinalTurn()` operation removes that unused rebuild. Ordinary append writes existing input directly, with no combined-history or positions allocation; eviction prepares only replacement token bytes. Success retires the view while keeping borrowed storage and the exclusive lock alive until `deinit()`. Validation failures and successful rollback retain a usable old snapshot; uncertain durable state retires it.
+
+The obsolete nonterminal append API and its production caller are migrated, not retained as a shim. Tests that model successive requests now reopen between successful turns. The generator publication test reads durable history after reopening and continues to exclude unpublished tails.
+
+**22 token-history tests passed**, including borrowed inputs, no-eviction append under allocation failure, invalid/empty final input, rollback, whole-document trimming and allocation failure before trim. A CPU/filesystem experiment compared the old implementation at `e465fa37` with the terminal implementation using complete published documents from the native arithmetic diagnostic. Each size has four alternating ABBA/BAAB quartets, eight observations per arm; all **64 durable byte sequences match exactly**.
+
+| Existing history token slots | Old append mean | Terminal append mean | Append latency reduction | Open/append/close latency reduction |
+|---|---:|---:|---:|---:|
+| 0 | 0.070 ms | 0.041 ms | 40.75% | 16.50% |
+| 7,979 | 1.043 ms | 0.057 ms | 94.57% | 47.74% |
+| 65,458 | 7.757 ms | 0.055 ms | 99.29% | 50.01% |
+| 261,920, requiring eviction | 34.609 ms | 0.895 ms | 97.41% | 50.16% |
+
+Each appended document contains 457 tokens plus a separator. These are **host persistence-component measurements with initialized filesystem caches**, not GPU decoding or request-throughput gains. No inference or build ran concurrently with this experiment. At 65,458 existing slots, append's measured cumulative allocation falls **527,328→0 bytes**; the eviction case falls **2,096,344→1,048,172 bytes**. These are allocated bytes during the operation, not peak RSS. Retained store format, capacity and disk payload are unchanged. Private numeric evidence: `history-append-observed-v30.json`.
+
+The opt-in publication diagnostics now also emit `[lookup-finalize]` after append and `LookupRound.deinit()`. Its timer measures **production lookup finalization**, including the document buffer and history destruction; it excludes earlier publication logging, scheduling delay and the rest of generator/slot cleanup. HTTP/SSE completion can precede this work. The writable benchmark reports HTTP latency, this production component time and observer-fence timing separately—not their sum as an invented full-request duration. The rebuilt executable exercised this receipt and exact durable publication in both completed live-history cohorts below.
+
+## Live completed-response reuse: MTP and DFlash2
+
+The v30 executable (`81911662b8213edbbc624d196615c4f188b2607e7c4cda1ba1c431cc4f34dcb1`) completed separate native-versus-adaptive-writable cohorts for MTP and **incoai DFlash2**. Private roots are `runs/independent-v30-mtp-writable-history-abba` and `runs/independent-v30-dflash-writable-history-abba`. Each contains four alternating ABBA/BAAB quartets and a serial reference: **136 exact responses per backend**, 128 timed and eight reference responses, with no fatal or publication errors. Each boot starts with an empty history; the four complete coding cases run first/repeat in the original order, with no discarded warmup requests. Both arms use the same frozen executable, row-exact arithmetic and disabled prefix/KV caching.
+
+Unlike the earlier frozen-history cohorts, each completed adaptive request publishes its actual prompt and authoritative output to the production store. Its immediate repeat can reuse that response. This is a favorable, intentional repeated-workload scenario, not an unseen-task generalization test. Only the first fresh-code request is globally empty-history; later cases' first exposures see earlier documents.
+
+| Backend | Exposure | HTTP/SSE throughput change | 95% quartet interval |
+|---|---|---:|---:|
+| MTP | All requests | **+28.31%** | +25.60% to +30.53% |
+| MTP | First exposures | −3.06% | −5.85% to −0.86% |
+| MTP | Immediate repeats | **+88.62%** | +86.93% to +90.31% |
+| DFlash2 | All requests | **+6.13%** | +5.30% to +6.76% |
+| DFlash2 | First exposures | −1.61% | −2.35% to −0.86% |
+| DFlash2 | Immediate repeats | **+14.80%** | +13.03% to +16.33% |
+
+These are geometric means of quartet throughput ratios, not percentages of latency saved. Every overall quartet favors the writable feature in both cohorts. **Swap usage and swap-ins changed in both runs**, so these are observed, hardware-unqualified workload gains; the qualification and promotion gates remain false. Neither result isolates StairCut, persistent storage alone or the fastest stock configuration.
+
+Hardware is not the only promotion concern. Applying the existing five-percent latency-regression allowance to each case/exposure/quartet would fail **five of 32 MTP cells** (fresh-first quartet 0, edit-first 0/2/3, completion-first 0) and **two of 32 DFlash2 cells** (fresh-first 0/1). Their latency increases range 5.50–10.21% for MTP and 9.11–9.53% for DFlash2. These diagnostic cohorts do not promote themselves; a positive aggregate cannot erase those first-use losses.
+
+| Coding case | MTP first | MTP repeat | DFlash2 first | DFlash2 repeat |
+|---|---:|---:|---:|---:|
+| Fresh generation | −3.06% | +135.78% | −5.05% | +24.12% |
+| Related helper | −0.35% | +127.36% | −3.28% | +23.93% |
+| Related edit | −6.32% | +33.60% | +1.45% | +3.67% |
+| Related completion | −2.82% | +75.39% | +0.70% | +10.00% |
+
+Executed work supports the reuse benefit without identifying selected source origins: MTP fresh-repeat lookup acceptance is **1,461/1,461 drafts**, with head rounds falling 624→62 across eight requests. DFlash2 repeat verification attempts fall 280→223 for fresh code, 240→185 for the helper, 216→199 for the edit and 144→128 for completion, with identical publications. Commit-only diagnostics do not prove which rounds selected persistent rather than local history, or price unexecuted alternatives.
+
+The first-edit MTP regression is also real executed work: native versus feature totals are **312→331 rounds**, **952→1,316 lookup drafts**, and **824→783 accepted lookup drafts**, for the same 1,568 published tokens. All four first-edit quartet ratios regress. Static review finds that tiered MTP currently bypasses the native prompt-copy gate and compares against head economics; exact intermediate-width coverage is another limitation. Neither aggregate counts nor the fourteen-draft mean establish which alternative would win at the same prefix. The next diagnostic must preserve native action identity, proposal membership, preparation and exact-width price provenance before changing admission. A blanket cap reduction would risk the productive repeat copies.
+
+### Persistence timing and incremental resources
+
+HTTP/SSE totals across 64 requests per arm are 560.772→437.045 seconds for MTP and 343.799→323.939 seconds for DFlash2. The separately observed request-through-store-snapshot envelope gives **+28.14%** and **+5.88%** respectively using quartet-geometric ratios; it includes observer overhead and is not pure production slot latency. Scoped production lookup finalization totals **12.612 ms for MTP** and **11.688 ms for DFlash2**, approximately **0.197 and 0.183 ms/request**. Native finalization is unmeasured (`null`), not zero.
+
+Every feature boot ends with **eight documents / 2,750 token slots**, including document separators: **11,040 logical file bytes**, **12,288 allocated file bytes**, versus no native store. The feature's initial header occupies 40 logical / 4,096 allocated bytes, so within-feature growth is 11,000 logical / 8,192 allocated bytes. Allocated APFS bytes exclude directories and are not exclusive physical extents or device-write traffic. These sizes describe this small workload, not the configured capacity.
+
+| End-of-boot mean across eight processes | MTP native | MTP writable | DFlash2 native | DFlash2 writable |
+|---|---:|---:|---:|---:|
+| Process physical footprint, MiB | 17,422.45 | 17,892.07 | 18,632.90 | 18,611.93 |
+| MLX active, MiB | 17,005.42 | 17,005.42 | 18,239.32 | 18,239.32 |
+| MLX reclaimable cache, MiB | 109.14 | 256.17 | 141.01 | 124.29 |
+| MLX lifetime peak, MiB | 18,304.12 | 18,503.44 | 18,638.03 | 18,637.43 |
+
+These are matched post-fence endpoints, **not allocator-quiescent samples or intrinsic lookup-memory bounds**. MTP's observed +469.61-MiB footprint includes retention and process variability; DFlash2's −20.97-MiB difference is not evidence that adding lookup intrinsically saves memory. MLX counters overlap process footprint and must not be added to it. Writable requests rebuild their changed-history index at opening; terminal append avoids only the redundant teardown rebuild.
+
+To isolate the incremental value and cost of live history, the next declared comparison holds adaptive features fixed and compares empty read-only history with writable history. Its result must remain separate from these native-versus-combined contrasts and the older frozen-history transfer experiments.
+
+## Isolated net live-history value: MTP
+
+`runs/independent-v30-mtp-history-increment-abba` holds the v30 adaptive controls fixed and compares an initially empty **read-only** store with an initially empty **writable** store. It completed **136 serial-exact responses**, four alternating quartets plus serial references, with no observation errors. This isolates the net live-history configuration—including changed-history index reopening and publication versus cached read-only lifecycle—not just a retrieval kernel or disk-write operation.
+
+| Exposure | Writable versus read-only throughput change | 95% quartet interval |
+|---|---:|---:|
+| All requests | **+32.24%** | +30.77% to +33.82% |
+| First exposures | −0.50% | −1.65% to +0.68% |
+| Immediate repeats | **+95.64%** | +93.93% to +97.74% |
+
+| Coding case | First exposure | Immediate repeat |
+|---|---:|---:|
+| Fresh generation | +0.25% | +144.64% |
+| Related helper | +1.54% | +138.59% |
+| Related edit | −3.15% | +38.44% |
+| Related completion | −1.25% | +79.23% |
+
+Read-only/writable HTTP totals are **588.516/444.832 seconds**, with separate request-through-snapshot totals **590.578/446.956 seconds**. Lookup finalization averages **0.014/0.200 ms/request**. Those components are not additive estimates of full-slot latency. Swap usage and swap-ins again fail qualification; the positive complete-workload result remains descriptive. Do not multiply this ratio by the separate native-relative cohort to synthesize another comparison.
+
+This strengthens the attribution to **net live completed-response reuse under fixed adaptive settings**. It does not identify selected source origins, separate policy-state interactions from retrieval, or establish an isolated StairCut gain. The related-edit first exposure still regresses despite the fixed adaptive configuration; preceding-history availability and resulting decisions matter, not only the feature-versus-native dispatch boundary. DFlash2's corresponding history-increment comparison is separate.
+
+## Bounded MTP proposal-coverage diagnostic
+
+A private CPU diagnostic directly imported the production `mtp_lookup.Index` and `token_history.Drafter`, replaying exact published prefixes with the original chronological history. Its single filtered diagnostic passed. It examined 218 fresh-repeat prefixes with one prior document and 196 first-edit prefixes with four prior documents. Each query includes its anchor in context but indexes only earlier tokens; future output is used only to score proposals after construction.
+
+At **first-edit output position 110**, native latest-match backing is eight tokens. Its seven-token cap candidate matches all seven oracle tokens; the tiered modal fourteen-token offer matches zero. The native continuation is present in the raw vote tree, but only off the modal chain that MTP currently makes executable. Across 115 suffix-eligible edit prefixes, this is the sole native-cap coverage advantage; the tier modal offer accepts more at 23 prefixes. No accepted native prefix is absent from the raw tree. Fresh repeat has only one native suffix-eligible prefix, where the tier offer accepts more.
+
+This is an **executable-candidate gap witness**, not proof that the runtime visited that prefix, that the native gate admitted the copy, or that it would be faster. Native gate EMA/streak/cost state and actual selected widths are unavailable in this offline replay; terminal lengths are clipped to published output. There were no equal-coverage/fewer-row witnesses under these cap comparisons. The next bounded full-receipt run must join the witness to actual executed anchors before changing selection or acquiring new prices. Private evidence: `mtp-membership-observed-v30.json`; raw fixture tokens remain private.
+
+## Isolated net live-history value: DFlash2
+
+`runs/independent-v30-dflash-history-increment-abba` completed the corresponding **136 serial-exact responses** with fixed adaptive DFlash2 controls, initially empty read-only/writable stores, four alternating quartets and no observation errors.
+
+| Exposure | Writable versus read-only throughput change | 95% quartet interval |
+|---|---:|---:|
+| All requests | **+7.84%** | +6.55% to +9.52% |
+| First exposures | +0.77% | −1.38% to +4.45% |
+| Immediate repeats | **+15.67%** | +14.35% to +17.52% |
+
+| Coding case | First exposure | Immediate repeat |
+|---|---:|---:|
+| Fresh generation | +6.28% | +26.00% |
+| Related helper | −1.12% | +28.19% |
+| Related edit | −0.94% | +3.02% |
+| Related completion | −0.99% | +8.03% |
+
+The fresh-first point estimate must **not** be credited to retrieval: both histories are empty at that point, while verifier attempts change only 272→270 across eight requests. Its wide interval and timing-sensitive adaptive state are reasons not to attribute that observed difference to a particular mechanism. Repeat work reductions are clearer: attempts fall **276→224** for fresh code, **234→177** for the helper, **210→201** for the edit and **141→128** for completion, with unchanged publications.
+
+Read-only/writable HTTP totals are **387.007/358.867 seconds**; observer-inclusive request-through-snapshot totals are **389.122/361.111 seconds**. Scoped lookup finalization averages **0.011/0.213 ms/request**. Read-only history remains 40 logical / 4,096 allocated bytes; writable ends at 11,040 / 12,288 bytes. Mean endpoint process footprint differs by approximately **+2.46 MiB**, not an intrinsic allocation or peak-memory bound.
+
+Swap usage, swap-ins **and swap-outs** fail qualification. This is descriptive net live-history benefit, including differing storage/cache lifecycles and their policy interactions—not a clean-machine, isolated retrieval, StairCut or fastest-stock claim. Together with the MTP control it establishes useful live-history behavior in both exercised neural families; their percentages cannot be added to other contrasts.
+
+## Executed MTP trajectories: admission delay, not a proven missing incumbent
+
+`runs/independent-v30-mtp-full-trajectory` completed **12 exact, syntax-valid publications** with no validation errors: fresh generation, related helper and related edit, first/repeat, in one empty-read-only boot and one writable boot. Full diagnostics were enabled in both; original request bodies, chronological publication, finalizers, lock fences and store bytes were retained. Five offline boundary checks covered unique-anchor joins, differing acceptance, mismatched prefixes, duplicate anchors and invalid publication identities.
+
+**Neither executed edit trajectory visited output position 110.** The offline off-modal candidate witness therefore does not justify a native-incumbent production change. The earliest actual divergence is at **absolute anchor 273 / output position 12**, after four identical three-token native-head rounds:
+
+- Both arms query a local order-fourteen, confidence-one offer. Persistent indexes support order twelve, so they cannot directly alter this order-fourteen proposal through voting.
+- Read-only takes fourteen lookup drafts, accepts all fourteen and commits fifteen tokens.
+- Writable declines with `mtp_rate`, takes two head drafts, then admits and fully accepts fourteen lookup drafts at output fifteen.
+
+Readonly/writable edit-first execution totals are **39/42 rounds**, with **154/168 lookup drafts** and **104/96 accepted lookup drafts**. At output 109 the read-only arm again starts a successful copy three tokens earlier. Writable fresh repeat still accepts **182/182 lookup drafts** and uses eight head rounds versus read-only's 79.
+
+A separate interruption at writable output sixty is the existing **64-plan alternate native-depth challenge**: depth one is selected as an explicit trial. Its request-local depth-one cost is unknown, so admission conservatively retains that head instead of borrowing depth-two pricing. Copy rounds advance the model-wide planning counter even when they replace the head. This is a policy interaction, not evidence of an incorrect depth index or fabricated timing.
+
+The losing lookup alternative's economics are not retained by existing receipts: a rejected choice reports the fallback rate, not the rejected yield/price/preparation inputs. Selected records at different prefixes cannot distinguish calibration, request support and price-history effects at anchor 273. **Stop the unproved native-incumbent fix.** The next diagnostic captures bounded host admission inputs and replays the original decision before exchanging support and price blocks on disposable state. Unknown prices must stay unknown; a replayed decision flip is not evidence of a faster GPU action.
+
+Full tracing perturbs cost learning and trajectory. These observations describe the diagnostic execution, not a reconstruction of the earlier commit-only benchmark or a new throughput measurement.
+
+## Terminal-append final verification
+
+After the completed v30 cohorts, the obsolete, unused `PersistentStore.max_order` field was removed; persistent index construction retains its existing default order. **All 22 token-history tests passed again**. The lookup-filtered integrated test command and ReleaseFast build exited successfully. The resulting v31 executable is `ad4ad30e082c401420f9c3fd8db4d2ec2119081f8fba3900dc993eb73ca8e91f`.
+
+`runs/independent-v31-terminal-history-smoke` exercised the rebuilt executable with three full original coding requests: serial, writable first, writable repeat. **All three publications match exactly**, with no errors, successful finalizers, released production locks and exact durable history growth **0→1→2 documents**. This is an untimed runtime smoke, not a shortened benchmark or a new performance estimate. Adversarial review corrected the private smoke's source-plan provenance and collector cancellation ownership before execution; those findings were confirmed resolved.

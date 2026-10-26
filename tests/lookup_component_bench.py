@@ -516,8 +516,14 @@ def mechanism_evidence(plan, rows):
     for arm, members in comparison_groups(plan).items():
         spec = plan['arm_definitions'][members[0]]
         own = [row for row in rows if row['arm'] in members]
-        rounds = [receipt for row in own for receipt in s.published_rounds(row)]
-        cut = sum(receipt.get('selection') == 'cut' and receipt.get('rows', 0) < receipt.get('legal_rows', 0) for receipt in rounds)
+        rounds = [receipt for row in own for receipt in s.published_rounds(row)
+                  if receipt.get('commit_scope') == 'published']
+        reduced = {}
+        for receipt in rounds:
+            if receipt.get('rows', 0) < receipt.get('legal_rows', 0):
+                selection = receipt.get('selection', 'unknown')
+                reduced[selection] = reduced.get(selection, 0) + 1
+        forced_cut = reduced.get('cut', 0)
         accepted = sum(d.origin_evidence([receipt], 'neural')['accepted_origin_lower_bound'] for receipt in rounds)
         lookup_cells = []
         for row in own:
@@ -527,16 +533,26 @@ def mechanism_evidence(plan, rows):
                                         for span in transfer['accepted_span_matches']))
         miss_cells = [row.get('backoff_events', [])[-1] if row.get('backoff_events') else {}
                       for row in own if row['case'] == 'unrelated-prose']
-        backoff_active = (spec.get('backoff') is not True or
+        backoff_observed = any(row.get('backoff_events') and
+                               row['backoff_events'][-1].get('plain_tokens', 0) > 0 and
+                               row['backoff_events'][-1].get('misses', 0) > 0 for row in own)
+        backoff_pass = (spec.get('backoff') is not True or
             len(miss_cells) == plan['blocks'] * len(members) * 2 and
             all(cell.get('plain_tokens', 0) > 0 and cell.get('misses', 0) > 0 for cell in miss_cells))
-        result[arm] = {'published_neural_acceptance_lower_bound': accepted, 'cut_reduced_rounds': cut,
+        result[arm] = {'published_rounds': len(rounds),
+            'published_neural_acceptance_lower_bound': accepted,
+            'width_reduced_rounds': sum(reduced.values()),
+            'width_reduced_rounds_by_selection': reduced,
+            'forced_cut_reduced_rounds': forced_cut,
             'related_cell_persistent_training_output_lower_bounds': lookup_cells,
-            'source_activated': (True if spec['candidate_source'] == 'native' else
+            'source_requirement_pass': (True if spec['candidate_source'] == 'native' else
                 accepted > 0 if spec['candidate_source'] == 'neural' else
                 len(lookup_cells) == plan['blocks'] * len(members) * len(s.RELATED) * 2 and all(value > 0 for value in lookup_cells)),
-            'width_cut_activated': spec['family'] == 'pld' or spec['actual'] != 'cut' or cut > 0,
-            'backoff_activated': backoff_active, 'unrelated_prose_backoff_endpoints': miss_cells}
+            'width_cut_required': spec['family'] != 'pld' and spec['actual'] == 'cut',
+            'width_cut_requirement_pass': spec['family'] == 'pld' or spec['actual'] != 'cut' or forced_cut > 0,
+            'backoff_required': spec.get('backoff') is True,
+            'backoff_requirement_pass': backoff_pass, 'backoff_observed': backoff_observed,
+            'unrelated_prose_backoff_endpoints': miss_cells}
     return result
 
 
@@ -619,10 +635,10 @@ def summarize(out, plan, final=False, supervisor=None):
         baseline = mechanisms.get(effect['baseline'], {})
         effect['performance_pass'] = bool(complete and not measurement and effect['every_cell_block_within_5pct']
             and effect['full_workload'].get('verdict') == 'win'
-            and treatment.get('source_activated') and baseline.get('source_activated')
-            and treatment.get('width_cut_activated') and treatment.get('backoff_activated')
-            and baseline.get('backoff_activated'))
-    result = {'version': 2, 'component': plan['component'], 'family': plan['family'], 'config_hash': plan['hash'],
+            and treatment.get('source_requirement_pass') and baseline.get('source_requirement_pass')
+            and treatment.get('width_cut_requirement_pass') and treatment.get('backoff_requirement_pass')
+            and baseline.get('backoff_requirement_pass'))
+    result = {'version': 3, 'component': plan['component'], 'family': plan['family'], 'config_hash': plan['hash'],
         'complete': complete, 'samples': len(rows), 'expected_samples': plan['total_requests'],
         'invalid_samples': len(invalid), 'invalid': invalid, 'errors': errors, 'worker_failures': failures,
         'measurement_errors': measurement, 'speed_comparison_valid': complete and not measurement,

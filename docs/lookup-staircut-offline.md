@@ -132,23 +132,45 @@ Declare a new cohort **after rebuilding**:
 
 ```sh
 python3 tests/lookup_canonical_window.py --declare --unbounded \
-  --config "$kit/independent-canonical.json" --pairs 4 --isolation declared \
+  --config "$kit/independent-canonical.json" --quartets 4 --isolation declared \
   --seed "$kit/runs/20261025-transfer-training-literal"
 ```
 
-Execute one explicitly selected arm:
+Execute one physical slot at a time, in the config's frozen `schedule` order:
 
 ```sh
 python3 tests/lookup_canonical_window.py \
-  --config "$kit/independent-canonical.json" --mode mtp-legacy --pair 0 \
-  --output "$kit/runs/independent-canonical-mtp-0"
+  --config "$kit/independent-canonical.json" --slot 0 \
+  --output "$kit/runs/independent-canonical-slot-0"
 ```
 
-If complete, its separate replay uses `--source "$kit/runs/independent-canonical-mtp-0"` and a new output directory. Other declared arms are `dflash-legacy`, `mtp-persistent`, `dflash-persistent`. Follow the frozen forward/reverse order for all four pairs; aggregation verifies actual nonoverlapping measurement-boot timestamps. The driver never schedules the other arms automatically. CPU aggregation requires every declared measurement and replay slot. `--pairs 2` is diagnostic-only; `--isolation undeclared` cannot qualify performance claims.
+Each family has adjacent **A B B A / B A A B**, where A is its native `legacy` arm and B its adaptive `persistent` arm. Every letter is a fresh physical boot running the entire canonical workload, not a repeated request in one boot. Four quartets per family mean **32 measurement windows and 32 separate exact replays**. Quartets 0–3 use ABBA, BAAB, BAAB, ABBA; family precedence alternates MTP-first, DFlash-first, MTP-first, DFlash-first, crossing orientation with precedence. Slot IDs 0–31 are unique; repeated logical arms cannot overwrite each other. All eight boots in a quartet share the same client request/cache tag. The runner launches only the selected slot; it does not sweep automatically.
+
+After all measurement slots finish in schedule order, replay each complete slot separately (replays do not belong between the adjacent measurement boots):
+
+```sh
+python3 tests/lookup_canonical_window.py \
+  --config "$kit/independent-canonical.json" \
+  --source "$kit/runs/independent-canonical-slot-0" \
+  --output "$kit/runs/independent-canonical-replay-0"
+```
+
+Repeat explicitly for every frozen slot, then join all measurement and replay directories on CPU:
+
+```sh
+python3 tests/lookup_canonical_window.py \
+  --aggregate "$kit"/runs/independent-canonical-slot-* \
+              "$kit"/runs/independent-canonical-replay-* \
+  --output "$kit/runs/independent-canonical-aggregate"
+```
+
+Aggregation verifies real nonoverlapping boot timestamps rather than input path ordering, and requires nonoverlapping exact replays after all measurement slots. Missing, duplicate, reordered or mutated slots and replay/source identity mismatches cannot qualify. Replay plans bind the source plan, probe and client-report bytes; changed sources fail rather than being silently reused. `--quartets 2` is diagnostic-only; `--isolation undeclared` cannot qualify claims. Protocol version two and helper hashes reject historical `--pairs`/`--mode` plans/configs; never rewrite or upgrade historical evidence.
 
 The pinned protocol retains all 34 requests, three runs, literal rung `512`, fixed prefill, prefix, batching and drift subscenarios. Context is 16,384 to fit the client's fixed long prefill. It does not reduce output lengths or omit expensive scenarios. `--unbounded` removes the worker/process-group deadline and raises the full-probe hang safeguard to 3,600 seconds; bounded mode remains available explicitly by omitting that declaration flag.
 
-Defined sequential metric requests require exact token replay. Setup/batching diagnostics remain outside the sequential verifier's correctness contract. Predictable-copy, novel-prose and ordinary decode rates are compared separately against **both** native families. Four complete isolated balanced pairs, exact replay, stable machine/load evidence and a lower paired-block confidence bound above one can qualify **pointwise metric** claims. Full-workload regressions remain separately visible; no automatic promotion or blanket correctness claim follows. Missing hits cannot be credited as a lookup benefit. Executable, resolved non-system libraries, Metal assets and loading configuration are frozen and checked before/after runs and at aggregation.
+Defined sequential metric requests require exact token replay across both replicas of the native and adaptive arm **within each family quartet**. Setup/batching diagnostics remain outside the sequential verifier's correctness contract. Each metric contributes **one effect per complete family quartet**, and uncertainty resamples those quartet effects, never the physical boots, 34 requests or three within-client repeats. Latency uses arithmetic means of the two boot summaries (primary TTFT first averages its three client samples; context/prefix use the client's reported boot summaries). Throughput uses a **geometric estimate of the two reported boot rates**, not summed rates or a claim of pooled tokens divided by elapsed duration. The paired effect is adaptive/native for rates and native/adaptive for latency.
+
+Four complete isolated balanced quartets per family, exact replay, stable machine/load evidence and a lower quartet-bootstrap confidence bound above one can qualify **pointwise family-native/adaptive metric** claims. This adjacent schedule does **not** justify a drift-matched cross-family fastest-native comparison, so that comparison is explicitly unsupported, not relabeled as a family result. Physical observations, quartet membership and full-workload regressions remain visible. Four quartets still give limited uncertainty resolution and do not remove nonlinear drift, carryover or between-quartet dependence. No automatic promotion, overall-workload win or blanket correctness claim follows. Missing hits cannot be credited as a lookup benefit. Executable, resolved non-system libraries, Metal assets and loading configuration remain frozen and checked before/after runs and at aggregation.
 
 ## Storage, diagnostics and privacy
 

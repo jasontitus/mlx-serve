@@ -407,3 +407,55 @@ The denominator surrounds `record_sample()`, including setup, ownership checks, 
 Adversarial review caught an idle-gap calculation that omitted sample-window boundaries. Corrected `analysis-corrected.json` retains the originals, uses exact structured PIDs and includes leading/trailing gaps. First-window gaps are **348.093 ms native / 359.447 ms adaptive**; later-window largest gaps are **87–115 ms**, not the originally reported 3–8 ms inter-encoder gaps. Trace-envelope containment does not imply complete shader attribution: dominant target-kernel samples are missing from the native first configuration window. No first-window kernel-mixture or throughput claim is made.
 
 Raw traces and exported TOCs can include inherited environment credentials and remain private. These profiles support investigating useful committed yield versus matrix-verification cost; they do not justify arbitrary trust-estimator relaxation or establish a performance win.
+
+## Adjacent MTP ABBA/BAAB confirmation (v14)
+
+`runs/independent-v14-mtp-abba` completed **six quartets, 24 fresh boots and 192 full requests** in 1,243.23 seconds. There were zero invalid responses; an independent post-run comparison also matched all 192 complete publications and semantic response fields to the already completed current-binary serial oracle. The prior six-permutation v14 run was interrupted when ABBA was requested and remains unqualified; none of its samples entered this cohort.
+
+| Workload | First-exposure observed speed change | Repeat-exposure observed speed change |
+|---|---:|---:|
+| Related configuration | +95.58% | +73.93% |
+| Conflicting configuration | +57.95% | +57.02% |
+| Related code | +37.98% | +33.55% |
+| Unrelated prose | −0.18% | −0.15% |
+
+The geometric mean of the six complete-quartet native/adaptive latency ratios was **1.38096×: +38.10% reciprocal-latency speed, or 27.59% lower latency on that paired geometric basis**, with descriptive bootstrap interval **1.36646–1.39596×**. Individual quartet ratios ranged from **1.35673 to 1.40884×**. Every quartet's case/exposure paired totals passed the five-percent regression guard, and persistent-source activation passed for every required replica cell. Physical-boot timings remain in the summary; the interval uses six observations, not 192.
+
+**The strict unchanged-swap qualification gate still failed:** reported swap use increased by approximately 1.3 MB, swap-ins by 12 and swap-outs by 80. Usage bytes derive from rounded OS output. Request endpoints bracket the usage/out changes in one adaptive configuration window, and the swap-ins in two native windows and one adaptive prose window. These are system-wide changes, not proven server-owned paging, and they were not exclusively during startup. Performance and promotion verdicts remain false; no sample was dropped and no frozen gate was relaxed.
+
+Supported claim: **38.1% observed full-workload improvement in this ABBA run, consistently faster configuration/code reuse and essentially unchanged prose.** This is not a fully isolated hardware claim, A/A equivalence result, universal speedup or canonical-benchmark result. Fresh boots and ABBA do not prove independent hardware conditions across quartets. The earlier v10b prose failures remain historical evidence, not retrospectively corrected results.
+
+## Adjacent DFlash ABBA/BAAB confirmation (v14)
+
+`runs/independent-v14-dflash-abba` completed **six quartets, 24 fresh boots and 192 full requests** in 907.09 seconds. All 192 publications and semantic response fields matched the current-binary serial oracle. There were no invalid samples or execution/validation errors; measurement qualification failed on the unchanged-swap checks described below. Persistent-source activation passed for every required replica cell.
+
+| Workload | First-exposure observed speed change | Repeat-exposure observed speed change |
+|---|---:|---:|
+| Related configuration | +13.16% | +16.02% |
+| Conflicting configuration | +11.01% | +13.39% |
+| Related code | +4.42% | +1.55% |
+| Unrelated prose | +0.84% | +1.95% |
+
+The geometric mean of complete-quartet native/adaptive latency ratios was **1.07208×: +7.21% reciprocal-latency speed**, with descriptive bootstrap interval **1.05796–1.08485×**. All six quartet ratios exceeded one, ranging from **1.04200 to 1.09565×**; one fell below the five-percent practical improvement threshold. Every quartet's case/exposure paired totals passed the five-percent regression guard. Configuration gains cleared the practical threshold; code and prose did not establish a practical five-percent gain.
+
+**The unchanged-swap qualification gate failed here too:** reported swap use increased by approximately 0.34 MB, swap-ins by 152 and swap-outs by 20. Two request windows bracketed 148 swap-ins; usage and swap-out changes were outside the request endpoint windows. These counters are system-wide, not server attribution. Performance and promotion verdicts remain false; no samples or gates were changed.
+
+Together, these cohorts support observed native-to-adaptive improvements for both drafter families on the declared reuse workload, not a direct MTP-versus-DFlash ranking. They do not isolate StairCut, lookup backoff or learned embedding-table contributions. DFlash used fewer rows than the legal offer in **1,294 of 1,608 published adaptive rounds**. The historical summary's `cut_reduced_rounds = 0` counts only the explicitly forced `cut` selection, not adaptive selection; interpreting it as no pruning was incorrect. Activation does not establish pruning's individual performance contribution. Canonical benchmark and individual-mechanism claims remain unestablished.
+
+An adversarial reporting review found that the old `*_activated` flags also represented satisfied non-applicable requirements. Corrected mechanism analysis now separates observed counters from requirement-pass fields, explicitly filters published rounds, and records backoff as unobserved in these hybrid cohorts. The CPU-only `mechanisms-corrected.json` files retain the original summaries' hashes; no execution evidence, timing result or qualification verdict was overwritten.
+
+Descriptive DFlash round attribution also narrows the optimization target: related configuration needed **288 rather than 432 verification rounds** for the same 3,408 published tokens across 24 requests, with no assistant-free rounds in either arm. Adaptive execution split evenly between eight-row generic and sixteen-row linear-GDN verification. Conflicting configuration used 322 rather than 432 rounds for the same token count. These observations support useful merged suffix continuations, not a claim that skipping the neural drafter caused the configuration gains. Only four code rounds bypassed the assistant; prose retained eight-row generic verification throughout.
+
+Prefill remains a substantial fixed share of these short requests. Reconstructing approximate prefill duration from the server's rounded rate reports yields about 35 of 76 aggregate seconds for adaptive related configuration and 30 of 57 seconds for adaptive code. These are approximate, not direct phase timers. The whole-request gain therefore remains smaller than a decode-only gain; optimizing lookup admission does not remove prompt prefill.
+
+### Additional same-state width-boundary diagnostics
+
+Two additional training-only `production-combined` windows exercised lookup9 and lookup12 against the same current-binary serial oracle. Both completed two exact requests; actual comparison validated identical common state, prepared target state and lookup offer across lookup9/12/16.
+
+| Lookup width | Actual dispatch | Committed tokens | Verify/commit time | Verify/commit time per token |
+|---|---|---:|---:|---:|
+| 9 | linear GDN | 9 | 140.192 ms | 15.577 ms |
+| 12 | linear GDN | 12 | 140.932 ms | 11.744 ms |
+| 16 | linear GDN | 16 | 152.267 ms | 9.517 ms |
+
+These individual first-offer observations show useful nonlinear width economics at this prefix: nine to twelve rows added little measured cost, while sixteen rows gave the lowest observed cost per committed token. They are not a repeated, drift-controlled hardware plateau determination. Diagnostic readback effects remain, the sixteen-row window was earlier, and no complete-round or throughput claim follows. The actual exporter produced the separately named five-cell `independent-v14-combined-boundary-training-prices.json` profile; canonical and completed ABBA cohorts do not consume it.

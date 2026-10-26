@@ -241,7 +241,7 @@ class ProductionRoutingQuartets(unittest.TestCase):
                                     'anchor_pos': 1, 'rows': 3, 'selected_persistent': 2}] if active else [])
             evidence = c.mechanism_evidence(plan, rows)
             self.assertEqual(set(evidence), {family + '-native', adaptive})
-            self.assertTrue(evidence[adaptive]['source_activated'])
+            self.assertTrue(evidence[adaptive]['source_requirement_pass'])
             self.assertEqual(len(evidence[adaptive]['related_cell_persistent_training_output_lower_bounds']),
                              plan['blocks'] * len(c.s.RELATED) * len(c.EXPOSURES) * 2)
             for arm in (adaptive, adaptive + '-repeat'):
@@ -251,9 +251,64 @@ class ProductionRoutingQuartets(unittest.TestCase):
                                 and row['case'] in c.s.RELATED and row['rep'] == rep)
                     cell['rounds'][0]['selected_persistent'] = 0
                     with self.subTest(family=family, arm=arm, rep=rep):
-                        self.assertFalse(c.mechanism_evidence(plan, changed)[adaptive]['source_activated'])
+                        self.assertFalse(c.mechanism_evidence(plan, changed)[adaptive]['source_requirement_pass'])
                         changed.remove(cell)
-                        self.assertFalse(c.mechanism_evidence(plan, changed)[adaptive]['source_activated'])
+                        self.assertFalse(c.mechanism_evidence(plan, changed)[adaptive]['source_requirement_pass'])
+
+
+class MechanismObservation(unittest.TestCase):
+    def test_adaptive_reductions_are_observed_without_forced_cut_labels(self):
+        plan = protocol('dflash', 'production-routing')
+        plan['reuse'] = {}
+        arm = 'dflash-combined-adaptive'
+        receipts = [
+            {'selection': 'adaptive', 'rows': 8, 'legal_rows': 16, 'commit_scope': 'published'},
+            {'selection': 'adaptive', 'rows': 16, 'legal_rows': 16, 'commit_scope': 'published'},
+            {'selection': 'adaptive', 'rows': 4, 'legal_rows': 16, 'commit_scope': 'discarded'},
+        ]
+        rows = [{'arm': arm, 'case': 'unrelated-prose', 'rounds': receipts}]
+        observed = c.mechanism_evidence(plan, rows)[arm]
+        self.assertEqual(observed['published_rounds'], 2)
+        self.assertEqual(observed['width_reduced_rounds'], 1)
+        self.assertEqual(observed['width_reduced_rounds_by_selection'], {'adaptive': 1})
+        self.assertEqual(observed['forced_cut_reduced_rounds'], 0)
+        self.assertFalse(observed['width_cut_required'])
+        self.assertTrue(observed['width_cut_requirement_pass'])
+        self.assertFalse(observed['backoff_observed'])
+        self.assertTrue(observed['backoff_requirement_pass'])
+
+    def test_fixed_caps_do_not_satisfy_forced_cut_requirement(self):
+        plan = protocol('dflash', 'neural-width')
+        plan['reuse'] = {}
+        arm = 'dflash-neural-cut'
+        receipt = {'selection': 'fixed', 'rows': 8, 'legal_rows': 16, 'commit_scope': 'published'}
+        rows = [{'arm': arm, 'case': 'unrelated-prose', 'rounds': [receipt]}]
+        observed = c.mechanism_evidence(plan, rows)[arm]
+        self.assertEqual(observed['width_reduced_rounds'], 1)
+        self.assertTrue(observed['width_cut_required'])
+        self.assertFalse(observed['width_cut_requirement_pass'])
+        receipt['selection'] = 'cut'
+        observed = c.mechanism_evidence(plan, rows)[arm]
+        self.assertEqual(observed['forced_cut_reduced_rounds'], 1)
+        self.assertTrue(observed['width_cut_requirement_pass'])
+        receipt['rows'] = 16
+        self.assertFalse(c.mechanism_evidence(plan, rows)[arm]['width_cut_requirement_pass'])
+
+    def test_partial_backoff_observation_does_not_satisfy_all_cell_requirement(self):
+        plan = protocol('pld', 'suffix-backoff')
+        plan['reuse'] = {}
+        arm = 'pld-backoff-on'
+        rows = [{'arm': arm, 'case': 'related-code', 'rounds': [], 'commits': [],
+                 'backoff_events': [{'plain_tokens': 1, 'misses': 1}]}]
+        observed = c.mechanism_evidence(plan, rows)[arm]
+        self.assertTrue(observed['backoff_observed'])
+        self.assertTrue(observed['backoff_required'])
+        self.assertFalse(observed['backoff_requirement_pass'])
+        native = c.mechanism_evidence(plan, rows)['serial']
+        self.assertEqual(native['width_reduced_rounds'], 0)
+        self.assertFalse(native['backoff_observed'])
+        self.assertFalse(native['backoff_required'])
+        self.assertTrue(native['backoff_requirement_pass'])
 
 
 class FrozenDeclaration(unittest.TestCase):
@@ -689,9 +744,9 @@ class PldBackoffContracts(unittest.TestCase):
         rows, _ = observations(plan)
         for row in rows:
             row.update(rounds=[], commits=[], backoff_events=backoff_trace() if row['arm'] == 'pld-backoff-on' else [])
-        self.assertTrue(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_activated'])
+        self.assertTrue(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_requirement_pass'])
         next(row for row in rows if row['arm'] == 'pld-backoff-on' and row['case'] == 'unrelated-prose')['backoff_events'] = []
-        self.assertFalse(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_activated'])
+        self.assertFalse(c.mechanism_evidence(plan, rows)['pld-backoff-on']['backoff_requirement_pass'])
 
 
 class ReceiptControls(unittest.TestCase):

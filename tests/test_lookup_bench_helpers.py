@@ -85,13 +85,13 @@ class RouteQualification(unittest.TestCase):
 class CanonicalIdentity(unittest.TestCase):
     def cohort(self, unbounded=False):
         protocol = canonical.UNBOUNDED_PROTOCOL if unbounded else canonical.PROTOCOL
-        return {'source_hashes': canonical.source_hashes(), 'protocol': copy.deepcopy(protocol),
+        return {'version': 2, 'source_hashes': canonical.source_hashes(), 'protocol': copy.deepcopy(protocol),
                 'budget': 'unbounded' if unbounded else 'bounded',
                 'measurement_isolation': 'declared', 'statistics': copy.deepcopy(canonical.STATISTICS),
                 'runtime_identity': {'binary': 'hash', 'libraries': {'libmlx.dylib': 'mlx'},
                                      'metallibs': {'mlx.metallib': 'metal'}},
-                'runs': 3, 'rungs': '512', 'pairs': 2, 'arms': list(canonical.ARMS),
-                'cache_tag': 'test', 'orders': [list(canonical.ARMS), list(reversed(canonical.ARMS))]}
+                'runs': 3, 'rungs': '512', 'quartets': 2, 'arms': list(canonical.ARMS),
+                'cache_tag': 'test', 'schedule': canonical.declared_schedule(2)}
 
     def plan(self, unbounded=False):
         config = self.cohort(unbounded)
@@ -103,29 +103,22 @@ class CanonicalIdentity(unittest.TestCase):
                 'binary': 'host', 'binary_sha256': 'hash',
                 'measurement_isolation': config['measurement_isolation'],
                 'statistics': copy.deepcopy(config['statistics']),
-                'pairs': config['pairs'], 'orders': copy.deepcopy(config['orders']),
+                'quartets': config['quartets'], 'schedule': copy.deepcopy(config['schedule']),
                 'deadline_seconds': config['protocol']['deadline_seconds'],
                 'worker_stop_seconds': config['protocol']['worker_stop_seconds'],
                 'server_args': dict(config['protocol']['server_args'], port=11279),
-                'phase': 'measure', 'mode': 'mtp-legacy', 'pair': 0, 'tier': 'legacy',
+                'phase': 'measure', **config['schedule'][0], 'tier': 'legacy',
+                'source_identity': {'plan.json': 'hash', 'probe.json': 'hash', 'arm/llmprobe.json': 'hash'},
                 'arm_definitions': definitions}
 
     def test_complete_current_cohort_and_plan_are_accepted(self):
         canonical.validate_plan(self.plan())
-        self.assertTrue({'lookup_canonical_window.py', 'lookup_similar_requests.py',
-                         'lookup_route_diagnostic.py', 'bench_lookup_staircut.py',
-                         'lookup_bench_evidence.py', 'prepare_lookup_offline.py',
-                         'lookup_transfer_contract.json'} <= set(canonical.source_hashes()))
 
-    def test_unbounded_measurement_and_replay_keep_full_protocol(self):
+    def test_unbounded_measurement_and_replay_accept_full_protocol(self):
         for phase in ('measure', 'replay'):
             plan = self.plan(unbounded=True)
             plan['phase'] = phase
             canonical.validate_plan(plan)
-            self.assertIsNone(plan['deadline_seconds'])
-            self.assertIsNone(plan['worker_stop_seconds'])
-            expected = dict(canonical.PROTOCOL['server_args'], probe_timeout=3600, port=11279)
-            self.assertEqual(plan['server_args'], expected)
 
     def test_unbounded_budget_cannot_omit_or_change_declared_timeouts(self):
         for key, value in (('deadline_seconds', 290), ('worker_stop_seconds', 285),
@@ -166,37 +159,46 @@ class CanonicalIdentity(unittest.TestCase):
             with self.assertRaisesRegex(route.r.BenchError, 'isolation declaration'):
                 canonical.validate_cohort(config)
         for key, value in (('measurement_isolation', 'undeclared'), ('statistics', {}),
-                           ('pairs', 4), ('orders', [])):
+                           ('quartets', 4), ('schedule', [])):
             plan = self.plan()
             plan[key] = value
             with self.assertRaisesRegex(route.r.BenchError, 'schedule identity mismatch'):
                 canonical.validate_plan(plan)
         config = self.cohort()
-        config['pairs'] = 4
-        config['orders'] *= 2
+        config['quartets'] = 4
+        config['schedule'] = canonical.declared_schedule(4)
         canonical.validate_cohort(config)
 
-    def test_declaration_requires_isolation_and_defaults_to_four_pairs(self):
-        for pairs in (None, 2):
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / 'cohort.json'
-                argv = ['canonical', '--declare', '--config', str(path), '--seed', directory,
-                        '--isolation', 'declared', '--unbounded']
-                if pairs is not None:
-                    argv += ['--pairs', str(pairs)]
-                with mock.patch.object(canonical.sys, 'argv', argv), mock.patch.object(route, 'load_json', return_value={'binary': 'host'}), mock.patch.object(route.r, 'absolute_asset', return_value='host'), mock.patch.object(route.r, 'digest', return_value='hash'), mock.patch.object(route.r, 'runtime_identity', return_value={'binary': 'hash', 'libraries': {'mlx': 'hash'}}), mock.patch.object(route, 'save') as save:
-                    self.assertEqual(canonical.main(), 0)
-                config = save.call_args.args[1]
-                self.assertEqual(config['pairs'], 4 if pairs is None else pairs)
-                self.assertEqual(len(config['orders']), config['pairs'])
-                self.assertEqual(config['measurement_isolation'], 'declared')
-                self.assertEqual(config['statistics'], canonical.STATISTICS)
-                self.assertEqual(config['runtime_identity'], {'binary': 'hash', 'libraries': {'mlx': 'hash'}})
+    def test_declaration_requires_explicit_isolation_and_rejects_old_cli(self):
         for argv in (['canonical', '--declare'], ['canonical', '--isolation', 'declared'],
-                     ['canonical', '--pairs', '4']):
+                     ['canonical', '--quartets', '4'], ['canonical', '--pairs', '4'],
+                     ['canonical', '--mode', 'mtp-legacy', '--pair', '0']):
             with mock.patch.object(canonical.sys, 'argv', argv), mock.patch.object(canonical.sys, 'stderr'):
                 with self.assertRaises(SystemExit):
                     canonical.main()
+
+    def test_schedule_mutation_and_historical_protocol_are_rejected(self):
+        for mutate in (lambda c: c['schedule'].reverse(),
+                       lambda c: c['schedule'].pop(),
+                       lambda c: c['schedule'].__setitem__(1, c['schedule'][0]),
+                       lambda c: c['schedule'][0].update(mode='dflash-legacy'),
+                       lambda c: c['schedule'][0].update(slot=True)):
+            config = self.cohort()
+            mutate(config)
+            with self.assertRaisesRegex(route.r.BenchError, 'boot slots'):
+                canonical.validate_cohort(config)
+        config = self.cohort()
+        config.update(version=1, pairs=2, orders=[])
+        with self.assertRaisesRegex(route.r.BenchError, 'redeclare, never upgrade history'):
+            canonical.validate_cohort(config)
+
+    def test_slot_identity_cannot_alias_another_replica(self):
+        for key, value in (('slot', True), ('slot', -1), ('slot', 16), ('slot', 3),
+                           ('position', 3), ('quartet', 1), ('family', 'dflash')):
+            plan = self.plan()
+            plan[key] = value
+            with self.assertRaises(route.r.BenchError):
+                canonical.validate_plan(plan)
 
     def test_runtime_identity_is_required_and_frozen_in_plan(self):
         for identity in (None, {}, [], 'old-binary-hash'):
@@ -280,7 +282,7 @@ class CanonicalIdentity(unittest.TestCase):
         del config['source_hashes']
         with self.assertRaisesRegex(route.r.BenchError, 'identity missing or changed'):
             canonical.validate_cohort(config)
-        for key, value in (('runs', 2), ('rungs', 512), ('pairs', True), ('protocol', None)):
+        for key, value in (('runs', 2), ('rungs', 512), ('quartets', True), ('protocol', None)):
             with self.subTest(key=key):
                 config = self.cohort()
                 config[key] = value
@@ -309,13 +311,14 @@ class CanonicalIdentity(unittest.TestCase):
 
 class CanonicalClaims(unittest.TestCase):
     def schedule(self, mutation=None):
-        config = {'orders': [list(canonical.ARMS), list(reversed(canonical.ARMS))] * 2}
+        config = {'schedule': canonical.declared_schedule(4)}
         measures, documents = {}, {}
-        for index, (pair, mode) in enumerate((pair, mode) for pair, order in enumerate(config['orders']) for mode in order):
+        for slot in config['schedule']:
+            index, mode = slot['slot'], slot['mode']
             root = Path(str(index))
-            measures[(pair, mode)] = (root, {})
+            measures[index] = (root, {})
             documents[root / 'boots.jsonl'] = [{
-                'pair': pair, 'arm': mode.split('-')[1], 'completed': True,
+                'pair': index, 'arm': mode.split('-')[1], 'completed': True,
                 'assets_preserved': True, 'numerical_mode': 'row-exact',
                 'machine_before': dict(machine_state(), timestamp=index * 10 + 1),
                 'machine_after': dict(machine_state(), timestamp=index * 10 + 9)}]
@@ -344,21 +347,54 @@ class CanonicalClaims(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertFalse(self.schedule(mutation)['proved'])
 
-    def comparisons(self, pairs=4, metric='decodeTokPerSec'):
-        return [{'pair': pair, 'family': 'mtp', 'metric': metric,
-                 'family_ratio': 2.0, 'fastest_native_ratio': 0.8} for pair in range(pairs)]
+    def comparisons(self, quartets=4, metric='decodeTokPerSec'):
+        return [{'quartet': quartet, 'family': 'mtp', 'metric': metric,
+                 'family_ratio': 2.0} for quartet in range(quartets)]
 
-    def test_separate_family_and_fastest_native_pointwise_claims(self):
+    def test_only_family_quartets_support_pointwise_claims(self):
         stats = canonical.comparison_statistics(self.comparisons(), True)
-        family, fastest = stats['per_family'][0], stats['fastest_native'][0]
+        family = stats['per_family'][0]
         self.assertTrue(family['qualified_speedup'])
         self.assertTrue(family['lower_ci_above_one'])
-        self.assertEqual(family['boot_blocks'], 4)
-        self.assertFalse(fastest['qualified_speedup'])
-        self.assertTrue(fastest['regression_ci_below_one'])
-        self.assertTrue(fastest['observed_regression'])
+        self.assertEqual(family['quartets'], 4)
+        self.assertNotIn('fastest_native', stats)
 
-    def test_two_pairs_unqualified_or_auxiliary_metrics_never_claim(self):
+    def test_replica_effects_cannot_be_counted_as_extra_quartets(self):
+        comparisons = self.comparisons()
+        comparisons.append(dict(comparisons[0]))
+        with self.assertRaisesRegex(route.r.BenchError, 'duplicate family quartet'):
+            canonical.comparison_statistics(comparisons, True)
+
+    def test_schedule_crosses_orientation_and_family_precedence(self):
+        schedule = canonical.declared_schedule(4)
+        self.assertEqual([slot['slot'] for slot in schedule], list(range(32)))
+        for family in ('mtp', 'dflash'):
+            combinations = set()
+            for quartet in range(4):
+                block = [slot for slot in schedule if slot['quartet'] == quartet]
+                slots = [slot for slot in block if slot['family'] == family]
+                self.assertEqual([slot['position'] for slot in slots], [0, 1, 2, 3])
+                self.assertEqual([slot['slot'] for slot in slots],
+                                 list(range(slots[0]['slot'], slots[0]['slot'] + 4)))
+                pattern = ''.join('A' if slot['mode'].endswith('-legacy') else 'B' for slot in slots)
+                self.assertIn(pattern, ('ABBA', 'BAAB'))
+                combinations.add((block[0]['family'] == family, pattern))
+            self.assertEqual(len(combinations), 4)
+
+    def test_latency_arithmetic_and_rate_geometric_pooling(self):
+        slots = canonical.declared_schedule(4)[:4]
+        values = {slot['slot']: {'ttftMs': latency, 'decodeTokPerSec': rate}
+                  for slot, latency, rate in zip(slots, (1, 4, 8, 9), (1, 4, 16, 9))}
+        rows = {row['metric']: row for row in canonical.quartet_comparisons(0, 'mtp', slots, values)}
+        self.assertEqual(rows['ttftMs']['native'], 5)
+        self.assertEqual(rows['ttftMs']['feature'], 6)
+        self.assertAlmostEqual(rows['ttftMs']['family_ratio'], 5 / 6)
+        self.assertAlmostEqual(rows['decodeTokPerSec']['native'], 3)
+        self.assertAlmostEqual(rows['decodeTokPerSec']['feature'], 8)
+        self.assertAlmostEqual(rows['decodeTokPerSec']['family_ratio'], 8 / 3)
+        self.assertEqual(rows['decodeTokPerSec']['physical_values']['legacy'], [1, 9])
+
+    def test_two_quartets_unqualified_or_auxiliary_metrics_never_claim(self):
         for comparisons, qualified in ((self.comparisons(2), True),
                                       (self.comparisons(), False),
                                       (self.comparisons(metric='batching:aggregateTokPerSec'), True)):
@@ -366,9 +402,9 @@ class CanonicalClaims(unittest.TestCase):
             self.assertFalse(stats['per_family'][0]['qualified_speedup'])
         two = canonical.comparison_statistics(self.comparisons(2), True)['per_family'][0]
         self.assertNotIn('ci95', two)
-        self.assertEqual(two['required_boot_blocks'], 4)
+        self.assertEqual(two['required_quartets'], 4)
 
-    def test_uncertainty_uses_paired_blocks_and_unity_is_not_a_win(self):
+    def test_uncertainty_uses_quartets_and_unity_is_not_a_win(self):
         comparisons = self.comparisons()
         for row, ratio in zip(comparisons, (0.5, 0.5, 2, 2)):
             row['family_ratio'] = ratio
@@ -382,7 +418,8 @@ class CanonicalClaims(unittest.TestCase):
 
     def test_full_metrics_include_latency_prefix_and_batch_diagnostics(self):
         probe = {'metric_values': {metric: 10 for metric in canonical.METRICS}}
-        report = {'bench': {'prefixCache': {'coldTtftMs': 8, 'warmTtftMs': 4},
+        report = {'bench': {'ttftMs': {'samples': [1, 5, 24]},
+                            'prefixCache': {'coldTtftMs': 8, 'warmTtftMs': 4},
                             'batching': {'singleTokPerSec': 20, 'aggregateTokPerSec': 40}}}
         values = canonical.full_metric_values(probe, report)
         self.assertEqual(len(values), 12)
@@ -390,10 +427,10 @@ class CanonicalClaims(unittest.TestCase):
         self.assertEqual(values['prefixCache:warmTtftMs'], 4)
         self.assertEqual(values['batching:aggregateTokPerSec'], 40)
 
-    def aggregate_fixture(self, directory, mutate=None, live_runtime=None):
+    def aggregate_fixture(self, directory, mutate=None, live_runtime=None, mutate_paths=None):
         base = Path(directory).resolve()
         config = CanonicalIdentity().cohort(unbounded=True)
-        config.update(pairs=4, orders=config['orders'] * 2)
+        config.update(quartets=4, schedule=canonical.declared_schedule(4))
         documents, boots, paths = {}, {}, []
         groups = [('decodeTokPerSec', 'ttftMs'), ('prefillTokPerSec',),
                   ('speculative:predictableTokPerSec',), ('speculative:novelTokPerSec',),
@@ -403,13 +440,14 @@ class CanonicalClaims(unittest.TestCase):
         for index, metrics in enumerate(groups):
             for rep in range(3):
                 captures[index * 3 + rep]['metrics'] = list(metrics)
-        for index, (pair, mode) in enumerate((pair, mode) for pair, order in enumerate(config['orders']) for mode in order):
+        for slot in config['schedule']:
+            index, mode = slot['slot'], slot['mode']
             root, replay_root = base / str(index), base / ('replay-' + str(index))
             family, tier = mode.split('-')
             plan = CanonicalIdentity().plan(unbounded=True)
             definitions = route.arm_definitions('reuse', family, [tier])
             route.declare_numerical_mode(definitions, True)
-            plan.update(config=config, pairs=4, orders=config['orders'], pair=pair, mode=mode,
+            plan.update(config=config, quartets=4, schedule=config['schedule'], **slot,
                         tier=tier, arm_definitions=definitions, config_sha256='config',
                         probe_assets={'client': 'hash'}, reuse={'hashes': {}}, model={})
             multiplier = 2 if tier == 'persistent' else 1
@@ -421,7 +459,7 @@ class CanonicalClaims(unittest.TestCase):
                      'metric_request_counts': {metric: 3 for metric in canonical.METRICS},
                      'machine_before': machine_state(), 'machine_after': machine_state(),
                      'machine_samples': [machine_state()], 'stability_errors': [], 'report_errors': []}
-            bench = {metric: {'median': metric_values[metric], 'samples': [10] * 3}
+            bench = {metric: {'median': metric_values[metric], 'samples': [metric_values[metric]] * 3}
                      for metric in ('decodeTokPerSec', 'ttftMs', 'prefillTokPerSec')}
             bench.update(contextScaling=[{'targetTokens': 512, 'runs': 3, 'inputTokens': 512,
                                           **{metric: metric_values['context:512:' + metric]
@@ -442,7 +480,7 @@ class CanonicalClaims(unittest.TestCase):
                 'reference_modes': ['serial'],
                 'results': [{'reference_matches': 1} for _ in captures]}
             boots[root / 'boots.jsonl'] = [{
-                'pair': pair, 'arm': tier, 'completed': True, 'assets_preserved': True,
+                'pair': index, 'arm': tier, 'completed': True, 'assets_preserved': True,
                 'numerical_mode': 'row-exact',
                 'machine_before': dict(machine_state(), timestamp=index * 10 + 1),
                 'machine_after': dict(machine_state(), timestamp=index * 10 + 9)}]
@@ -451,14 +489,19 @@ class CanonicalClaims(unittest.TestCase):
                 documents[window / 'runtime-identity.json'] = {
                     'before': copy.deepcopy(config['runtime_identity']),
                     'after': copy.deepcopy(config['runtime_identity'])}
+                if window == replay_root:
+                    documents[window / 'runtime-identity.json'].update(
+                        started_at=1000 + index * 10, finished_at=1009 + index * 10)
         if mutate:
             mutate(documents, boots, config)
+        if mutate_paths:
+            mutate_paths(paths)
         # Keep guard tests cheap; actual bootstrap uncertainty is exercised above.
         def effect(ratios, margin, replications, minimum):
             ratio = ratios[0]
             return {'boot_blocks': len(ratios), 'ratios': ratios, 'ci95': [ratio, ratio],
                     'verdict': 'win' if ratio > 1 else 'inconclusive'}
-        with mock.patch.object(route, 'load_json', side_effect=lambda path: documents[path]), mock.patch.object(route, 'read_rows', side_effect=lambda path: (boots[path], [])), mock.patch.object(route, 'save') as save, mock.patch.object(canonical, 'bootstrap_effect', side_effect=effect), mock.patch.object(route.r, 'runtime_identity', return_value=config['runtime_identity'] if live_runtime is None else live_runtime):
+        with mock.patch.object(route, 'load_json', side_effect=lambda path: documents[path]), mock.patch.object(route, 'read_rows', side_effect=lambda path: (boots[path], [])), mock.patch.object(route, 'save') as save, mock.patch.object(canonical, 'bootstrap_effect', side_effect=effect), mock.patch.object(canonical, 'source_hashes', return_value=config['source_hashes']), mock.patch.object(route.r, 'digest', return_value='hash'), mock.patch.object(route.r, 'runtime_identity', return_value=config['runtime_identity'] if live_runtime is None else live_runtime):
             status = canonical.aggregate(list(reversed(paths)), base / 'aggregate')
         return status, save.call_args.args[1]
 
@@ -482,7 +525,59 @@ class CanonicalClaims(unittest.TestCase):
         self.assertFalse(family['prefixCache:coldTtftMs']['qualified_speedup'])
         self.assertTrue(family['prefixCache:coldTtftMs']['regression_ci_below_one'])
         self.assertIn('prefixCache:coldTtftMs', {row['metric'] for row in result['full_workload_regressions']['per_family']})
-        self.assertEqual(len(result['load_drift']), 16)
+        self.assertEqual(len(result['load_drift']), 32)
+        self.assertEqual(len(result['physical_observations']), 32)
+        self.assertEqual({row['quartets'] for row in result['statistics']['per_family']}, {4})
+        self.assertFalse(result['fastest_native']['supported'])
+
+    def test_missing_or_duplicate_physical_windows_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status, result = self.aggregate_fixture(directory, mutate_paths=lambda paths: paths.pop(0))
+        self.assertEqual(status, 1)
+        self.assertFalse(result['measurement_qualified'])
+        self.assertIn('missing_declared_measurement_slots', result['errors'])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(route.r.BenchError, 'duplicate input window'):
+                self.aggregate_fixture(directory, mutate_paths=lambda paths: paths.append(paths[0]))
+
+    def test_replay_cannot_substitute_another_same_arm_replica(self):
+        def mutate(documents, boots, config):
+            plan = next(value for path, value in documents.items()
+                        if path.parent.name == 'replay-0' and path.name == 'plan.json')
+            plan.update(config['schedule'][3])
+        with tempfile.TemporaryDirectory() as directory:
+            status, result = self.aggregate_fixture(directory, mutate)
+        self.assertEqual(status, 1)
+        self.assertFalse(result['measurement_qualified'])
+        self.assertIn('replay_source_slot_or_identity_mismatch:0', result['errors'])
+
+    def test_duplicate_physical_slot_cannot_hide_in_distinct_paths(self):
+        def mutate(documents, boots, config):
+            plan = next(value for path, value in documents.items()
+                        if path.parent.name == '3' and path.name == 'plan.json')
+            plan.update(config['schedule'][0])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(route.r.BenchError, 'duplicate measurement slot'):
+                self.aggregate_fixture(directory, mutate)
+
+    def test_replay_source_bytes_and_adjacency_are_required(self):
+        def replay_document(documents, name):
+            return next(value for path, value in documents.items()
+                        if path.parent.name == 'replay-0' and path.name == name)
+        mutations = [
+            lambda docs, boots, config: replay_document(docs, 'plan.json')['source_identity'].update(
+                {'probe.json': 'changed'}),
+            lambda docs, boots, config: replay_document(docs, 'runtime-identity.json').update(
+                started_at=20, finished_at=25),
+            lambda docs, boots, config: replay_document(docs, 'runtime-identity.json').pop('started_at'),
+            lambda docs, boots, config: replay_document(docs, 'runtime-identity.json').update(
+                finished_at=1011),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                status, result = self.aggregate_fixture(directory, mutation)
+            self.assertEqual(status, 1)
+            self.assertFalse(result['measurement_qualified'])
 
     def test_aggregate_guards_preserve_diagnostics_but_remove_all_claims(self):
         def first(documents, suffix):

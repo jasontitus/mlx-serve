@@ -219,7 +219,7 @@ class ProductionEndpointGate(unittest.TestCase):
                 return c.summarize(out, plan)
             effects = [dict(contrast, full_workload={'verdict': 'win'}, every_cell_block_within_5pct=True)
                        for contrast in contrasts]
-            mechanisms = {arm: {'source_activated': True, 'width_cut_activated': True, 'backoff_activated': True}
+            mechanisms = {arm: {'source_requirement_pass': True, 'width_cut_requirement_pass': True, 'backoff_requirement_pass': True}
                           for arm in definitions}
             # Isolate the measurement gate; schedule, original swap guards, telemetry joins,
             # summary effect gates, and final production verdict run their real implementations.

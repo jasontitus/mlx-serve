@@ -1022,3 +1022,54 @@ The two earlier failed CLI cohorts remain failed and are not reclassified. A new
 This changes response-format acceptance, not the model invocation or task. It does not prove compliance with the source-only instruction or functional correctness of generated Python. CLI invocation already uses the model's chat formatter; flattened system words are not a true system-role message. The new declaration binds both failed predecessor plan hashes and exact schema-two cases, rejecting historical plans/foreign observations rather than pooling them.
 
 Independent adversarial review found no remaining parser, identity, reducer or provenance defect. Seventeen throwaway parser/quality/schema/provenance checks passed, followed by a complete synthetic reducer case and eight corruptions that all withheld performance estimates (raw-format/whitespace/ID mismatches, missing/foreign protocol stamps, non-stop output and incomplete cohort). The actual declaration command completed without loading a model. No schema-three model execution or new PLE inference performance result is claimed.
+
+## Optimization checkpoint: preparation result and overall-process review
+
+The freshly declared `runs/independent-v28-mtp-preparation-hostname-fixed-abba` completed **136 exact responses**, comparing v27/v28 with identical adaptive MTP controls and publication-only receipts. The isolated preparation-accounting effect is **+0.39%**, ratio 1.00387, interval **0.97037–1.03510**; quartet ratios are 1.00393, 1.04571, 0.95736 and 1.01046. Swap usage and swap-ins fail qualification. This is not an established preparation speedup and is not a new native-relative comparison.
+
+| Coding case | v28 versus v27: first | Repeat |
+|---|---:|---:|
+| Fresh function | +1.58% | +0.70% |
+| Related helper | −0.79% | −1.40% |
+| Related edit | +1.21% | +0.41% |
+| Related completion | −2.00% | +3.55% |
+
+Across eight fresh-first requests per arm, the same sixteen upper-width learning actions each draft fourteen tokens and accept none. Ordinary one-draft lookup executions fall 13→10, but native-head rounds rise 631→635, leaving total rounds 660→661. All 27 executed fresh v28 lookup actions, including the one repeat action, have unknown preparation cost at selection. Positive preparation prices occur on related workloads, but the fresh improvement cannot be attributed to directly pricing away these bad fresh selections.
+
+The earlier v25 fresh-first ledger likewise contains sixteen learning misses plus ten ordinary one-draft selections, accepting only three lookup drafts. Their gross logged lookup duration is 444.73 ms/request versus the approximately 879.25-ms observed decode gap. These durations replace native actions; neither their sum nor an assumed recovery charge is an incremental saving. The source applies and settles existing head history on lookup entry, and two existing transition observations show no consistent large recovery spike. A new recovery surcharge would risk double counting.
+
+The hypothesized long-order-to-short-order trust transfer is not established as the fresh-first cause: no preceding offer exceeds order four before the first learning miss in any of the eight requests. Long-hit/short-miss witnesses exist elsewhere, but useful intervening short matches also exist. Do not restore exact-order request fragmentation or fit a short-match threshold to these fixtures without an attainable-latency ledger and an isolated full-request contrast.
+
+### Adversarial process findings and resulting priorities
+
+- **P1: production opportunity cost remains unmeasured.** Current exact-mode comparisons do not establish improvement over the fastest supported production-native configuration. Keep exact-mode feature value separate from the numerical-mode/production gap; never disable exactness to manufacture a win. A numerical-mode diagnostic must retain output differences instead of treating them as equal-work acceleration.
+- **P1: stop scheduling broad performance cohorts under an unchanged failed environment.** In the latest DFlash native comparison, 55/136 request intervals have swap-ins, totaling 6,508 increments; the preparation comparison has 54/136, totaling 5,585. Neither has request-aligned swap-outs, and every request reports normal pressure on AC. This does not establish model-induced memory pressure. A subsequent sixty-second diagnostic with no model loaded still observes 182 swap-in increments, with unchanged swap usage/outs. Background paging persists independently of inference; its owning process is not identified.
+- **P2: optimize attainable latency, not counters.** The stable learning misses justify investigation, not credit for removing their entire gross duration. Reconcile preparation, native alternatives, actual coverage and useful admissions before adding another policy. Copy-call savings alone already failed to establish a gain.
+- **P2: close the PLE end-to-end question before expanding its cache.** The validated thirty-two-process CLI cohort remains the next independent performance question when hardware prerequisites permit it. A null result closes that workload's current speed hypothesis; it is not permission to enlarge the cache automatically.
+
+The proposed 576-request broad component package and 64 canonical measurement/replay windows are deferred, not cancelled or replaced by narrow claims. First establish comparator relevance and measurement feasibility; then run the direct native/adaptive contrast that answers a deployment decision. Further DFlash copy-policy changes rank behind these gaps. Sushi work is deferred at the user's request.
+
+Progress checkpoints retain the hypothesis, observed work changes, isolated timing, native-relative timing, incremental resources and decision to keep/change/defer. Repeat the overall-process adversarial review after each material frozen-runtime change and before a broad cohort, not merely after individual fixes.
+
+### Mechanism-reporting correction after v29
+
+The private coding reducer now excludes selected native copies from its raw width-reduction count and reports selected-copy rounds separately. A throwaway execution of the actual reducer expressions distinguishes copy, ordinary reduction, equal-width and zero-commit cases; the completed isolated v29 candidate records contain 69 selected-copy rounds. Historical summaries and qualifications were not rewritten. This corrects attribution, not latency, and an observed reduction still does not isolate a causal StairCut speedup.
+
+### Native arithmetic opportunity diagnostic
+
+A separate prospective diagnostic runs the frozen v29 executable with native DFlash2 and native MTP, each in stock / row-exact / row-exact / stock order. Each fresh server runs the same four complete coding cases, first and repeat: 64 requests total. Existing native lookup/copy defaults remain enabled. Both modes use publication-only receipts with lookup tracing disabled. The harness retains token identities, output lengths, finish state, syntax observations and latency separately; divergent outputs are not equal-work speedups. One quartet per family is descriptive evidence, not a statistical promotion gate or cross-family race.
+
+Publication-only validation now accepts absent DFlash round diagnostics only when the arm explicitly requests `commit` receipts and native DFlash statistics establish actual engagement. Wrong-family or zero-attempt statistics remain failures, as do absent publication receipts; full-diagnostic mode still requires its rounds. The missing-round rejection reproduced before the fix, and all 57 benchmark-helper tests passed afterward. This reporting change does not alter inference code or certify mechanism attribution.
+
+The diagnostic completed **64 valid publications**, with no syntax/structure failures. All eight DFlash case/exposure cells and seven of eight MTP cells have identical publications across their four observations. MTP fresh-code repeat differs within stock mode: one output has 219 tokens, the other 218; exact mode produces 218 in both boots. That cell is excluded from matched-work timing, not silently repaired.
+
+| Native decoder | Matched cells / all cells | Stock total request seconds | Row-exact total request seconds | Row-exact latency change |
+|---|---:|---:|---:|---:|
+| DFlash2 | 8 / 8 | 89.035 | 92.069 | +3.41% |
+| MTP, matched subgroup only | 7 / 8 | 122.833 | 118.789 | −3.29% |
+
+These are descriptive sums of the two observations per mode in matched cells, not confidence intervals or qualified performance claims. Swap usage and swap-ins fail hardware qualification. DFlash executes 440 native attempts and accepts 2,416 drafts in each mode across its sixteen requests. MTP changes its native work substantially: across all sixteen requests per mode, stock/exact executes 567/871 native attempts, accepts 1,852/1,520 drafts, and executes 45/44 native lookup rounds. Its mode contrast therefore is not a pure arithmetic-kernel cost measurement. Related-edit exact latency is approximately 10.6% lower in both exposures, while fresh-first is 5.3% higher.
+
+**Decision:** no evidence here supports a large universal exact-mode penalty hiding an otherwise strong adaptive-policy win. DFlash's observed 3.41% cost increases the production hurdle; MTP's work-policy changes and one stock output divergence forbid treating mode removal as a free optimization. Preserve correctness controls and pursue actual useful work per verification rather than weakening the oracle. The frozen plan's top-level family/numerical-mode fields are inherited source metadata; the mixed diagnostic is defined by its schedule and actual per-boot/per-request activation records. Native boots use empty stores and no corpus despite retained seed provenance metadata.
+
+Adversarial review found no lifecycle, ownership, receipt-validation or hidden-treatment defect. This runtime exercise also validates the publication-only validator fix on real native DFlash execution. Evidence root: `runs/independent-v29-native-arithmetic-diagnostic`.

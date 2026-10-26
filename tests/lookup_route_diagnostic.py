@@ -433,7 +433,10 @@ def check_sample(row):
         if not stats.get('family_engaged'):
             errors.append('mtp_not_engaged_in_spec_stats')
     elif family == 'dflash' and not rounds:
-        errors.append('missing_dflash_round_receipts')
+        if spec.get('experiment', {}).get('MLX_SERVE_LOOKUP_RECEIPTS') != 'commit':
+            errors.append('missing_dflash_round_receipts')
+        elif not row.get('stats', {}).get('family_engaged'):
+            errors.append('dflash_not_engaged_in_spec_stats')
     elif family == 'serial':
         if any(row['body'].get(key) is not False for key in ('enable_mtp', 'enable_drafter', 'enable_pld')):
             errors.append('serial_speculation_not_disabled')

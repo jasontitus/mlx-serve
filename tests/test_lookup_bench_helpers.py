@@ -188,6 +188,26 @@ class NativeCopyReceipts(unittest.TestCase):
                 'commits': [{'prompt_ids': [1], 'generated_ids': list(range(2, 10)), 'finish_reason': 'stop'}],
                 'rounds': [receipt], 'seconds': 1.0, 'body': {'max_tokens': 32}}
 
+    def test_publication_only_requires_native_family_engagement(self):
+        sample = self.sample()
+        sample['rounds'] = []
+        sample['arm_definition']['experiment'] = {'MLX_SERVE_LOOKUP_RECEIPTS': 'commit'}
+        for log, expected in (
+                ('[spec-stats] mode=dflash attempts=3 accepts=2', []),
+                ('[spec-stats] mode=dflash attempts=0 accepts=0',
+                 ['dflash_not_engaged_in_spec_stats']),
+                ('[spec-stats] mode=mtp attempts=3 accepts=2',
+                 ['dflash_not_engaged_in_spec_stats'])):
+            with self.subTest(log=log):
+                sample['stats'] = route.r.parse_stats(log, 'dflash')
+                self.assertEqual(route.check_sample(sample), expected)
+        sample['stats'] = route.r.parse_stats('[spec-stats] mode=dflash attempts=3', 'dflash')
+        sample['arm_definition']['experiment']['MLX_SERVE_LOOKUP_RECEIPTS'] = '1'
+        self.assertEqual(route.check_sample(sample), ['missing_dflash_round_receipts'])
+        sample['arm_definition']['experiment']['MLX_SERVE_LOOKUP_RECEIPTS'] = 'commit'
+        sample['commits'] = []
+        self.assertIn('expected_exactly_one_commit', route.check_sample(sample))
+
     def test_separate_copy_geometry_and_unknown_prediction_are_explicit(self):
         for known in (False, True):
             self.assertEqual(route.check_sample(self.sample(known)), [])

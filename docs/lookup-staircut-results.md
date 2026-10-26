@@ -1003,3 +1003,22 @@ Editing first exposure regresses in all four quartets. Across eight such request
 Edit repeat instead changes 200→199 rounds, 1,632→1,624 verifier rows and 199→191 assistant-bearing rounds. Five selected copies accept all 35 draft tokens. Copy opportunities remain absent from the other three cases; their timing changes cannot be attributed to copy execution. The comparison also contains the shared remaining-clock correction. Raw `published_width_reductions` from this private driver are not isolated StairCut attribution; selected native copies must be excluded before interpreting such counts. Direct native-versus-v29 evaluation is a separate cohort.
 
 Independent adversarial review found no remaining clock, action-identity, low-yield retention or bounded-state defect in the copy integration. Prefix-level work evidence retains the unfavorable outcomes: all eight first-edit copies at anchor 341 accept one draft, while the earlier arm executes four assistant actions accepting seven and four lookup actions accepting one. Later copy selections at anchors 387 and 415 accept three and two drafts respectively. Historical paired economics do not guarantee future copy coverage; the review does not turn this measured regression into a speedup.
+
+The separate direct-native cohort, `runs/independent-v29-dflash-coding-abba`, completed **136 serial-exact responses**. Combined v29 versus native DFlash2 measures **+0.66%** overall (ratio 1.00662), with quartet-bootstrap interval **0.99522–1.01726** and quartet ratios 1.02178, 1.00383, 0.98996 and 1.01120. Changed swap usage and swap-ins fail isolated-hardware qualification; the aggregate interval also includes no improvement.
+
+| Coding case | Combined v29 versus native DFlash2: first | Repeat |
+|---|---:|---:|
+| Fresh function | −2.67% | +0.42% |
+| Related helper | +1.12% | +2.95% |
+| Related edit | +1.54% | +1.56% |
+| Related completion | +0.91% | −1.70% |
+
+Related-helper repeat has interval 1.00802–1.04738, while completion repeat has interval 0.96938–0.99686, before hardware qualification. The aggregate is near-neutral and the workload effects are mixed; neither exact output nor a majority of positive point estimates establishes general acceleration. All contrasts retain the same explicit row-exact arithmetic and incoai DFlash2 drafter, not a fastest-stock-arithmetic comparison.
+
+## Prospective PLE CLI response-format protocol
+
+The two earlier failed CLI cohorts remain failed and are not reclassified. A new private schema-three declaration, `runs/independent-v25-ple-cli-assistant-python-abba`, retains the same two schema-two workloads, prompts, frozen v25 binary, 512-token limits, four quartets and 32-process schedule. Its explicit prospective quality contract permits raw Python or one complete Python Markdown fence, rejecting outside prose, multiple/malformed fences and non-stop publications. Extracted source is used only for the unchanged syntactic/structural checks; complete raw text, prompt/generated token IDs, usage and finish reason must still match across arms.
+
+This changes response-format acceptance, not the model invocation or task. It does not prove compliance with the source-only instruction or functional correctness of generated Python. CLI invocation already uses the model's chat formatter; flattened system words are not a true system-role message. The new declaration binds both failed predecessor plan hashes and exact schema-two cases, rejecting historical plans/foreign observations rather than pooling them.
+
+Independent adversarial review found no remaining parser, identity, reducer or provenance defect. Seventeen throwaway parser/quality/schema/provenance checks passed, followed by a complete synthetic reducer case and eight corruptions that all withheld performance estimates (raw-format/whitespace/ID mismatches, missing/foreign protocol stamps, non-stop output and incomplete cohort). The actual declaration command completed without loading a model. No schema-three model execution or new PLE inference performance result is claimed.

@@ -264,7 +264,7 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
 
 /// The EXL3 stream kernels' plans fix threadgroups of up to 1024 threads; M1 and M2 (g13, g14) grant some of them
 /// fewer. Generation 0 is a GPU we cannot name.
-fn exl3Runs(gen: u32) bool {
+pub fn exl3Runs(gen: u32) bool {
     return gen == 0 or gen >= 15;
 }
 

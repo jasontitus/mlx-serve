@@ -299,6 +299,7 @@ fn skipOnThreadCap(e: anyerror) anyerror {
 
 test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, a phase change to decode) gives the trunk's logits over the same bank at fewer slot rows" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!@import("plugin.zig").exl3Runs(@import("../../mlx/device.zig").deviceGeneration().gen)) return error.SkipZigTest;
     mlx.installErrorHandler();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

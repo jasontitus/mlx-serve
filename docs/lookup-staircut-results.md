@@ -1239,3 +1239,74 @@ Full tracing perturbs cost learning and trajectory. These observations describe 
 After the completed v30 cohorts, the obsolete, unused `PersistentStore.max_order` field was removed; persistent index construction retains its existing default order. **All 22 token-history tests passed again**. The lookup-filtered integrated test command and ReleaseFast build exited successfully. The resulting v31 executable is `ad4ad30e082c401420f9c3fd8db4d2ec2119081f8fba3900dc993eb73ca8e91f`.
 
 `runs/independent-v31-terminal-history-smoke` exercised the rebuilt executable with three full original coding requests: serial, writable first, writable repeat. **All three publications match exactly**, with no errors, successful finalizers, released production locks and exact durable history growth **0→1→2 documents**. This is an untimed runtime smoke, not a shortened benchmark or a new performance estimate. Adversarial review corrected the private smoke's source-plan provenance and collector cancellation ownership before execution; those findings were confirmed resolved.
+
+## Standard mlx-serve benchmark comparison: frozen v31 protocol
+
+This comparison uses the repository's standard `tests/bench.sh` client protocol: pinned **llmprobe 0.6.17**, `HOST -m MODEL --bench-only --save REPORT`, without scenario overrides. The private declaration is `runs/standard-v31-default-abba/plan.json`. All eight MTP boots completed; the campaign stopped on its own validation gate after DFlash feature boot 09, as detailed below. It was not cancelled for the refactor port.
+
+- **Sixteen fresh server boots:** MTP and incoai DFlash2 each run native/feature/feature/native, then feature/native/native/feature. The same frozen v31 binary runs every arm. Native means feature-disabled stock numerical mode in this PR binary, **not an untouched upstream build**. Feature includes the required row-exact mode, adaptive lookup/width selection and initially empty writable history.
+- Preserve default prefix caching, automatic context capacity, server concurrency and client medium reasoning. Standard greedy scenarios include decode, prefill, predictable normalization, novel prose, prefix-cache cold/warm, a four-stream batching probe, the **512/4K/8K/16K context ladder**, and sustained-load decode. There are three measured samples per headline scenario and one coding/counting pair per context rung. Startup detection requests are additional.
+- The sole client-source change is the previously reviewed cache-bust initializer, shared within each quartet. Prompts, token limits, scenario order, timing code and all other client bytes remain unchanged. Each server has fresh configuration/cache directories and history; no fixture seeds or cross-boot training. Standard warmups and earlier requests can train history, so this measures **benchmark-warmed behavior**, not held-out generalization.
+- Direct client connections avoid a relay. Per-round tracing and publication receipts are off in both arms. Frozen identities cover the executable, linked runtime/Metal libraries, client/dependencies, interpreter and model metadata; safetensors payloads are not rehashed. Passive telemetry, memory snapshots and settled storage are separate from client timing.
+- Completion requires all three primary samples, all four context rungs, native-family engagement, and successful tokenizer-bound history activation/publication for feature boots. Failed slots are retained and stop the campaign; no retry or replacement. Predictable-task results filtered by the standard client remain unavailable, not zero or a substitute task.
+- Effects use within-quartet arm means and the geometric mean of the two feature/native ratios. Report both quartet effects and their range, not a confidence interval from two units. Throughput increases and latency reductions are labeled separately. Resource snapshots are not isolated lookup allocation; finalization is not added to HTTP timing.
+
+Adversarial review required linked-runtime identity checks, proof of writable-history activation, balanced-quartet reduction, and measured-sample completeness before launch. Offline checks exercised missing-sample/rung rejection, unavailable speculative metrics, client-stage errors, durable-history structure, and real owned-child termination. Those checks started no inference. This Qwen-27B comparison evaluates the combined opt-in lookup/width/routing configuration; it does not evaluate Flash-Next's learned-embedding cache.
+
+### Interim MTP quartet: repeated decode wins, cold/short-context and batching losses
+
+The first complete MTP quartet, boots **00 native / 01 feature / 02 feature / 03 native**, has no request-validation or client-stage errors. These are means of two boot-level report medians per arm; the completed eight-boot MTP estimate follows below.
+
+| Standard-suite metric | Native MTP | Feature | Observed change |
+|---|---:|---:|---:|
+| Headline decode | 20.80 tok/s | 71.45 tok/s | +243.51% |
+| Predictable decode | 42.15 tok/s | 71.80 tok/s | +70.34% |
+| Novel-prose decode | 15.30 tok/s | 50.65 tok/s | +231.05% |
+| 512-context decode | 19.90 tok/s | 17.60 tok/s | −11.56% |
+| 4K-context decode | 16.65 tok/s | 19.40 tok/s | +16.52% |
+| 8K-context decode | 18.20 tok/s | 21.20 tok/s | +16.48% |
+| 16K-context decode | 17.80 tok/s | 19.90 tok/s | +11.80% |
+| Headline TTFT | 1,103.5 ms | 1,220.5 ms | 10.60% longer |
+| Prefill throughput | 131.25 tok/s | 128.10 tok/s | −2.40% |
+| Four-stream aggregate | 24.65 tok/s | 22.85 tok/s | −7.30% |
+| Whole-client observer envelope | 1,061.260 s | 1,003.002 s | 5.49% shorter |
+
+Every boot processes the same **105,970 input / 5,137 output tokens over 36 benchmark requests**, plus identical aggregate setup usage. Actual headline, predictable, novel and context generations reach 192 tokens; batch streams reach 96. Equal lengths do not prove equal token identities or quality. Only headline/drift requests force length through `ignore_eos` and `min_tokens`.
+
+Normal runtime counters support the repeated-decode mechanism: late feature headline repeats accept **168 lookup drafts** and use **four head rounds**, versus approximately forty head rounds and five to seven accepted lookup drafts in native execution. No prefix-cache reuse is logged for these initial requests. Feature novel samples progress from **17.0→51.7→55.2** and **16.4→49.6→52.5 tok/s**: the nominally novel task itself repeats and trains history. These counters establish accepted lookup work replacing head work, not which local/persistent source supplied it.
+
+The losses have concrete reached-path evidence:
+
+- The first feature length probe uses **71/72 head rounds** with only six/five accepted lookup tokens, versus 42 head rounds in the first native boot. It is not already fast before warming.
+- At the actual 513-token context, feature uses **76/77 head rounds** versus 57 in both native boots. Higher per-draft acceptance does not compensate for lower yield per round; lookup accepts only fifteen/thirteen drafts. Individual feature head rounds are not uniformly slower.
+- Four-stream cohorts have **zero lookup rounds** and identical 384-token output totals. All arms engage batched trunk verification/decode. Native engages the shared batched MTP-head lane; row-exact feature mode disables rerank and reaches per-chain full-logit head construction instead. This is a dispatch-cost hypothesis for a future component diagnostic, not proof that it accounts for the full aggregate loss. The client's “serialized” efficiency label must not be read as absence of actual batching.
+
+Qualification remains failed because system swap-ins change. Default automatic resource sizing also yields different effective contexts (**105,472 / 115,712 / 117,760 / 116,736**) and prefix-cache budgets across boots. Actual context requests still match, and every prefix-cache probe reports **1,510/1,541 cached tokens**; those resource differences do not explain the observed short-prompt lookup transition, but prevent an isolated identical-resource claim. All context-coding quality notes report that the answer never used the planted constant; medium reasoning and the short generation cap do not establish useful long-context coding quality.
+
+Feature stores finish at **444,564/445,152 logical bytes**, or **487,424 allocated filesystem bytes** each, containing 36/37 documents. This is roughly 42% of the existing token capacity, with no enlarged limit. Process footprint and GPU cache retention include multi-gigabyte prefix-cache allocations and are not intrinsic lookup memory costs.
+
+Two independent adversarial reviews confirmed the arithmetic, matching token counts, reached work-count evidence and limits. No new campaign-continuation blocker was found. Preserve the frozen run; after completion, target cold row-exact head yield and reached batched-head dispatch rather than changing lookup admission based on an unreached candidate.
+
+### Completed MTP subset and DFlash publication failure
+
+All eight declared MTP boots completed, covering both ABBA and BAAB. The balanced estimator is the geometric mean of the two within-quartet feature/native mean ratios; two quartets do not support a confidence interval.
+
+| Standard-suite metric | Balanced change | First quartet | Second quartet |
+|---|---:|---:|---:|
+| Headline decode throughput | +221.71% | +243.51% | +201.29% |
+| Predictable decode throughput | +58.37% | +70.34% | +47.23% |
+| Repeated novel-prose throughput | +273.23% | +231.05% | +320.79% |
+| 512-context decode throughput | −10.31% | −11.56% | −9.05% |
+| 4K-context decode throughput | +6.14% | +16.52% | −3.32% |
+| 8K-context decode throughput | +10.08% | +16.48% | +4.02% |
+| 16K-context decode throughput | +11.84% | +11.80% | +11.89% |
+| Headline TTFT | 5.54% longer | 10.60% longer | 0.71% longer |
+| Prefill throughput | −2.06% | −2.40% | −1.73% |
+| Four-stream aggregate throughput | −4.64% | −7.30% | −1.89% |
+| Whole-client observer envelope | 6.63% shorter | 5.49% shorter | 7.76% shorter |
+
+These are observed results on the old main-based v31 implementation, not qualification of a new refactor-based port. The warmed-history, automatic-resource-sizing, swap and output-quality limitations above remain. The whole-client envelope includes the complete standard workload and client overhead; the 3.22× headline rate is not a whole-workload speedup.
+
+DFlash native boot 08 completed. Feature boot 09 finished its client successfully with no client-stage errors and produced a valid 35-document, 110,435-token history. However, one overlapping request logged **`[lookup] persistent store unavailable: StoreBusy`**. The predeclared history-availability gate therefore marked that boot failed and stopped the campaign; boots 10–15 were not run. No balanced DFlash standard-suite claim is available. Retain this failed cohort without replacing, resuming or relabeling it.
+
+Adversarial port review traced two incompatible overlap assumptions in the old implementation: a writable request retains an exclusive store lock throughout generation, and cached leases allow only one active borrower. The refactor port must use shared immutable request snapshots and short terminal append transactions against the current durable log. Appending an old request snapshot would lose another request's completed document; simply suppressing `StoreBusy` would hide missing history. The new baseline also permits preserving stock MTP numerical/head routing while adding external candidate sources, rather than carrying the global row-exact/cap-2 configuration responsible for additional cold and batching costs.

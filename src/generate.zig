@@ -16,6 +16,28 @@ const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
+const token_history = @import("token_history.zig");
+const speculation = @import("speculation_policy.zig");
+const lookup_adapter = @import("lookup_adapter.zig");
+const cf = @import("lookup_counterfactual.zig");
+
+pub fn lookupCounterfactualEnabled() bool {
+    return cf.enabled();
+}
+
+fn lookupCounterfactualAction() !cf.Action {
+    const raw = std.c.getenv("MLX_SERVE_LOOKUP_COUNTERFACTUAL_ACTION") orelse return error.DiagnosticMissingAction;
+    return std.meta.stringToEnum(cf.Action, std.mem.span(raw)) orelse error.DiagnosticInvalidAction;
+}
+
+const CounterfactualPending = struct {
+    kernel: cf.Kernel,
+    verify_commit_ns: u64,
+    readback_ns: u64,
+    accepted: u32,
+    count: usize,
+    complete: bool,
+};
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
@@ -1605,7 +1627,673 @@ const SsmLag = struct {
     }
 };
 
+const LookupRoute = struct {
+    const AlternativeSource = enum { plain, lookup, native_copy };
+
+    /// Historical costs per token and counters, captured before routing mutates the cut.
+    decision: speculation.RouteDecision,
+    alternative_source: ?AlternativeSource,
+    lookup_rows: u32,
+    lookup_expected_tokens: f32,
+    lookup_variant: ?speculation.Variant,
+    lookup_verify_ms: ?f32,
+};
+
+/// A separate native action, not calibrated lookup evidence. Own the small
+/// continuation because the bounded tail-query scratch is reused immediately.
+const NativeCopyAction = struct {
+    tokens: [Generator.DFLASH_TREE_W - 1]u32 = undefined,
+    len: usize,
+    backing_length: usize,
+
+    fn query(prompt: []const u32, generated: []const u32, anchor: u32, nodes: usize, depth_limit: u32, silent: *u8, enabled: bool, scratch: *[Generator.DFLASH_COPY_WINDOW]u32) ?NativeCopyAction {
+        if (!enabled) return null;
+        if (silent.* > 0) {
+            silent.* -= 1;
+            return null;
+        }
+        if (nodes == 0 or nodes >= Generator.DFLASH_TREE_W or nodes > depth_limit) return null;
+        const tail = scratch[0..@min(prompt.len + generated.len + 1, scratch.len)];
+        pld_index.tailWindow(tail, prompt, generated, anchor);
+        const copy = pld_index.backedCopy(tail, nodes, Generator.DFLASH_COPY_MATCH) orelse return null;
+        if (copy.draft.len != nodes) return null;
+        var result = NativeCopyAction{ .len = nodes, .backing_length = copy.match };
+        @memcpy(result.tokens[0..nodes], copy.draft);
+        return result;
+    }
+
+    fn geometry(self: *const NativeCopyAction, anchor: u32) speculation.Tree {
+        std.debug.assert(self.len > 0 and self.len < Generator.DFLASH_TREE_W);
+        var tree = speculation.Tree.init(anchor);
+        for (self.tokens[0..self.len], 1..) |token, row| {
+            tree.tokens[row] = token;
+            tree.parents[row] = @intCast(row - 1);
+            tree.sources[row] = .look;
+            tree.origins[row] = 1;
+        }
+        tree.len += self.len;
+        // Zero scores are geometry-only, never an acceptance prediction.
+        return tree;
+    }
+};
+
+fn nativeCopyAdaptiveEnabled(tiered_tree: bool, candidates: bool, selection: []const u8, counterfactual: bool) bool {
+    return tiered_tree and candidates and !counterfactual and std.mem.eql(u8, selection, "adaptive");
+}
+
+fn nativeCopyOutcomeEligible(raw_accepted: u32, accepted: u32, terminal: bool, completion_tokens: u32, max_tokens: u32) bool {
+    return raw_accepted == accepted and !terminal and completion_tokens < max_tokens;
+}
+
+fn nativeCopySampleEligible(actual_uncensored_copy: bool, query_solo: bool, execution_solo: bool, outcome_solo: bool) bool {
+    return actual_uncensored_copy and query_solo and execution_solo and outcome_solo;
+}
+
+fn nativeCopyFeedback(misses: *u8, silent: *u8, accepted: u32) void {
+    misses.* = if (accepted == 0) misses.* + 1 else 0;
+    if (misses.* >= 4) {
+        misses.* = 0;
+        silent.* = 16;
+    }
+}
+
+const PreparedLookupTree = struct {
+    /// Immutable bounded offer, retained before routing or assistant preparation.
+    tree: speculation.Tree,
+    execution: speculation.Tree,
+    watch: io_util.Stopwatch,
+    order: u32,
+    confidence: f32,
+    source: token_history.Source,
+    route: ?LookupRoute = null,
+    native_copy: ?NativeCopyAction = null,
+    /// Starts after all query work and before either action's route/materialization.
+    remaining_watch: ?io_util.Stopwatch = null,
+    native_copy_solo: bool = false,
+
+    fn nativeCopySelected(self: *const PreparedLookupTree) bool {
+        return if (self.route) |route| route.decision.native_copy else false;
+    }
+
+    fn routeBeforeAssistant(self: *PreparedLookupTree, cut: *speculation.Policy, class: i64, query_ms: f32, row_limit: u32, dispatch: speculation.TreeDispatch, anchor_pos: usize) void {
+        var evaluation: lookup_adapter.RouteEvaluation = .{};
+        const tracing = lookupPriceTraceEnabled();
+        const routing = lookup_adapter.route(cut, &self.execution, class, query_ms, row_limit, dispatch, if (tracing) &evaluation else null, if (self.native_copy) |copy| @intCast(copy.len + 1) else null);
+        if (tracing) for (evaluation.entries[0..evaluation.len]) |entry| {
+            log.info("[lookup-route-price] {{\"family\":\"dflash\",\"anchor_pos\":{d},\"class\":{d},\"rows\":{d},\"variant\":\"{s}\",\"query_ms\":{d:.6},\"verify_ms\":{?d:.6},\"expected_tokens\":{d:.6},\"ms_per_token\":{?d:.6}}}\n", .{
+                anchor_pos, class, entry.rows, @tagName(entry.variant), query_ms, entry.verify_ms, entry.expected_tokens, entry.ms_per_token,
+            });
+        };
+        self.route = .{
+            .decision = routing.decision,
+            .alternative_source = switch (routing.source) {
+                .plain => if (routing.plain_ms != null) .plain else null,
+                .lookup => .lookup,
+                .native_copy => .native_copy,
+            },
+            .lookup_rows = routing.lookup_rows,
+            .lookup_expected_tokens = routing.lookup_expected_tokens,
+            .lookup_variant = routing.lookup_variant,
+            .lookup_verify_ms = routing.lookup_verify_ms,
+        };
+        if (routing.decision.native_copy) self.execution = self.native_copy.?.geometry(self.tree.tokens[0]);
+    }
+
+    fn mergeInto(self: *const PreparedLookupTree, candidate: *speculation.Tree) void {
+        lookup_adapter.merge(candidate, &self.execution);
+    }
+};
+
+/// Request-owned proposals and leases over model-owned immutable history.
+pub const LookupRound = struct {
+    drafter: token_history.Drafter,
+    cut: *speculation.Policy,
+    candidates_enabled: bool = true,
+    persistent: ?*token_history.PersistentStore = null,
+    corpus_lease: ?token_history.CorpusLease = null,
+    persistent_lease: ?token_history.PersistentLease = null,
+    /// Generated tokens already indexed (`drafter.observe`).
+    gen: usize = 0,
+    /// This round's lookup continuation, then the chain the cut kept.
+    look: std.ArrayList(u32) = .empty,
+    pick: std.ArrayList(u32) = .empty,
+    query_small: [token_history.max_order]u32 = undefined,
+    /// The round's context class, for the price model.
+    cls: i64 = 0,
+    /// Selected edge evidence, copied into an in-flight MTP chain before scratch reuse.
+    chain: speculation.Tree = .{},
+    /// Initial scope: greedy row-exact MTP/DFlash; PLD retains pooled calibration.
+    trust: speculation.RequestTrust = .{},
+    trust_active: bool = false,
+    offered: ?speculation.Tree = null,
+    offered_position: usize = 0,
+    receipt: ?LookupReceipt = null,
+    controlled_root: bool = false,
+    /// Paired cost/yield from homogeneous native cycles in this request/context.
+    /// Query-adjusted wall estimates, not isolated GPU measurements.
+    native_cycles: [3]?speculation.RemainingRound = @splat(null),
+    native_query_ns: u64 = 0,
+    /// Yield evidence does not require an eligible timing interval. Keep the
+    /// paired measurements intact; combine populations only at admission.
+    native_yield: [3]f32 = @splat(0),
+    native_yield_samples: [3]u32 = @splat(0),
+
+    fn observeNativeYield(self: *LookupRound, depth: u32, tokens: u32) void {
+        if (depth == 0 or depth >= self.native_yield.len or tokens == 0 or tokens > depth + 1) return;
+        const value: f32 = @floatFromInt(tokens);
+        const mean = &self.native_yield[depth];
+        if (self.native_yield_samples[depth] == 0) mean.* = value else mean.* += 0.2 * (value - mean.*);
+        self.native_yield_samples[depth] +|= 1;
+    }
+
+    fn observeNativeCycle(self: *LookupRound, depth: u32, cycle_ms: f32, query_ns: u64, tokens: u32) void {
+        if (depth == 0 or depth >= self.native_cycles.len or tokens == 0) return;
+        const remaining = cycle_ms - @as(f32, @floatFromInt(query_ns)) / std.time.ns_per_ms;
+        if (!(remaining > 0) or !std.math.isFinite(remaining)) return;
+        const yield: f32 = @floatFromInt(tokens);
+        if (self.native_cycles[depth]) |*fresh| {
+            fresh.round_ms += 0.2 * (remaining - fresh.round_ms);
+            fresh.expected_tokens += 0.2 * (yield - fresh.expected_tokens);
+        } else self.native_cycles[depth] = .{ .round_ms = remaining, .expected_tokens = yield };
+    }
+
+    fn takeOffer(self: *LookupRound, anchor: u32, position: usize) ?speculation.Tree {
+        const offer = if (self.offered) |*value| value else return null;
+        defer self.offered = null;
+        if (position != self.offered_position or offer.tokens[0] != anchor) return null;
+        return offer.*;
+    }
+
+    /// Copy only the searchable suffix into request-owned scratch.
+    fn tailContext(self: *LookupRound, prompt: []const u32, generated: []const u32, anchor: u32) ![]const u32 {
+        const order = self.drafter.maxQueryOrder();
+        const len = @min(order, prompt.len + generated.len + 1);
+        const context = self.query_small[0..len];
+        pld_index.tailWindow(context, prompt, generated, anchor);
+        return context;
+    }
+
+    /// Query once before assistant routing; retain the same proposals for merging.
+    /// depth_limit counts draft edges after the anchor, not total verifier rows.
+    fn prepareTree(self: *LookupRound, prompt: []const u32, generated: []const u32, anchor: u32, depth_limit: u32, watch: io_util.Stopwatch, out: *PreparedLookupTree) !void {
+        if (!self.candidates_enabled) {
+            out.* = .{ .tree = speculation.Tree.init(anchor), .execution = speculation.Tree.init(anchor), .watch = watch, .order = 0, .confidence = 0, .source = .local };
+            return;
+        }
+        if (generated.len > self.gen) {
+            try self.drafter.observe(generated[self.gen..]);
+            self.gen = generated.len;
+        }
+        const context = try self.tailContext(prompt, generated, anchor);
+        const look = try self.drafter.look(context, depth_limit, &self.look);
+        out.* = .{
+            .tree = lookup_adapter.lookupTree(anchor, look.nodes, look.order, &self.cut.cal, depth_limit),
+            .execution = undefined,
+            .watch = watch,
+            .order = look.order,
+            .confidence = look.confidence,
+            .source = look.source,
+        };
+        out.execution = if (self.trust_active) self.cut.restrictLookup(&out.tree, &self.trust) else out.tree;
+    }
+
+    pub fn deinit(self: *LookupRound) void {
+        const a = self.drafter.allocator;
+        self.look.deinit(a);
+        self.pick.deinit(self.cut.prices.allocator);
+        if (self.persistent) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        self.drafter.deinit();
+        if (self.corpus_lease) |*lease| lease.deinit();
+        if (self.persistent_lease) |*lease| lease.deinit();
+    }
+};
+
+/// `MLX_SERVE_LOOKUP=1`: the three-tier lookup replaces the single-index prompt lookup.
+pub var lookup_tiers_override: ?bool = null;
+var lookup_tiers_cache: ?bool = null;
+fn lookupTiersEnabled() bool {
+    if (lookup_tiers_override) |v| return v;
+    if (lookup_tiers_cache) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_LOOKUP");
+    const on = raw != null and !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    lookup_tiers_cache = on;
+    return on;
+}
+
+/// Isolate neural tree pruning without suffix indexing, queries, or external stores.
+fn lookupCandidatesEnabled() bool {
+    const value = lookupEnvPath("MLX_SERVE_LOOKUP_CANDIDATES") orelse return true;
+    return !std.mem.eql(u8, value, "0");
+}
+
+/// `MLX_SERVE_LOOKUP_TRACE=1`: one line a round with what the lookup proposed and what the cut
+/// kept (order, vote share, rows, value, the alternative it had to beat).
+pub var lookup_trace_override: ?bool = null;
+var lookup_trace_cache: ?bool = null;
+fn lookupTraceEnabled() bool {
+    if (lookup_trace_override) |v| return v;
+    if (lookup_trace_cache) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_LOOKUP_TRACE");
+    lookup_trace_cache = raw != null and !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    return lookup_trace_cache.?;
+}
+
+fn lookupEnvPath(name: [:0]const u8) ?[]const u8 {
+    const raw = std.c.getenv(name) orelse return null;
+    const v = std.mem.sliceTo(raw, 0);
+    return if (v.len == 0) null else v;
+}
+
+const LookupSelection = struct {
+    name: []const u8 = "adaptive",
+    rows: u32 = 0,
+};
+var lookup_selection_cache: ?LookupSelection = null;
+fn lookupSelection() LookupSelection {
+    if (lookup_selection_cache) |v| return v;
+    var value = LookupSelection{};
+    if (lookupEnvPath("MLX_SERVE_LOOKUP_SELECTION")) |raw| {
+        if (std.mem.eql(u8, raw, "max")) {
+            value = .{ .name = "max", .rows = std.math.maxInt(u32) };
+        } else if (std.mem.eql(u8, raw, "cut")) {
+            value = .{ .name = "cut" };
+        } else if (std.mem.startsWith(u8, raw, "fixed:")) {
+            const rows = std.fmt.parseInt(u32, raw[6..], 10) catch 0;
+            if (rows > 0) value = .{ .name = "fixed", .rows = rows };
+        }
+    }
+    lookup_selection_cache = value;
+    return value;
+}
+const LookupReceiptMode = enum { off, commit, full };
+var lookup_receipts_cache: ?LookupReceiptMode = null;
+fn lookupReceiptMode() LookupReceiptMode {
+    if (lookup_receipts_cache) |v| return v;
+    const value = lookupEnvPath("MLX_SERVE_LOOKUP_RECEIPTS");
+    const mode: LookupReceiptMode = if (value) |raw|
+        (if (std.mem.eql(u8, raw, "1")) .full else if (std.mem.eql(u8, raw, "commit")) .commit else .off)
+    else
+        .off;
+    lookup_receipts_cache = mode;
+    return mode;
+}
+fn lookupReceiptsEnabled() bool {
+    return lookupReceiptMode() == .full;
+}
+/// Complete published IDs and one-time store identity, without round diagnostics
+/// or their native-path settlement barriers. Production policy timing is unchanged.
+fn lookupPublicationsEnabled() bool {
+    return lookupReceiptMode() != .off;
+}
+var lookup_price_trace_cache: ?bool = null;
+fn lookupPriceTraceEnabled() bool {
+    if (lookup_price_trace_cache) |v| return v;
+    const value = lookupEnvPath("MLX_SERVE_LOOKUP_PRICE_TRACE");
+    const on = value != null and std.mem.eql(u8, value.?, "1");
+    lookup_price_trace_cache = on;
+    return on;
+}
+fn lookupStoreWrites() bool {
+    const value = lookupEnvPath("MLX_SERVE_LOOKUP_STORE_WRITE") orelse return true;
+    return !std.mem.eql(u8, value, "0");
+}
+
+const NativeCopyReceipt = struct {
+    rows: usize,
+    backing_length: usize,
+    geometry_hash: u64,
+    selected: bool,
+    ms_per_token: ?f32,
+    expected_tokens: ?f32,
+};
+
+const LookupReceipt = struct {
+    version: u32 = 1,
+    context_bucket: []const u8 = "floor-power-of-two-2048",
+    family: []const u8,
+    kind: []const u8,
+    variant: speculation.Variant = .generic,
+    lookup_candidates: bool = true,
+    class: i64,
+    anchor_pos: usize,
+    prefix_hash: u64,
+    prompt_hash: u64,
+    candidate_hash: u64,
+    candidate_probability_hash: ?u64 = null,
+    candidate_rows: usize,
+    legal_rows: usize,
+    requested_rows: u32,
+    selection: []const u8,
+    rows: usize,
+    admissible: bool,
+    assistant: bool = false,
+    route: ?LookupRoute = null,
+    /// Separate action identity: it need not fit inside the bounded lookup offer.
+    native_copy: ?NativeCopyReceipt = null,
+    executed_geometry_hash: ?u64 = null,
+    lookup_order: ?u32 = null,
+    /// Raw lookup vote share, before source calibration.
+    lookup_confidence: ?f32 = null,
+    selected_local: usize = 0,
+    // Root-only without assistant work; lookup preparation may still have run.
+    root_no_assistant: bool = false,
+    selected_corpus: usize = 0,
+    selected_persistent: usize = 0,
+    selected_neural: usize = 0,
+    accepted: u32 = 0,
+    committed: usize = 0,
+    draft_ms: ?f32 = null,
+    // Exact chooser input, not whole-request overhead; null when no chooser ran.
+    selection_overhead_ms: ?f32 = null,
+    preverify_ms: ?f32 = null,
+    carried_preparation_ms: ?f32 = null,
+    verify_commit_ms: ?f32 = null,
+    round_ms: ?f32 = null,
+    other_ms: ?f32 = null,
+    predicted_verify_ms: ?f32 = null,
+    predicted_tokens: ?f32 = null,
+    timing_scope: []const u8 = "settled_round",
+    commit_scope: []const u8 = "returned_block",
+    priced: bool = false,
+
+    fn recordNativeCopy(self: *LookupReceipt, prepared: *const PreparedLookupTree) void {
+        const copy = prepared.native_copy orelse return;
+        const route = prepared.route.?.decision;
+        const geometry = copy.geometry(prepared.tree.tokens[0]);
+        self.native_copy = .{
+            .rows = geometry.len,
+            .backing_length = copy.backing_length,
+            .geometry_hash = lookupTreeHash(&geometry),
+            .selected = route.native_copy,
+            .ms_per_token = route.native_copy_ms,
+            .expected_tokens = route.native_copy_tokens,
+        };
+        if (route.native_copy) self.predicted_tokens = route.native_copy_tokens;
+    }
+
+    /// Reconcile a carried chain with its final executable prefix. Candidate identity
+    /// remains the original offer; only executed-action predictions and labels change.
+    fn limitChain(self: *LookupReceipt, tree: *const speculation.Tree, policy: *const speculation.Policy, executed_drafts: u32, max_rows: usize) void {
+        if (tree.len == 0) return;
+        const rows = 1 + @min(tree.len - 1, executed_drafts);
+        self.rows = rows;
+        self.legal_rows = @min(self.legal_rows, max_rows);
+        self.admissible = self.admissible and (self.requested_rows == 0 or self.requested_rows == rows);
+        self.predicted_verify_ms = policy.predictVerify(@intCast(rows), .chain, self.class, .generic);
+        var expected: f32 = 0;
+        for (tree.scores[0..rows]) |reach| expected += reach;
+        self.predicted_tokens = expected;
+        self.selected_local = 0;
+        self.selected_corpus = 0;
+        self.selected_persistent = 0;
+        self.selected_neural = 0;
+        for (tree.origins[1..rows]) |origin| {
+            self.selected_local += @intFromBool(origin & 1 != 0);
+            self.selected_corpus += @intFromBool(origin & 2 != 0);
+            self.selected_persistent += @intFromBool(origin & 4 != 0);
+            self.selected_neural += @intFromBool(origin & 8 != 0);
+        }
+    }
+
+
+    fn emit(self: LookupReceipt, allocator: std.mem.Allocator) void {
+        const json = std.json.Stringify.valueAlloc(allocator, self, .{}) catch return;
+        defer allocator.free(json);
+        log.info("[lookup-round] {s}\n", .{json});
+    }
+};
+
+fn lookupTreeHash(tree: *const speculation.Tree) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.sliceAsBytes(tree.tokens[0..tree.len]));
+    h.update(std.mem.sliceAsBytes(tree.parents[0..tree.len]));
+    h.update(tree.origins[0..tree.len]);
+    return h.final();
+}
+
+/// Diagnostic geometry only: the first native-count best-first admissions,
+/// preserved through the expanded tree's preorder. Never feed these zero
+/// scores to a selector or compare them with merged calibrated probabilities.
+fn nativeAdmissionTree(anchor: u32, full: *const dflash_mod.DraftTree, admission_order: []const usize, count: usize, depth_limit: u32) speculation.Tree {
+    std.debug.assert(full.tokens.len < speculation.MAX_TREE_ROWS and admission_order.len >= full.tokens.len);
+    var result = speculation.Tree.init(anchor);
+    var remap: [speculation.MAX_TREE_ROWS]usize = @splat(0);
+    for (full.tokens, 0..) |token, row| {
+        if (admission_order[row] >= count or full.depth[row] >= depth_limit) continue;
+        const parent = full.parents[row];
+        std.debug.assert(parent < @as(i32, @intCast(row)));
+        if (parent >= 0) std.debug.assert(remap[@intCast(parent)] != 0);
+        const dst = result.len;
+        remap[row] = dst;
+        result.tokens[dst] = token;
+        result.parents[dst] = if (parent < 0) 0 else @intCast(remap[@intCast(parent)]);
+        result.origins[dst] = 8;
+        result.len += 1;
+    }
+    return result;
+}
+
+/// Identity includes ancestry: equal token IDs under different parents are not
+/// evidence that a native path survived. Root is included in the row mapping.
+fn nativeSelectedRows(native: *const speculation.Tree, selected: *const speculation.Tree) [speculation.MAX_TREE_ROWS]i32 {
+    var matched: [speculation.MAX_TREE_ROWS]i32 = @splat(-1);
+    if (native.tokens[0] != selected.tokens[0]) return matched;
+    matched[0] = 0;
+    for (1..native.len) |row| {
+        const parent = matched[@intCast(native.parents[row])];
+        if (parent < 0) continue;
+        for (1..selected.len) |other| {
+            if (selected.parents[other] == parent and selected.tokens[other] == native.tokens[row]) {
+                matched[row] = @intCast(other);
+                break;
+            }
+        }
+    }
+    return matched;
+}
+
+fn writeNativeCandidate(writer: *std.Io.Writer, receipt: *const LookupReceipt, native: *const speculation.Tree, selected: *const speculation.Tree, remaining: u32, horizon: u32) !void {
+    const matched = nativeSelectedRows(native, selected);
+    try std.json.Stringify.value(.{
+        .version = @as(u32, 1),
+        .family = "dflash",
+        .class = receipt.class,
+        .anchor_pos = receipt.anchor_pos,
+        .prefix_hash = receipt.prefix_hash,
+        .prompt_hash = receipt.prompt_hash,
+        .candidate_hash = receipt.candidate_hash,
+        .selection = receipt.selection,
+        .requested_rows = receipt.requested_rows,
+        .assistant_horizon = horizon,
+        .remaining_token_budget = remaining,
+        .scope = "offered_geometry_only",
+        .commit_scope = "not_publication_evidence",
+        .terminal_censoring_required = true,
+        .serial_join = "Join exact complete published token IDs at anchor_pos minus prompt length; require anchor match. Missing continuation or terminal output censors yield; never infer a rejection or bonus token beyond published output.",
+        .native = .{
+            .hash = lookupTreeHash(native),
+            .variant = native.variant(.linear_gdn),
+            .tokens = native.tokens[0..native.len],
+            .parents = native.parents[0..native.len],
+            .selected_rows = matched[0..native.len],
+        },
+        .selected = .{
+            .hash = lookupTreeHash(selected),
+            .variant = selected.variant(.linear_gdn),
+            .tokens = selected.tokens[0..selected.len],
+            .parents = selected.parents[0..selected.len],
+        },
+    }, .{}, writer);
+}
+
+fn emitNativeCandidate(receipt: *const LookupReceipt, native: *const speculation.Tree, selected: *const speculation.Tree, remaining: u32, horizon: u32) void {
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    writeNativeCandidate(&writer, receipt, native, selected, remaining, horizon) catch {
+        log.err("[lookup-native-candidate-invalid] diagnostic buffer exhausted\n", .{});
+        return;
+    };
+    log.info("[lookup-native-candidate] {s}\n", .{writer.buffered()});
+}
+
+/// The actual priced native-width competitor can differ from original native
+/// geometry. Capture both without another selection, target evaluation or price.
+fn emitCompetingCandidate(receipt: *const LookupReceipt, candidate: *const speculation.Tree, native: *const speculation.Tree, selected: *const speculation.Tree, entry: speculation.TreeEvaluation.Entry, preparation_ms: f32, selected_verify_ms: ?f32, forced_trial: bool) void {
+    const alternative = if (entry.retained_native) native.* else candidate.subset(entry.prefix_mask);
+    std.debug.assert(alternative.len == entry.rows and alternative.variant(.linear_gdn) == entry.variant);
+    var buffer: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    std.json.Stringify.value(.{
+        .version = @as(u32, 1),
+        .family = "dflash",
+        .class = receipt.class,
+        .anchor_pos = receipt.anchor_pos,
+        .prefix_hash = receipt.prefix_hash,
+        .prompt_hash = receipt.prompt_hash,
+        .candidate_hash = receipt.candidate_hash,
+        .selection = receipt.selection,
+        .requested_rows = receipt.requested_rows,
+        .scope = "priced_alternatives_geometry_only",
+        .commit_scope = "not_publication_evidence",
+        .terminal_censoring_required = true,
+        .preparation_ms = preparation_ms,
+        .forced_upper_trial = forced_trial,
+        .native = .{
+            .tokens = native.tokens[0..native.len],
+            .parents = native.parents[0..native.len],
+            .variant = native.variant(.linear_gdn),
+        },
+        .alternative = .{
+            .rows = entry.rows,
+            .retained_native = entry.retained_native,
+            .tokens = alternative.tokens[0..alternative.len],
+            .parents = alternative.parents[0..alternative.len],
+            .origins = alternative.origins[0..alternative.len],
+            .variant = entry.variant,
+            .expected_tokens = entry.expected_tokens,
+            .verify_ms = entry.verify_ms,
+            .tokens_per_ms = entry.tokens_per_ms,
+        },
+        .selected = .{
+            .rows = selected.len,
+            .tokens = selected.tokens[0..selected.len],
+            .parents = selected.parents[0..selected.len],
+            .origins = selected.origins[0..selected.len],
+            .variant = selected.variant(.linear_gdn),
+            .expected_tokens = receipt.predicted_tokens,
+            .verify_ms = selected_verify_ms,
+            .tokens_per_ms = if (selected_verify_ms) |ms| receipt.predicted_tokens.? / (preparation_ms + ms) else @as(?f32, null),
+        },
+    }, .{}, &writer) catch {
+        log.err("[lookup-competing-candidate-invalid] diagnostic buffer exhausted\n", .{});
+        return;
+    };
+    log.info("[lookup-competing-candidate] {s}\n", .{writer.buffered()});
+}
+
+fn lookupRoundMs(elapsed_ns: u64, preparation_ns: u64, carried: bool) f32 {
+    const total_ns = elapsed_ns +| if (carried) preparation_ns else 0;
+    return @as(f32, @floatFromInt(total_ns)) / std.time.ns_per_ms;
+}
+
+/// Context labels follow the host's lower-bound cost buckets.
+pub fn lookupCtxClass(kv_len: usize) i64 {
+    return lookup_adapter.contextClass(kv_len);
+}
+
+test "lookup specTreeFor: only proven chains enable no-restart GDN" {
+    var parents: [16]i32 = undefined;
+    var depth: [16]i32 = undefined;
+    for (0..16) |i| {
+        parents[i] = @as(i32, @intCast(i)) - 1;
+        depth[i] = @intCast(i);
+    }
+    for ([_]usize{ 1, 2, 8, 9, 15, 16 }) |w| {
+        const chain = Generator.specTreeFor(parents[0..w], depth[0..w], @intCast(w - 1));
+        defer chain.deinit();
+        try std.testing.expect(chain.linear);
+        try std.testing.expectEqual(w > 8, chain.usesLinearGdn(w));
+        if (w > 2) {
+            // The last row branches from the root, not its preceding row.
+            parents[w - 1] = 0;
+            depth[w - 1] = 1;
+            const branch = Generator.specTreeFor(parents[0..w], depth[0..w], @intCast(w - 2));
+            defer branch.deinit();
+            try std.testing.expect(!branch.linear);
+            try std.testing.expect(!branch.usesLinearGdn(w));
+            parents[w - 1] = @intCast(w - 2);
+            depth[w - 1] = @intCast(w - 1);
+        }
+    }
+}
+
 pub const Generator = struct {
+    pub const PldBackoff = struct {
+        pub const Action = enum { lookup, native, drain, cold };
+        left: u8 = 0,
+        window: u8 = 0,
+        /// Actual emitted skip tokens, including drains (never counted twice).
+        plain_tokens: u64 = 0,
+        native_tokens: u64 = 0,
+        drain_tokens: u64 = 0,
+        cold_tokens: u64 = 0,
+        misses: u64 = 0,
+        resets: u64 = 0,
+
+        pub fn enabled() bool {
+            const value = lookupEnvPath("MLX_SERVE_LOOKUP_BACKOFF") orelse return true;
+            return !std.mem.eql(u8, value, "0");
+        }
+
+        fn action(self: PldBackoff, pending: bool) Action {
+            if (self.left == 0) return .lookup;
+            if (self.left > 1) return .native;
+            // A clean one-token block cannot launch next() then drain without
+            // emitting twice. Only this boundary uses the existing cold step.
+            return if (pending) .drain else .cold;
+        }
+
+        /// The miss token is outside the skip budget; next() seeds its successor.
+        fn beginNativeMiss(self: *PldBackoff, backoff_enabled: bool, absent: bool, selection_rows: u32) bool {
+            if (!backoff_enabled or !absent or selection_rows != 0) return false;
+            self.miss("no_match");
+            return true;
+        }
+
+        fn miss(self: *PldBackoff, reason: []const u8) void {
+            self.window = @min(@as(u8, 8), @max(@as(u8, 1), self.window * 2));
+            self.left = self.window;
+            self.misses += 1;
+            self.trace(reason);
+        }
+
+        fn success(self: *PldBackoff) void {
+            self.window = 0;
+            self.left = 0;
+            self.resets += 1;
+            self.trace("accepted");
+        }
+
+        fn emitted(self: *PldBackoff, kind: []const u8) void {
+            std.debug.assert(self.left > 0);
+            self.left -= 1;
+            self.plain_tokens += 1;
+            if (std.mem.eql(u8, kind, "native")) self.native_tokens += 1
+            else if (std.mem.eql(u8, kind, "drain")) self.drain_tokens += 1
+            else self.cold_tokens += 1;
+            self.trace(kind);
+        }
+
+        fn trace(self: PldBackoff, event: []const u8) void {
+            if (lookupReceiptsEnabled() or lookupTraceEnabled())
+                log.info("[lookup-backoff] {{\"family\":\"pld\",\"event\":\"{s}\",\"window\":{d},\"left\":{d},\"plain_tokens\":{d},\"native_tokens\":{d},\"drain_tokens\":{d},\"cold_tokens\":{d},\"misses\":{d},\"resets\":{d}}}\n", .{
+                    event, self.window, self.left, self.plain_tokens, self.native_tokens, self.drain_tokens, self.cold_tokens, self.misses, self.resets,
+                });
+        }
+    };
     /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
     /// -1) at `depth`: the GDN tree table and each row's ancestor path.
     pub fn specTreeFor(parents: []const i32, depth: []const i32, max_depth: i32) transformer_mod.SpecTree {
@@ -1626,6 +2314,7 @@ pub const Generator = struct {
         gdn_decode.treeTable(parents, table[0 .. 6 * w]);
         return .{
             .parents = mlx.mlx_array_new_data(&table, &[_]c_int{6 * wc}, 1, .int32),
+            .linear = gdn_decode.linearParents(parents),
             .attn = .{
                 .depth = mlx.mlx_array_new_data(depth.ptr, &[_]c_int{wc}, 1, .int32),
                 .path = mlx.mlx_array_new_data(&path, &[_]c_int{ wc, @intCast(maxd) }, 2, .int32),
@@ -1713,6 +2402,25 @@ pub const Generator = struct {
     /// owned slices are freed via the `allocator` argument to `deinit` for
     /// historical reasons; this one is set during `initWithOptions`.)
     prompt_ids_alloc: ?std.mem.Allocator = null,
+    lookup_prefix_hash: std.hash.Wyhash = std.hash.Wyhash.init(0),
+    lookup_prefix_count: usize = 0,
+    lookup_prefix_primed: bool = false,
+    lookup_prompt_hash: u64 = 0,
+    /// A scheduler may publish only a prefix of an internally verified block.
+    published_output: ?[]const u32 = null,
+    published_finish_reason: ?[]const u8 = null,
+    publication_managed: bool = false,
+    pending_lookup_receipt: ?LookupReceipt = null,
+    diagnostic_owned_slot: bool = false,
+    diagnostic_cache_off: bool = false,
+    diagnostic_model_sha256: ?cf.Digest = null,
+    diagnostic_request_sha256: ?cf.Digest = null,
+    diagnostic_readback_ns: u64 = 0,
+    diagnostic_pending: ?CounterfactualPending = null,
+    diagnostic_first_published: ?u32 = null,
+    /// Test oracle injection; production always constructs and selects real proposals.
+    lookup_test_candidate: if (@import("builtin").is_test) ?speculation.Tree else void = if (@import("builtin").is_test) null else {},
+    lookup_test_targets: if (@import("builtin").is_test) ?[]const i32 else void = if (@import("builtin").is_test) null else {},
     /// Did init actually arm PLD for this generator (`InitOptions.pld_enabled`
     /// AFTER the deepseek_v4 chokepoint guard)? `nextPld` declines to the
     /// plain serial step when false, and the scheduler's tick dispatch
@@ -1814,6 +2522,8 @@ pub const Generator = struct {
     ssm_lag: [2]SsmLag = .{ .{}, .{} },
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
+    /// Actual non-anchor verification rows, including lookup branches and width cuts.
+    dflash_verified_drafts: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -1845,6 +2555,8 @@ pub const Generator = struct {
     mtp_kept: u32 = 0,
     mtp_tried: u32 = 0,
     mtp_cycle_watch: ?io_util.Stopwatch = null,
+    mtp_cycle_depth: u32 = 0,
+    mtp_cycle_shape: MtpCycleShape = .ineligible,
     /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
     model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
@@ -1864,8 +2576,16 @@ pub const Generator = struct {
     mtp_depth_current: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Stats: count of nextMtp calls that ran a verify forward.
     mtp_attempted: u64 = 0,
+    lookup_mtp_probe_class: ?i64 = null,
+    lookup_mtp_probe_attempts: u8 = 0,
+    lookup_mtp_probe_eligible: u8 = 0,
+    lookup_mtp_probe_learned: u8 = 0,
+    lookup_mtp_probe_gaps: u8 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     mtp_accepted_tokens: u64 = 0,
+    /// Fresh ordinary native cycles supersede inherited depth costs within this request.
+    mtp_request_depth_ms: [3]f32 = @splat(0),
+    mtp_request_depth_class: ?i64 = null,
     /// Adaptive-depth moving window: per-round drafted/accepted counts.
     mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
     mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
@@ -1886,6 +2606,10 @@ pub const Generator = struct {
     /// Prompt + committed output, indexed up to `mtp_lookup_gen` generated tokens.
     mtp_lookup_idx: ?mtp_lookup.Index = null,
     mtp_lookup_gen: usize = 0,
+    /// Independent three-tier proposals and cost-aware selection, armed by
+    /// `MLX_SERVE_LOOKUP=1`. One per generator: primed with the prompt, extended with every
+    /// committed token, read before an MTP round's draft.
+    lookup_tiers: ?LookupRound = null,
     /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
     mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
     mtp_round_ema: f32 = 0,
@@ -2044,6 +2768,8 @@ pub const Generator = struct {
     /// fresh economic evaluation instead of inheriting the bad early yield.
     yield_steps: u64 = 0,
     yield_accepted: u64 = 0,
+    /// Standalone tiered PLD only; drain emissions count inside the skip budget.
+    pld_backoff: PldBackoff = .{},
     /// Steps spent in disabled mode since the gate tripped (drives the
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
@@ -2344,23 +3070,21 @@ pub const Generator = struct {
         if (self.dflash != null and self.dflash_attempted + self.dflash_plain > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(@max(self.dflash_attempted, 1)));
-            const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-            // Under the chooser the width varies per round: drafts proposed
-            // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed = self.dflash_verified_drafts;
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% drafted={d} block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
+                    drafts_proposed,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
                     self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
@@ -2370,7 +3094,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
                     self.xfm.round_cost.dropped_implausible,
-                    if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
+                    @as(f32, @floatFromInt(drafts_proposed)) / @as(f32, @floatFromInt(@max(self.dflash_attempted, 1))),
                     if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                     self.dflash_plain,
@@ -2464,6 +3188,12 @@ pub const Generator = struct {
     };
 
     pub const InitOptions = struct {
+        /// Set only by the scheduler after exclusive admission and real cache bypass.
+        diagnostic_owned_slot: bool = false,
+        diagnostic_cache_off: bool = false,
+        /// Content digest of the target and assistant model files.
+        diagnostic_model_sha256: ?cf.Digest = null,
+        diagnostic_request_sha256: ?cf.Digest = null,
         /// Skip the lazy pre-forward of the first sampled token. When set,
         /// init samples t1 synchronously and leaves `pending_logits/pending_token`
         /// empty — the cache lands at exactly `prompt_len` with t1 NOT in cache.
@@ -2742,6 +3472,21 @@ pub const Generator = struct {
         eos_token_ids: []const u32,
         options_in: InitOptions,
     ) !Generator {
+        if (lookupCounterfactualEnabled()) {
+            try (try cf.preparation()).validate(try lookupCounterfactualAction(), lookupCandidatesEnabled());
+            if (options_in.diagnostic_request_sha256 == null) return error.DiagnosticPreconditions;
+            if (!options_in.diagnostic_owned_slot or !options_in.diagnostic_cache_off or options_in.diagnostic_model_sha256 == null or
+                !xfm.config.rowExactDecode() or !options_in.dflash_enabled or options_in.dflash == null or
+                !lookupTiersEnabled() or lookupStoreWrites() or sampling_in.temperature != 0 or sampling_in.seed == null or
+                sampling_in.constraint != null or sampling_in.think_bound != null or sampling_in.tool_force != null or sampling_in.penalized() or
+                options_in.mtp_enabled or options_in.pld_enabled or max_tokens < 16 or tok.content_sha256 == null or
+                !xfm.specTreeSupported() or xfm.qwen4 != null or xfm.config.has_sliding_window or xfm.config.isMoe() or xfm.ane_prefill != null)
+                return error.DiagnosticPreconditions;
+            if (options_in.dflash.?.selector == null or options_in.dflash.?.markov != null or options_in.dflash.?.lilicorr != null)
+                return error.DiagnosticUnsupportedAssistant;
+            if (!std.mem.eql(u8, xfm.config.model_type, "qwen3_5") and !std.mem.eql(u8, xfm.config.model_type, "qwen3_5_moe"))
+                return error.DiagnosticUnsupportedDispatch;
+        }
         // Reserved-token suppression rides the sampling params from HERE —
         // the one chokepoint every init site funnels through — so every
         // sampling path (serial, PLD/drafter/MTP corrections, draft heads,
@@ -3083,8 +3828,8 @@ pub const Generator = struct {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
                 // the KV built so far is freed with the slot.
-                if (options.cancel_flag) |cf| {
-                    if (cf.load(.acquire)) {
+                if (options.cancel_flag) |cancel| {
+                    if (cancel.load(.acquire)) {
                         // Salvage the chunk loop's progress: `forwarded` is
                         // the authoritative length (cache.step only advances
                         // when init completes), the stride checkpoints ride
@@ -3345,8 +4090,8 @@ pub const Generator = struct {
                 }
                 // The tick allocated for co-tenant slots; re-price the widen against what is left.
                 if (pending_widen != 0) {
-                    if (widen_confirm) |cf| {
-                        if (cf(widen_ctx.?, ssm_cp_offset + pos, pending_widen)) {
+                    if (widen_confirm) |confirm_width| {
+                        if (confirm_width(widen_ctx.?, ssm_cp_offset + pos, pending_widen)) {
                             commitAdaptiveWidth(&cur_chunk, &adapt_state, pending_widen);
                         } else {
                             adapt_state.supporting = 0;
@@ -3649,6 +4394,10 @@ pub const Generator = struct {
             else
                 0;
             var gen = Generator{
+                .diagnostic_owned_slot = options.diagnostic_owned_slot,
+                .diagnostic_cache_off = options.diagnostic_cache_off,
+                .diagnostic_model_sha256 = options.diagnostic_model_sha256,
+                .diagnostic_request_sha256 = options.diagnostic_request_sha256,
                 .xfm = xfm,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
@@ -3993,7 +4742,145 @@ pub const Generator = struct {
         return @min(self.loop_guard_start, self.generated_ids.items.len);
     }
 
+    /// Borrowed through deinit; direct generator callers retain their existing output contract.
+    pub fn setPublishedOutput(self: *Generator, ids: []const u32, reason: []const u8) void {
+        self.published_output = ids;
+        self.published_finish_reason = reason;
+        if (lookupCounterfactualEnabled() and !std.mem.eql(u8, reason, "stop"))
+            self.invalidateCounterfactual();
+    }
+
+    fn invalidateCounterfactual(self: *Generator) void {
+        self.diagnostic_pending = null;
+        if (self.xfm.lookup_counterfactual) |*probe| {
+            probe.active = false;
+            probe.warmup = null;
+            probe.requests = 2;
+        }
+        log.err("[lookup-counterfactual-invalid] request did not complete normally\n", .{});
+    }
+
+    fn outputIds(self: *const Generator) []const u32 {
+        return self.published_output orelse self.generated_ids.items;
+    }
+
+    fn outputFinishReason(self: *const Generator) []const u8 {
+        return self.published_finish_reason orelse self.finish_reason;
+    }
+
+    pub fn managePublication(self: *Generator) void {
+        self.publication_managed = true;
+    }
+
+    /// Called only after the scheduler has actually appended the early prefill token.
+    pub fn noteCounterfactualFirstPublished(self: *Generator, token: u32) void {
+        if (!lookupCounterfactualEnabled()) return;
+        self.diagnostic_first_published = token;
+    }
+
+    fn recordLookupReceipt(self: *Generator, allocator: std.mem.Allocator, receipt: LookupReceipt) void {
+        if (self.publication_managed) {
+            std.debug.assert(self.pending_lookup_receipt == null);
+            self.pending_lookup_receipt = receipt;
+        } else receipt.emit(allocator);
+    }
+
+    fn takePublishedLookupReceipt(self: *Generator, published_count: usize) ?LookupReceipt {
+        var receipt = self.pending_lookup_receipt orelse return null;
+        self.pending_lookup_receipt = null;
+        const start = receipt.anchor_pos -| self.prompt_ids_owned.len;
+        receipt.committed = @min(receipt.committed, published_count -| start);
+        receipt.commit_scope = "published";
+        return receipt;
+    }
+
+    pub fn publishLookupReceipt(self: *Generator, allocator: std.mem.Allocator, published_ids: []const u32) void {
+        self.publishCounterfactual(allocator, published_ids);
+        if (self.takePublishedLookupReceipt(published_ids.len)) |receipt| receipt.emit(allocator);
+    }
+
+    fn publishCounterfactual(self: *Generator, allocator: std.mem.Allocator, published_ids: []const u32) void {
+        if (!lookupCounterfactualEnabled()) return;
+        const pending = self.diagnostic_pending orelse return;
+        self.diagnostic_pending = null;
+        const probe = &self.xfm.lookup_counterfactual.?;
+        const count = @min(published_ids.len, pending.count);
+        const complete = pending.complete and published_ids.len == pending.count and
+            std.mem.eql(u32, published_ids[0..count], self.generated_ids.items[0..count]) and
+            (self.published_finish_reason == null or std.mem.eql(u8, self.published_finish_reason.?, "stop"));
+        const receipt = probe.finishFirstRound(pending.kernel, .{
+            .verify_commit_ns = pending.verify_commit_ns,
+            .full_round_ns = null,
+            .diagnostic_readback_ns = pending.readback_ns,
+        }, published_ids[0..count], pending.accepted, complete) catch |err| {
+            probe.active = false;
+            probe.warmup = null;
+            probe.requests = 2;
+            log.err("[lookup-counterfactual-invalid] {s}\n", .{@errorName(err)});
+            return;
+        };
+        const json = std.json.Stringify.valueAlloc(allocator, receipt, .{}) catch {
+            probe.warmup = null;
+            probe.requests = 2;
+            log.err("[lookup-counterfactual-invalid] receipt allocation failed\n", .{});
+            return;
+        };
+        defer allocator.free(json);
+        log.info("[lookup-counterfactual] {s}\n", .{json});
+    }
+
+    fn persistLookupTurn(self: *const Generator, allocator: std.mem.Allocator, store: *token_history.PersistentStore) !void {
+        var document: std.ArrayList(u32) = .empty;
+        defer document.deinit(allocator);
+        try document.ensureTotalCapacity(allocator, self.prompt_ids_owned.len + self.outputIds().len);
+        document.appendSliceAssumeCapacity(self.prompt_ids_owned);
+        document.appendSliceAssumeCapacity(self.outputIds());
+        try store.appendFinalTurn(document.items);
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        // Short requests must not disappear from opt-in phase profiles merely
+        // because they finish before the periodic logging cadence.
+        if (dflashTraceEnabled()) self.flushDflashTrace();
+        if (mtpTraceEnabled()) self.flushMtpTrace();
+        if (self.publication_managed) {
+            std.debug.assert(self.published_output != null);
+            self.publishLookupReceipt(allocator, self.outputIds());
+        }
+        if (lookupPublicationsEnabled()) {
+            const json = std.json.Stringify.valueAlloc(allocator, .{
+                .version = @as(u32, 1),
+                .prompt_ids = self.prompt_ids_owned,
+                .prompt_hash = self.lookupPromptHash(),
+                .generated_ids = self.outputIds(),
+                .finish_reason = self.outputFinishReason(),
+            }, .{}) catch null;
+            if (json) |text| {
+                defer allocator.free(text);
+                log.info("[lookup-commit] {s}\n", .{text});
+            }
+        }
+        // Capture only committed tokens, before releasing either prompt or generated storage.
+        if (self.lookup_tiers) |*lr| {
+            // SSE completion can precede this work. Measure append plus history
+            // teardown, not the rest of generator/slot cleanup or observer waits.
+            const finalize_watch = if (lookupPublicationsEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
+            const write_requested = lookupStoreWrites() and lr.persistent != null;
+            var write_succeeded = false;
+            if (write_requested) {
+                const store = lr.persistent.?;
+                if (self.persistLookupTurn(allocator, store)) |_| {
+                    write_succeeded = true;
+                } else |err| {
+                    log.warn("[lookup] saving committed tokens failed: {s}\n", .{@errorName(err)});
+                }
+            }
+            lr.deinit();
+            self.lookup_tiers = null;
+            if (finalize_watch) |watch| log.info("[lookup-finalize] {{\"version\":1,\"write_requested\":{any},\"write_succeeded\":{any},\"elapsed_ns\":{d}}}\n", .{
+                write_requested, write_succeeded, watch.read(),
+            });
+        }
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
         for (&self.ssm_lag) |*lag| lag.deinit(self.xfm.allocator);
@@ -4628,13 +5515,44 @@ pub const Generator = struct {
         // dispatch bug ever routes such a request here.
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
+        const tiered = lookupTiersEnabled();
+        const backoff_enabled = tiered and PldBackoff.enabled();
+        // Candidate ablation never queries and retains the ordinary pipeline.
+        if (tiered and !lookupCandidatesEnabled()) {
+            const tok = (try self.next(allocator)) orelse return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok;
+            return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+        }
+        var clean_backoff_step = false;
+        if (backoff_enabled and self.pld_backoff.left > 0) {
+            const action = self.pld_backoff.action(self.has_pending_logits or self.has_pending_token);
+            switch (action) {
+                .lookup => unreachable,
+                .cold => clean_backoff_step = true,
+                .native, .drain => {
+                    const tok = if (action == .native)
+                        (try self.next(allocator)) orelse return null
+                    else switch (try self.drainPipelineForSpec(allocator)) {
+                        .drained => |token| token,
+                        .stopped => return null,
+                        .already_clean, .stay_disabled => return error.PipelineHalfState,
+                    };
+                    self.pld_backoff.emitted(@tagName(action));
+                    const tokens = try allocator.alloc(u32, 1);
+                    tokens[0] = tok;
+                    return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+                },
+            }
+        }
+
         // Runtime acceptance gate: if a prior step set the flag, fall back
         // to the regular `next()` path. Under v2, PLD's exit invariant has
         // `t1 NOT in cache` (matches `nextDrafter`) — `next()`'s transition
         // shim seeds `pending_logits` synchronously via `forward([t1])` when
         // it sees `!has_pending_logits and !has_pending_token`. So the
         // hand-off works even though pending state is empty.
-        if (self.spec_disabled_runtime) {
+        if (!tiered and self.spec_disabled_runtime) {
             self.disabled_steps += 1;
             // Periodic re-enable check: when the generated tail turns
             // repetitive (file/tool echo after a novel preamble), PLD pays
@@ -4694,6 +5612,7 @@ pub const Generator = struct {
             }
         }
 
+        const pad_before_stop = self.consecutive_pad;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
@@ -4702,20 +5621,19 @@ pub const Generator = struct {
         // ── INVARIANT going INTO this call (mirrors `nextDrafter`) ──
         //   cache.step = prompt_len + tokens_emitted   (NOT + 1)
         //   t1 = next_token_id (= "this step's first emit"); NOT in cache yet.
-        //   pending_logits / pending_token are empty (init's PLD branch and
-        //   every nextPld exit leave them empty under v2).
+        //   pending_logits / pending_token are empty here: native backoff
+        //   returns above until its terminal drain restores this invariant.
         //
-        // Cold path (no n-gram match): forward([t1]) length 1 advances cache
-        // by 1, produces logits at position +1 → sample lookahead → emit t1,
-        // set next_token_id = lookahead. Loses A's lazy pipeline overlap on
-        // cold steps; the prompt-time n-gram gate disables PLD on novel
-        // content where cold-path dominates.
+        // An adaptive absent-proposal round enters next() and leaves a native
+        // successor pending. Other root-only rounds retain the settled cold
+        // forward/sample path (including fixed/max diagnostic controls).
         //
         // Verify path: input = `[t1, draft[0..m-1]]` length 1+m. Walk
         // verify_logits[i] vs draft[i] for i=0..m-1; full accept commits 1+m
         // tokens and exits with cache at prompt_len + TE_new (no post-step
         // forward — that is the per-step saving over v1).
         const t1: u32 = self.next_token_id;
+        const tiers_watch: ?io_util.Stopwatch = if (lookupTiersEnabled() or lookupReceiptsEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
 
         // Cap draft_len so the verify forward stays a small fixed cost.
         const max_draft: u32 = @min(draft_len, 15);
@@ -4727,31 +5645,82 @@ pub const Generator = struct {
         const prompt = self.prompt_ids_owned;
         const generated = self.generated_ids.items;
         const total_len = prompt.len + generated.len + 1;
+        // Backoff skips the query, not the verifier's context-cost transition.
+        if (self.lookup_tiers) |*lr| lr.cls = lookupCtxClass(total_len);
 
-        var committed = try allocator.alloc(u32, total_len);
-        defer allocator.free(committed);
-        @memcpy(committed[0..prompt.len], prompt);
-        @memcpy(committed[prompt.len .. prompt.len + generated.len], generated);
-        committed[total_len - 1] = t1;
-
+        // Only legacy PLD searches the whole token buffer. Tiered lookup owns
+        // bounded suffix scratch; context pricing still uses the full length.
+        var committed: ?[]u32 = null;
+        defer if (committed) |buffer| allocator.free(buffer);
+        var lookup_miss = false;
         var draft_slice: ?[]const u32 = null;
-        if (klen <= total_len - 1) {
+        if (tiered) {
+            if (!clean_backoff_step) {
+                const remaining_drafts = self.max_tokens -| self.completion_tokens -| 1;
+                draft_slice = try self.pldTiersDraft(allocator, t1, @min(max_draft, remaining_drafts), &lookup_miss);
+            }
+        } else if (klen <= total_len - 1) {
+            const buffer = try allocator.alloc(u32, total_len);
+            committed = buffer;
+            @memcpy(buffer[0..prompt.len], prompt);
+            @memcpy(buffer[prompt.len .. prompt.len + generated.len], generated);
+            buffer[total_len - 1] = t1;
             const key_start = total_len - klen;
-            const key = committed[key_start..total_len];
-            const lookup = pld_index.PldLookup{ .committed = committed, .key_len = klen };
+            const key = buffer[key_start..total_len];
+            const lookup = pld_index.PldLookup{ .committed = buffer, .key_len = klen };
             draft_slice = lookup.findMatch(key, max_draft);
         }
         if (draft_slice) |d| {
             if (d.len == 0) draft_slice = null;
         }
+        var pld_receipt: ?LookupReceipt = null;
+        if (lookupReceiptsEnabled() and !clean_backoff_step) {
+            pld_receipt = if (self.lookup_tiers) |lr| lr.receipt else null;
+            if (pld_receipt == null) {
+                var proposal = speculation.Tree.chain(t1, draft_slice orelse &.{}, 0, 0);
+                for (proposal.origins[1..proposal.len]) |*origin| origin.* = 1;
+                pld_receipt = self.lookupReceipt("pld", "chain", lookupCtxClass(total_len), t1, &proposal, &proposal, max_draft + 1);
+                pld_receipt.?.selection = if (lookupTiersEnabled()) "fallback" else "legacy";
+            }
+        }
+        const preverify_ms = if (tiers_watch) |watch| lookupRoundMs(watch.read(), 0, false) else 0;
+        if (pld_receipt) |*r| {
+            r.preverify_ms = preverify_ms;
+            r.draft_ms = if (r.root_no_assistant) 0 else preverify_ms;
+        }
 
         const stochastic = self.sampling.temperature > 0.01;
 
-        // ── Phase 2: Cold path (no n-gram match) ──
+        // ── Phase 2: Root-only path (absent or economically declined draft) ──
         // Forward([t1]) length 1: cache.step += 1, produces logits at that
         // position. Sample the lookahead, emit t1, set next_token_id =
         // lookahead. Cache exits at prompt_len + TE_new where TE_new = TE + 1.
         if (draft_slice == null) {
+            if (self.pld_backoff.beginNativeMiss(backoff_enabled, lookup_miss, lookupSelection().rows)) {
+                // next() rechecks stops after lookup; do not count this same
+                // token twice toward the consecutive-pad stop condition.
+                self.consecutive_pad = pad_before_stop;
+                const tok = (try self.next(allocator)) orelse return null;
+                // This emission owns the lookup round, NOT a skipped token.
+                // In particular the first one-token window now drains the
+                // pending successor instead of paying another cold forward.
+                if (pld_receipt) |*r| {
+                    r.committed = 1;
+                    r.round_ms = if (tiers_watch) |watch| lookupRoundMs(watch.read(), 0, false) else null;
+                    r.timing_scope = "native_entry_unsettled";
+                    r.verify_commit_ms = null;
+                    r.other_ms = null;
+                    r.predicted_verify_ms = null;
+                    r.priced = false;
+                    // Never settle or observe a kernel price here: next() may
+                    // still be executing the successor after this return.
+                    self.recordLookupReceipt(allocator, r.*);
+                }
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok;
+                return .{ .tokens = tokens, .accepted_tokens = 0, .used_lookup = false };
+            }
+
             const t1_i32: i32 = @intCast(t1);
             const t1_shape = [_]c_int{ 1, 1 };
             const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
@@ -4770,13 +5739,26 @@ pub const Generator = struct {
             try self.generated_ids.append(allocator, t1);
             self.advanceStep(1);
             self.next_token_id = new_t1;
+            if (tiers_watch != null) try self.lookupSettle();
+            const cold_ms = if (tiers_watch) |watch| lookupRoundMs(watch.read(), 0, false) else 0;
+            if (self.spec_cost_solo) {
+                if (self.lookup_tiers) |*lr| {
+                    const native_ms = @max(0, cold_ms - preverify_ms);
+                    if (lr.cut.prices.observeKernel(1, native_ms, .chain, lr.cls, .generic))
+                        lr.cut.observePlain(native_ms, lr.cls);
+                }
+            }
+            if (pld_receipt) |r| self.recordLookupReceipt(allocator, self.lookupChainOutcome(r, 0, 1, cold_ms));
+            if (backoff_enabled) {
+                if (clean_backoff_step) self.pld_backoff.emitted("cold") else if (lookup_miss) self.pld_backoff.miss("no_match");
+            }
 
             // Yield gate: cold steps pay the unpipelined forward; if the
             // workload isn't yielding accepted drafts to pay for it, fall
             // back to the pipelined `next()` (re-enable check above can
             // bring PLD back when the tail turns repetitive).
             self.yield_steps += 1;
-            if (yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
+            if (!tiered and yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
                 log.info(
                     "  pld=disabled (yield gate: {d} drafted tokens over {d} steps < {d:.2}/step)\n",
                     .{ self.yield_accepted, self.yield_steps, YIELD_GATE_MIN_YIELD },
@@ -4911,11 +5893,14 @@ pub const Generator = struct {
                 accepted += 1;
             }
         }
+        const verified_accepted = accepted;
         accepted = capAcceptedForTokenBudget(
             accepted,
             self.completion_tokens,
             self.max_tokens,
         );
+        const stop_prefix = mtpStopPrefix(draft, accepted, self.eos_token_ids);
+        accepted = stop_prefix.accepted;
         const full_accept = accepted == m;
 
         // ── Phase 6: Sample new_t1 from per_pos_logits[accepted] ──
@@ -4933,6 +5918,7 @@ pub const Generator = struct {
         // index `accepted`. Off-by-one here would silently corrupt output.
         const correction_logits = per_pos_logits[accepted];
         const new_t1: u32 = blk: {
+            if (stop_prefix.stop) |eos| break :blk eos;
             if (stochastic) {
                 const probs = try probsAtLastPos(correction_logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
@@ -5023,11 +6009,27 @@ pub const Generator = struct {
         for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
 
         self.pld_accepted_tokens += accepted;
+        if (tiers_watch != null) try self.lookupSettle();
+        const round_ms = if (tiers_watch) |watch| lookupRoundMs(watch.read(), 0, false) else 0;
+        if (self.lookup_tiers) |*lr| {
+            lr.cut.observeChainAccepted(&lr.chain, m, verified_accepted);
+            if (self.spec_cost_solo and round_ms > 0) {
+                _ = lr.cut.prices.observeKernel(m + 1, @max(0, round_ms - preverify_ms), .chain, lr.cls, .generic);
+            }
+        }
+        if (pld_receipt) |r| self.recordLookupReceipt(allocator, self.lookupChainOutcome(r, verified_accepted, num_emit, round_ms));
         self.advanceStep(num_emit);
+        if (backoff_enabled) {
+            if (accepted > 0) self.pld_backoff.success() else self.pld_backoff.miss("zero_accepted");
+        }
 
         // No post-step forward — `next_token_id = new_t1` and exit. The next
         // nextPld call sees t1 NOT in cache (new invariant).
         self.next_token_id = new_t1;
+        if (stop_prefix.stop != null) {
+            self.done = true;
+            self.finish_reason = "stop";
+        }
 
         // Yield-gate accounting for verify steps (cold steps update in their
         // own branch above).
@@ -5041,7 +6043,7 @@ pub const Generator = struct {
         // upper-bound draft length (`max_draft`); matches with shorter accepts
         // still divide by this max so a workload with consistently-short
         // n-gram matches DOES get throttled.
-        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
+        if (!tiered and runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
             const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
             const rate: f32 = if (drafts_proposed > 0)
                 @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
@@ -5534,6 +6536,12 @@ pub const Generator = struct {
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        errdefer if (lookupCounterfactualEnabled()) self.invalidateCounterfactual();
+        if (lookupCounterfactualEnabled()) {
+            const lr = try self.lookupTiersArm(allocator);
+            const probe = &self.xfm.lookup_counterfactual.?;
+            if (probe.active and probe.common == null) try self.captureCounterfactualCommon(lr);
+        }
         // The budget's last token is the previous verify's: emit it without a round. (A pipelined plain
         // stretch has no such token: its last one comes out of `next`.)
         if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1 and !self.has_pending_logits and !self.has_pending_token) {
@@ -5558,7 +6566,7 @@ pub const Generator = struct {
         // the "no spec" candidate a width chooser needs).
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
-        self.dflash_unobserved = false;
+        self.dflash_unobserved = lookupCounterfactualEnabled();
         const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted + self.dflash_plain;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
@@ -5566,12 +6574,13 @@ pub const Generator = struct {
             const post_warmup = dflash_rounds_before >= dflashGateWarmup();
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0 and !self.dflash_unobserved, false);
-            if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
+            if (!self.dflashTiersTreeEnabled()) if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
         std.debug.assert(self.dflash_ctx != null);
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        const tiers_tree = self.dflashTiersTreeEnabled();
 
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
@@ -5589,7 +6598,8 @@ pub const Generator = struct {
 
         // The round policy: a plain tick runs on the serial pipeline; every other round starts from the drained state.
         var policy_draft = true;
-        if (self.dflash_pol) |*pol| {
+        if (!tiers_tree and self.dflash_pol != null) {
+            const pol = &self.dflash_pol.?;
             policy_draft = pol.drafting.shouldDraft();
             if (!policy_draft and self.dflashCanPipeline()) return try self.dflashPlainPipelined(allocator);
             pol.plain_watch = null;
@@ -5600,7 +6610,11 @@ pub const Generator = struct {
         // (serial = width 0 is a candidate, so "serial wins" is the gate),
         // the fixed block until it has data.
         var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-        if (self.dflash_chooser) |*ch| {
+        // Each predeclared preparation has one horizon, independent of the cut.
+        // The neural control preserves the production horizon and 15-node budget.
+        if (lookupCounterfactualEnabled()) round_width = (try cf.preparation()).horizon(round_width);
+        if (!tiers_tree and self.dflash_chooser != null) {
+            const ch = &self.dflash_chooser.?;
             if (ch.rounds >= dflashGateWarmup()) {
                 const d = if (mtpDepthPolicy() == .accept) self.dflashAcceptChoose(ch) else ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
                 round_width = d.width;
@@ -5623,7 +6637,7 @@ pub const Generator = struct {
         }
         // The round policy replaces the chooser and the serial fallback: a round with no drafts is the verify
         // forward at one row, so DFlash resumes whenever drafting pays again.
-        if (self.dflash_pol != null and !policy_draft) round_width = 0;
+        if (!tiers_tree and self.dflash_pol != null and !policy_draft) round_width = 0;
         self.dflash_round_width = round_width;
         if (round_width == 0 and self.dflash_pol == null) {
             const tok_opt = try self.next(allocator);
@@ -5682,7 +6696,7 @@ pub const Generator = struct {
         // A plain round supplies a fresh committed row for the next draft.
         if (m_draft == 0 or (model.lilicorr != null and dctx.anchor.ctx == null))
             return try self.dflashPlainRound(allocator, t1, serial, stochastic);
-        if (self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
+        if (!tiers_tree and self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
         // block sampling. Greedy requests keep the byte-equality bar (a
@@ -5698,22 +6712,52 @@ pub const Generator = struct {
         // is what the head is for — dropping it drafts every position from
         // an uncorrected distribution the sidecar was never trained to emit.
         const use_markov = model.markov != null and dflashMarkovEnabled();
-        const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
-        // A continuation the context backs long enough to fill the tree is
-        // verified as the round's chain, with no assistant forward.
-        if (tree_round and self.dflash_copy_silent > 0) {
+        const tree_round = tiers_tree or (use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null);
+        // Unsupported trunks and unkeyed stochastic sampling retain their existing
+        // chain verifier; the tiers never pretend those paths support tree attention.
+        // Non-tier native copy keeps its existing eligibility and backoff.
+        if (tree_round and !tiers_tree and self.dflash_copy_silent > 0) {
             self.dflash_copy_silent -= 1;
-        } else if (tree_round) {
+        } else if (tree_round and !tiers_tree) {
             const prompt = self.prompt_ids_owned;
             const gen = self.generated_ids.items;
             const committed = try allocator.alloc(u32, @min(prompt.len + gen.len + 1, DFLASH_COPY_WINDOW));
             defer allocator.free(committed);
             pld_index.tailWindow(committed, prompt, gen, t1);
             if (pld_index.backedCopy(committed, dflashTreeNodes(m), DFLASH_COPY_MATCH)) |c| if (c.draft.len == dflashTreeNodes(m))
-                return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, c.draft);
+                return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, c.draft, null, false, null);
+        }
+
+        if (lookupCounterfactualEnabled() and !self.xfm.lookup_counterfactual.?.action.assistant())
+            return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, &.{}, null, false, null);
+        if (tiers_tree and !lookupCounterfactualEnabled() and lookupSelection().rows == 1)
+            return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, &.{}, null, true, null);
+        var prepared_lookup: PreparedLookupTree = undefined;
+        var lookup_proposal: ?*const PreparedLookupTree = null;
+        if (tiers_tree and !lookupCounterfactualEnabled() and std.mem.eql(u8, lookupSelection().name, "adaptive")) {
+            const lr = try self.lookupTiersArm(allocator);
+            const cls = lookupCtxClass(anchor_pos + 1);
+            const depth_limit: u32 = @intCast(@min(DFLASH_TREE_W - 1, self.max_tokens -| self.completion_tokens -| 1));
+            const query_watch = io_util.Stopwatch.init(self.timer.io);
+            const query_solo = self.spec_cost_solo;
+            var copy_scratch: [DFLASH_COPY_WINDOW]u32 = undefined;
+            const native_copy = NativeCopyAction.query(self.prompt_ids_owned, self.generated_ids.items, t1,
+                dflashTreeNodes(m), depth_limit, &self.dflash_copy_silent,
+                nativeCopyAdaptiveEnabled(tiers_tree, lr.candidates_enabled, lookupSelection().name, lookupCounterfactualEnabled()),
+                &copy_scratch);
+            try lr.prepareTree(self.prompt_ids_owned, self.generated_ids.items, t1, depth_limit, query_watch, &prepared_lookup);
+            prepared_lookup.native_copy = native_copy;
+            prepared_lookup.native_copy_solo = query_solo;
+            lookup_proposal = &prepared_lookup;
+            const query_ms = lookupRoundMs(prepared_lookup.watch.read(), 0, false);
+            prepared_lookup.remaining_watch = io_util.Stopwatch.init(self.timer.io);
+            prepared_lookup.routeBeforeAssistant(lr.cut, cls, query_ms, DFLASH_TREE_W, .linear_gdn, anchor_pos);
+            if (prepared_lookup.route.?.decision.skip)
+                return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, &.{}, null, false, lookup_proposal);
         }
 
         // ── Phase 1: one assistant forward drafts all m tokens ──
+        const draft_watch: ?io_util.Stopwatch = if (tiers_tree or lookupReceiptsEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
         // Row mapping is the export's convention (`anchor_row_drafts`):
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
@@ -5802,7 +6846,7 @@ pub const Generator = struct {
         }
         const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
         if (tree_round) {
-            return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{});
+            return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{}, draft_watch, false, lookup_proposal);
         }
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
@@ -6035,6 +7079,7 @@ pub const Generator = struct {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
         self.dflash_attempted += 1;
+        self.dflash_verified_drafts += m;
         if (tracing) {
             // Captures ride the same forward — eval them here or their cost
             // is billed to `append`.
@@ -6601,7 +7646,18 @@ pub const Generator = struct {
         return if (transformer_mod.naxAvailable()) DFLASH_TREE_W - 1 else @min(m, DFLASH_TREE_W - 1);
     }
 
-    fn dflashTreeRound(
+    /// Only the existing exact tree-supported selector route can use tiered rows.
+    /// Cut replaces the legacy width/round policies here, including their sticky
+    /// serial choice, so a root-only round can recover on a later continuation.
+    fn dflashTiersTreeEnabled(self: *const Generator) bool {
+        const model = self.dflash orelse return false;
+        const keyed = self.sampling.keyed and self.sampling.seed != null;
+        return lookupTiersEnabled() and model.selector != null and dflashSelectorEnabled() and
+            !(model.markov != null and dflashMarkovEnabled()) and
+            (self.sampling.temperature <= 0.01 or keyed) and self.xfm.specTreeSupported();
+    }
+
+    pub fn dflashTreeRound(
         self: *Generator,
         allocator: std.mem.Allocator,
         model: *DflashModel,
@@ -6614,13 +7670,51 @@ pub const Generator = struct {
         kv_step_snap: usize,
         serial: bool,
         copy: []const u32,
+        draft_watch: ?io_util.Stopwatch,
+        plain_probe: bool,
+        prepared_lookup: ?*const PreparedLookupTree,
     ) !DrafterStepResult {
         const xfm = self.xfm;
         const s = xfm.s;
         const MAX_W = DFLASH_TREE_W;
         const tracing = dflashTraceEnabled();
         var ph = io_util.Stopwatch.init(self.timer.io);
-        const max_nodes = dflashTreeNodes(m);
+        const round_watch = if (prepared_lookup) |look| look.watch else draft_watch orelse io_util.Stopwatch.init(self.timer.io);
+        const native_copy_selected = if (prepared_lookup) |look| look.nativeCopySelected() else false;
+        const native_copy_execution_solo = self.spec_cost_solo;
+        // Prepared tiered actions are complete geometries, never append drafts.
+        std.debug.assert(!native_copy_selected or (copy.len == 0 and draft_logits == null and draft_watch == null));
+        const tiers: ?*LookupRound = if (lookupTiersEnabled()) try self.lookupTiersArm(allocator) else null;
+        // Native's architecture heuristic limits executed rows. The cost-aware
+        // selector needs the full bounded offer before it can compare widths.
+        const max_nodes = if (tiers != null) DFLASH_TREE_W - 1 else dflashTreeNodes(m);
+        const cls = lookupCtxClass(anchor_pos + 1);
+        if (tiers) |lr| lr.cls = cls;
+        // Output budget bounds each path's depth, not the number of sibling
+        // alternatives verified together. Keep native and wider branching legal.
+        const row_limit: u32 = MAX_W;
+        const depth_limit: u32 = @intCast(@min(MAX_W - 1, self.max_tokens -| self.completion_tokens -| 1));
+        const native_nodes = dflashTreeNodes(m);
+        const diagnostic = if (lookupCounterfactualEnabled() and self.xfm.lookup_counterfactual.?.active) &self.xfm.lookup_counterfactual.? else null;
+        const requested_rows = if (lookupCounterfactualEnabled()) self.xfm.lookup_counterfactual.?.action.rows() else lookupSelection().rows;
+        var chosen = speculation.Tree.init(t1);
+        var candidate = speculation.Tree.init(t1);
+        // Admission metadata serves selection; hashes and diagnostic serialization
+        // remain restricted to explicit token tracing.
+        const native_trace = tiers != null and draft_logits != null and copy.len == 0 and
+            lookupPriceTraceEnabled() and lookupReceiptsEnabled();
+        var admission_order: [MAX_W - 1]usize = undefined;
+        var native_candidate: speculation.Tree = undefined;
+        var native_incumbent = speculation.Tree.init(t1);
+        var priced_native_alternative: ?speculation.TreeEvaluation.Entry = null;
+        var forced_upper_trial = false;
+        var local_lookup: PreparedLookupTree = undefined;
+        var lookup_offer: ?*const speculation.Tree = null;
+        var draft_ms: f32 = 0;
+        var selection_overhead_ms: ?f32 = null;
+        var lookup_order: u32 = 0;
+        var lookup_conf: f32 = 0;
+        var lookup_source: token_history.Source = .local;
         if (!dflash_tree_logged) {
             dflash_tree_logged = true;
             log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{max_nodes});
@@ -6635,7 +7729,7 @@ pub const Generator = struct {
         parents[0] = -1;
         depth[0] = 0;
         toks[0] = @intCast(t1);
-        if (copy.len == 0) {
+        if (copy.len == 0 and draft_logits != null) {
             var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden.?, draft_logits.?, t1, s);
             defer lat.deinit(allocator);
             // A sampled target's scores carry its own noise at each position's candidates.
@@ -6645,13 +7739,102 @@ pub const Generator = struct {
                 .max_nodes = max_nodes,
                 .temperature = if (serial) self.sampling.temperature else 1.0,
                 .noise = noise,
+                .admission_order = if (tiers != null) &admission_order else null,
             });
             defer tree.deinit(allocator);
-            for (tree.tokens, tree.parents, tree.depth) |tok, par, d| {
-                parents[w] = if (par < 0) 0 else par + 1;
-                depth[w] = @intCast(d + 1);
-                toks[w] = @intCast(tok);
-                w += 1;
+            if (native_trace) native_candidate = nativeAdmissionTree(t1, &tree, &admission_order, native_nodes, depth_limit);
+            if (tiers != null) {
+                candidate = lookup_adapter.neuralTree(t1, tree.tokens, tree.parents, tree.depth, tree.confidence, depth_limit);
+                native_incumbent = lookup_adapter.neuralAdmissionTree(&candidate, tree.tokens, tree.parents, &admission_order, native_nodes);
+                if (draft_watch) |watch| draft_ms = @as(f32, @floatFromInt(watch.read())) / 1_000_000.0;
+            } else {
+                for (tree.tokens, tree.parents, tree.depth) |tok, par, d| {
+                    parents[w] = if (par < 0) 0 else par + 1;
+                    depth[w] = @intCast(d + 1);
+                    toks[w] = @intCast(tok);
+                    w += 1;
+                }
+            }
+        }
+        if (tiers) |lr| {
+            if (!plain_probe) {
+                const look = prepared_lookup orelse blk: {
+                    try lr.prepareTree(self.prompt_ids_owned, self.generated_ids.items, t1, depth_limit, round_watch, &local_lookup);
+                    break :blk &local_lookup;
+                };
+                lookup_offer = &look.tree;
+                lookup_order = look.order;
+                lookup_conf = look.confidence;
+                lookup_source = look.source;
+                if (look.nativeCopySelected()) candidate = look.tree else look.mergeInto(&candidate);
+                if (@import("builtin").is_test) {
+                    if (self.lookup_test_candidate) |injected| {
+                        candidate = injected;
+                        // The fixture supplies the full offer, including unselected rows.
+                        lookup_offer = &candidate;
+                    }
+                }
+                // Price all preparation covered by this round's clock, including
+                // lookup merge without an assistant. Forced paths can also include
+                // first arming; work before round_watch started is not included.
+                // Lattice construction has already evaluated any assistant work.
+                const overhead_ms = lookupRoundMs(round_watch.read(), 0, false);
+                selection_overhead_ms = overhead_ms;
+                var evaluation: speculation.TreeEvaluation = .{};
+                const price_trace = lookupPriceTraceEnabled();
+                const routed = if (prepared_lookup) |prepared| if (prepared.route) |route| route.decision.skip else false else false;
+                chosen = if (routed)
+                    prepared_lookup.?.execution
+                else if (draft_logits != null)
+                    lr.cut.chooseTreeBootstrapControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, &native_incumbent, if (price_trace) &evaluation else null, .linear_gdn)
+                else
+                    lr.cut.chooseTreeControlled(&candidate, cls, overhead_ms, row_limit, requested_rows, if (price_trace) &evaluation else null, .linear_gdn);
+                // Both adaptive admission and forced-assistant cut use dynamic
+                // widths. Learn one real upper shape plus one cold retry; fixed
+                // and maximum controls never consume exploration reservations.
+                if (!routed and draft_logits != null and !lookupCounterfactualEnabled() and
+                    requested_rows == 0 and self.spec_cost_solo)
+                {
+                    const trial_cap: u32 = @intCast(@min(candidate.len, row_limit));
+                    const native = lr.cut.chooseTreeIncumbentControlled(&candidate, &native_incumbent, cls, overhead_ms, row_limit, @intCast(native_incumbent.len), null, .linear_gdn);
+                    const maximum = lr.cut.chooseTreeIncumbentControlled(&candidate, &native_incumbent, cls, overhead_ms, row_limit, trial_cap, null, .linear_gdn);
+                    const native_shape: speculation.Shape = .{ .rows = @intCast(native.len), .variant = native.variant(.linear_gdn) };
+                    if (lr.cut.prices.upperTrialWidth(native_shape, .{ .rows = @intCast(maximum.len), .variant = maximum.variant(.linear_gdn) }, .tree, cls)) |trial_rows| {
+                        const wider = lr.cut.chooseTreeIncumbentControlled(&candidate, &native_incumbent, cls, overhead_ms, row_limit, trial_rows, null, .linear_gdn);
+                        var wide_yield: f32 = 0;
+                        var native_yield: f32 = 0;
+                        for (wider.scores[0..wider.len]) |reach| wide_yield += reach;
+                        for (native.scores[0..native.len]) |reach| native_yield += reach;
+                        const variant = wider.variant(.linear_gdn);
+                        if (wider.len == trial_rows and wide_yield > native_yield and
+                            lr.cut.prices.reserveUpperTrial(native_shape, .{ .rows = trial_rows, .variant = variant }, .tree, cls))
+                        {
+                            chosen = wider;
+                            forced_upper_trial = true;
+                            if (lookupReceiptsEnabled()) log.info("[lookup-width-probe] {{\"family\":\"dflash\",\"class\":{d},\"rows\":{d},\"variant\":\"{s}\",\"reason\":\"upper_width_learning\",\"reservation_consumed\":true,\"max_forced_executions\":2}}\n", .{ cls, trial_rows, @tagName(variant) });
+                        }
+                    }
+                }
+                if (price_trace) for (evaluation.entries[0..evaluation.len]) |entry| {
+                    log.info("[lookup-prices] class={d} anchor_pos={d} anchor={d} candidate_rows={d} rows={d} variant={s} verify_ms={d:.3} preparation_ms={d:.3} expected_tokens={d:.3} tokens_per_ms={d:.5} selected={any}\n", .{
+                        cls, self.prompt_ids_owned.len + self.generated_ids.items.len, t1, candidate.len, entry.rows, @tagName(entry.variant),
+                        entry.verify_ms, overhead_ms, entry.expected_tokens, entry.tokens_per_ms, entry.rows == chosen.len,
+                    });
+                };
+                if (native_trace and chosen.len > native_incumbent.len) {
+                    for (evaluation.entries[0..evaluation.len]) |entry| {
+                        if (entry.rows == native_incumbent.len) {
+                            priced_native_alternative = entry;
+                            break;
+                        }
+                    }
+                }
+            }
+            w = chosen.len;
+            for (0..w) |i| {
+                parents[i] = chosen.parents[i];
+                depth[i] = if (i == 0) 0 else depth[@intCast(parents[i])] + 1;
+                toks[i] = @intCast(chosen.tokens[i]);
             }
         }
         if (copy.len > 0 and !dflash_copy_logged) {
@@ -6666,10 +7849,64 @@ pub const Generator = struct {
         }
         var max_depth: i32 = 0;
         for (depth[0..w]) |d| max_depth = @max(max_depth, d);
+        if (tiers != null) self.dflash_round_width = @intCast(w - 1);
+        var receipt: ?LookupReceipt = null;
+        if (lookupReceiptsEnabled()) {
+            if (tiers == null) {
+                candidate = speculation.Tree.init(t1);
+                for (1..w) |i| {
+                    const row = candidate.add(@intCast(parents[i]), @intCast(toks[i]), 0, if (copy.len > 0) .look else .draft, 0).?;
+                    candidate.origins[row] = if (copy.len > 0) 1 else 8;
+                }
+                chosen = candidate;
+            }
+            if (!plain_probe) draft_ms = lookupRoundMs(round_watch.read(), 0, false);
+            receipt = self.lookupReceipt("dflash", "tree", cls, t1, &candidate, &chosen, row_limit);
+            receipt.?.variant = chosen.variant(.linear_gdn);
+            receipt.?.executed_geometry_hash = lookupTreeHash(&chosen);
+            receipt.?.selection_overhead_ms = selection_overhead_ms;
+            receipt.?.assistant = draft_watch != null;
+            receipt.?.root_no_assistant = draft_watch == null and w == 1;
+            if (tiers) |lr| {
+                if (!plain_probe) {
+                    receipt.?.route = if (prepared_lookup) |look| look.route else null;
+                    receipt.?.lookup_order = lookup_order;
+                    receipt.?.lookup_confidence = lookup_conf;
+                }
+                receipt.?.predicted_verify_ms = lr.cut.predictVerify(@intCast(w), .tree, cls, chosen.variant(.linear_gdn));
+                var gain: f32 = 1;
+                for (chosen.scores[1..chosen.len]) |q| gain += q;
+                receipt.?.predicted_tokens = gain;
+            } else receipt.?.selection = "legacy";
+            if (prepared_lookup) |look| receipt.?.recordNativeCopy(look);
+        }
+        if (native_trace) emitNativeCandidate(&receipt.?, &native_candidate, &chosen, self.max_tokens -| self.completion_tokens, m);
+        if (native_trace) if (priced_native_alternative) |entry| {
+            emitCompetingCandidate(&receipt.?, &candidate, &native_incumbent, &chosen, entry,
+                selection_overhead_ms.?, tiers.?.cut.prices.known(@intCast(chosen.len), .tree, cls, chosen.variant(.linear_gdn)), forced_upper_trial);
+        };
         if (tracing) {
             self.dflash_trace.add(.head, ph.read());
             ph.reset();
         }
+        // Separate from assistant drafting: includes the exact target tree forward,
+        // path compaction, SSM commit and evaluated assistant-context append.
+        if (diagnostic) |probe| {
+            if (candidate.len < requested_rows or chosen.len != requested_rows) return error.DiagnosticInvalidOffer;
+            const readback_watch = io_util.Stopwatch.init(self.timer.io);
+            const prepared = cf.PreparedState{
+                .target_kv = try cf.fingerprintKV(self.ctx.cache, s),
+                .target_ssm = try cf.fingerprintSSM(self.ctx.ssm_entries orelse &.{}, s),
+                .assistant = try cf.fingerprintAssistant(if (self.dflash_ctx) |*context| context else null, self.dflash_pending.items, self.dflash_pending_rounds, s),
+                .preparation = try cf.preparation(),
+                .assistant_horizon = if (draft_logits != null) m else 0,
+                .suffix_candidates = lookupCandidatesEnabled(),
+                .context_length = anchor_pos,
+            };
+            try probe.captureOffer(&candidate, &chosen, draft_logits != null, prepared);
+            self.diagnostic_readback_ns += readback_watch.read();
+        }
+        const verify_watch: ?io_util.Stopwatch = if (tiers != null or lookupReceiptsEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
         const spec_tree = Generator.specTreeFor(parents[0..w], depth[0..w], max_depth);
         defer spec_tree.deinit();
         const wc: c_int = @intCast(w);
@@ -6687,7 +7924,15 @@ pub const Generator = struct {
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
         self.ctx.pipeline_build = VERIFY_PIPELINE_LAYERS;
+        var dispatch: transformer_mod.DiagnosticDispatch = undefined;
+        if (diagnostic != null) {
+            const instrumentation_watch = io_util.Stopwatch.init(self.timer.io);
+            dispatch = .{ .io = self.timer.io };
+            transformer_mod.beginDiagnosticDispatch(&dispatch);
+            dispatch.overhead_ns = instrumentation_watch.read();
+        }
         const verify_logits = xfm.forwardWith(&self.ctx, verify_input);
+        if (diagnostic != null) transformer_mod.endDiagnosticDispatch();
         self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false;
         self.ctx.tree = null;
@@ -6697,6 +7942,7 @@ pub const Generator = struct {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
         self.dflash_attempted += 1;
+        self.dflash_verified_drafts += w - 1;
 
         var targets = blk: {
             defer _ = mlx.mlx_array_free(logits);
@@ -6707,7 +7953,12 @@ pub const Generator = struct {
         };
         defer targets.deinit();
         try mlx.check(mlx.mlx_array_eval(targets.lazy()));
-        const ids = try targets.ids(w);
+        const ids = target_ids: {
+            if (@import("builtin").is_test) {
+                if (self.lookup_test_targets) |injected| break :target_ids injected;
+            }
+            break :target_ids try targets.ids(w);
+        };
         if (tracing) {
             self.dflash_trace.add(.verify, ph.read());
             ph.reset();
@@ -6729,8 +7980,32 @@ pub const Generator = struct {
             }
             break;
         }
+        const raw_accepted = accepted;
+        if (tiers) |lr| {
+            var raw_path: [MAX_W]u32 = undefined;
+            for (path_rows[1 .. accepted + 1], 0..) |row, i| raw_path[i] = @intCast(toks[row]);
+            raw_path[accepted] = @intCast(ids[path_rows[accepted]]);
+            // Only decisions already reached by the executed target path are evidence.
+            // The anchor is excluded and the final correction/bonus appears exactly once.
+            if (self.sampling.temperature == 0 and xfm.config.rowExactDecode() and lookup_offer != null) {
+                lr.cut.observeLookupTree(lookup_offer.?, raw_path[0 .. accepted + 1], if (lr.trust_active) &lr.trust else null);
+            } else if (!native_copy_selected) {
+                lr.cut.observeLookupTree(&chosen, raw_path[0 .. accepted + 1], null);
+            }
+        }
         accepted = capAcceptedForTokenBudget(accepted, self.completion_tokens, self.max_tokens);
-        const next_pending: u32 = @intCast(ids[path_rows[accepted]]);
+        var eos_stop: ?u32 = null;
+        eos_scan: for (1..@as(usize, accepted) + 1) |j| {
+            const token: u32 = @intCast(toks[path_rows[j]]);
+            for (self.eos_token_ids) |eos| {
+                if (token == eos) {
+                    accepted = @intCast(j - 1);
+                    eos_stop = token;
+                    break :eos_scan;
+                }
+            }
+        }
+        const next_pending: u32 = eos_stop orelse @as(u32, @intCast(ids[path_rows[accepted]]));
         if (serial) self.sampling.draw = self.generated_ids.items.len + accepted + 2;
         // A copy that keeps nothing four rounds running pauses the copies.
         if (copy.len > 0) {
@@ -6789,22 +8064,119 @@ pub const Generator = struct {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             dctx.appendEvalArrays(eval_vec);
-            if (tracing) {
+            if (tracing or tiers != null) {
                 try mlx.check(mlx.mlx_eval(eval_vec));
-                self.dflash_trace.add(.append, ph.read());
+                if (tracing) self.dflash_trace.add(.append, ph.read());
             } else {
                 try mlx.check(mlx.mlx_async_eval(eval_vec));
             }
         }
-
         const tokens = try allocator.alloc(u32, n_commit);
+        errdefer allocator.free(tokens);
         for (0..n_commit) |j| tokens[j] = @intCast(toks[path_rows[j]]);
         for (tokens) |t| try self.generated_ids.append(allocator, t);
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
-        self.checkDflashRuntimeGate();
-        if (self.completion_tokens >= self.max_tokens) {
+        if (tiers != null or receipt != null) try self.lookupSettle();
+        const settled_diagnostic_ns = if (diagnostic != null) verify_watch.?.read() -| dispatch.overhead_ns else 0;
+        const remaining_ms = if ((native_copy_selected or draft_watch != null) and prepared_lookup != null)
+            if (prepared_lookup.?.remaining_watch) |watch| lookupRoundMs(watch.read(), 0, false) else null
+        else
+            null;
+        const assistant_remaining_ms = if (draft_watch != null) remaining_ms else null;
+        const native_copy_outcome = native_copy_selected and nativeCopyOutcomeEligible(raw_accepted, accepted,
+            eos_stop != null or std.mem.indexOfScalar(u32, self.eos_token_ids, next_pending) != null,
+            self.completion_tokens, self.max_tokens);
+        if (native_copy_outcome) nativeCopyFeedback(&self.dflash_copy_misses, &self.dflash_copy_silent, raw_accepted);
+        if (diagnostic != null) {
+            const hash_watch = io_util.Stopwatch.init(self.timer.io);
+            if (dispatch.layers != xfm.config.num_hidden_layers or dispatch.events <= dispatch.layers)
+                return error.DiagnosticMissingDispatch;
+            var geometry: cf.Geometry = .{ .committed_count = n_commit, .kv_compacted = moved };
+            @memcpy(geometry.selected_parents[0..w], parents[0..w]);
+            @memcpy(geometry.selected_depths[0..w], depth[0..w]);
+            for (path_rows[0..n_commit], 0..) |row, i| geometry.committed_rows[i] = @intCast(row);
+            const kernel = cf.Kernel{
+                .rows = @intCast(w),
+                .variant = dispatch.variant,
+                // Price kind names the executed verifier, not the selected topology.
+                // Linear GDN is a variant of this tree-verifier path.
+                .kind = .tree,
+                .class = cls,
+                .dispatch = dispatch.hash.finish(),
+                .geometry = geometry,
+            };
+            const hash_ns = hash_watch.read();
+            self.diagnostic_pending = .{
+                .kernel = kernel,
+                .verify_commit_ns = settled_diagnostic_ns,
+                .readback_ns = self.diagnostic_readback_ns + dispatch.overhead_ns + hash_ns,
+                .accepted = accepted,
+                .count = n_commit,
+                .complete = accepted == raw_accepted and eos_stop == null and self.completion_tokens < self.max_tokens,
+            };
+            if (!self.publication_managed) self.publishCounterfactual(allocator, self.generated_ids.items);
+        }
+        const settled_verify_ms = if (verify_watch) |watch| lookupRoundMs(watch.read(), 0, false) else 0;
+        const settled_round_ms = if (tiers != null or receipt != null) lookupRoundMs(round_watch.read(), 0, false) else 0;
+        if (tiers) |lr| {
+            const verify_ms = settled_verify_ms;
+            const round_ms = settled_round_ms;
+            // Scheduler-known contention invalidates wall prices, not acceptance.
+            // Other processes on the device are not observable through this flag.
+            if (self.spec_cost_solo and !lookupCounterfactualEnabled()) {
+                if (plain_probe) {
+                    if (lr.cut.observePlainProbe(verify_ms, cls, MTP_ADAPTIVE_PROBE_WARM))
+                        lr.cut.prices.observe(@intCast(w), verify_ms, .tree, cls, .generic);
+                } else {
+                    const warmed = lr.cut.prices.observeKernel(@intCast(w), verify_ms, .tree, cls, if (spec_tree.usesLinearGdn(w)) .linear_gdn else .generic);
+                    if (w == 1 and warmed) {
+                        // The first valid root execution is cold, just like wider kernels.
+                        lr.cut.observePlain(verify_ms, cls);
+                    }
+                }
+                if (!plain_probe and assistant_remaining_ms != null and raw_accepted == accepted and eos_stop == null) {
+                    // Adaptive routing queried first; this clock starts after that query.
+                    // Assistant-first forced rounds have no isolated remaining-work sample.
+                    _ = lr.cut.observeSpecRemainingProbe(assistant_remaining_ms.?, accepted + 1, cls, MTP_ADAPTIVE_PROBE_WARM);
+                }
+                if (nativeCopySampleEligible(native_copy_outcome, if (prepared_lookup) |look| look.native_copy_solo else false,
+                    native_copy_execution_solo, self.spec_cost_solo))
+                {
+                    _ = lr.cut.observeNativeCopyRemaining(remaining_ms.?, accepted + 1, @intCast(w), cls);
+                }
+            }
+            if (lookupTraceEnabled()) {
+                var draft_rows: usize = 0;
+                var look_rows: usize = 0;
+                var both_rows: usize = 0;
+                for (chosen.sources[1..w]) |source| switch (source) {
+                    .draft => draft_rows += 1,
+                    .look => look_rows += 1,
+                    .both => both_rows += 1,
+                };
+                log.info("[lookup] dflash mode={s} class={d} order={d} conf={d:.2} src={s} rows={d} draft={d} look={d} both={d} accepted={d} draft_ms={d:.3} tree_ms={d:.3} round_ms={d:.3} priced={any}\n", .{
+                    if (plain_probe) "plain" else if (native_copy_selected) "native_copy" else if (draft_watch != null) "merged" else "lookup", cls, lookup_order, lookup_conf, @tagName(lookup_source), w, draft_rows, look_rows, both_rows, raw_accepted, draft_ms, verify_ms, round_ms, self.spec_cost_solo,
+                });
+            }
+        }
+
+        if (receipt) |*r| {
+            r.accepted = raw_accepted;
+            r.committed = n_commit;
+            r.draft_ms = draft_ms;
+            r.verify_commit_ms = settled_verify_ms;
+            r.round_ms = settled_round_ms;
+            r.other_ms = @max(0, r.round_ms.? - draft_ms - r.verify_commit_ms.?);
+            r.priced = self.spec_cost_solo;
+            self.recordLookupReceipt(allocator, r.*);
+        }
+        if (tiers == null) self.checkDflashRuntimeGate();
+        if (eos_stop != null) {
+            self.done = true;
+            self.finish_reason = "stop";
+        } else if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
             self.finish_reason = "length";
         }
@@ -7001,6 +8373,62 @@ pub const Generator = struct {
         return draw;
     }
 
+    /// Flight-owned empirical lookup work, not a causal native-vs-lookup delta.
+    const MtpLookupPreparation = struct {
+        watch: io_util.Stopwatch,
+        scope: speculation.LookupPreparationScope,
+        class: i64,
+        pricing: bool,
+        eligible: bool,
+        rows: u32 = 0,
+        query_ns: ?u64 = null,
+        ready_ns: ?u64 = null,
+        preverify_complete: bool = false,
+        observed: bool = false,
+        stash_rows: usize,
+        stash_present: bool,
+        shadow_requery: bool = false,
+
+        fn elapsedAt(watch: io_util.Stopwatch, now: std.Io.Timestamp) ?u64 {
+            const ns = now.nanoseconds - watch.started_at.nanoseconds;
+            if (ns < 0 or ns > std.math.maxInt(u64)) return null;
+            return @intCast(ns);
+        }
+
+        /// One timestamp closes P and starts V. Carried P keeps its frozen
+        /// handoff; only the consumer's disjoint preverify interval is added.
+        fn preverify(self: *MtpLookupPreparation, round_watch: io_util.Stopwatch, now: std.Io.Timestamp, carried: bool) ?u64 {
+            const round_ns = elapsedAt(round_watch, now) orelse return null;
+            if (!carried) self.ready_ns = elapsedAt(self.watch, now);
+            self.preverify_complete = self.ready_ns != null;
+            return round_ns;
+        }
+
+        fn postQueryNs(self: *const MtpLookupPreparation) ?u64 {
+            const query = self.query_ns orelse return null;
+            const ready = self.ready_ns orelse return null;
+            return if (ready >= query) ready - query else null;
+        }
+
+        fn sampleNs(self: *const MtpLookupPreparation, carried: bool, resumed_ns: u64, rows: u32, solo: bool) ?u64 {
+            const actual: speculation.LookupPreparationScope = if (carried) .carried else .cold;
+            if (!self.pricing or !self.eligible or !solo or !self.preverify_complete or
+                self.shadow_requery or self.scope != actual or self.rows != rows) return null;
+            const post = self.postQueryNs() orelse return null;
+            const resumed = if (carried) resumed_ns else 0;
+            if (post > std.math.maxInt(u64) - resumed) return null;
+            const ns = post + resumed;
+            return if (ns > 0) ns else null;
+        }
+
+        fn observe(self: *MtpLookupPreparation, cut: *speculation.Policy, carried: bool, resumed_ns: u64, rows: u32, solo: bool) bool {
+            if (self.observed) return false;
+            self.observed = true;
+            const ns = self.sampleNs(carried, resumed_ns, rows, solo) orelse return false;
+            return cut.observeMtpPreparation(rows, self.class, self.scope, lookupRoundMs(ns, 0, false));
+        }
+    };
+
     /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
     /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
     /// round's tail. Owns every handle it holds; `deinit` frees whatever was
@@ -7034,9 +8462,26 @@ pub const Generator = struct {
         /// Tokens actually drafted this round; starts at m_lo, grows to
         /// m_hi iff the confidence gate clears at the chunk boundary.
         m: u32,
+        /// Preparation performed at the preceding round's tail is billed to its consumer.
+        lookup_prepare_ns: u64 = 0,
+        lookup_prepared_before_round: bool = false,
+        lookup_preverify_ns: u64 = 0,
+        /// Acquired without full receipts for row-exact MTP; diagnostics may
+        /// retain ineligible flights but cannot turn them into observations.
+        lookup_preparation: ?MtpLookupPreparation = null,
+        /// Only a fresh, post-query chain can own an isolated native-work clock.
+        lookup_native_watch: ?io_util.Stopwatch = null,
+        lookup_native_class: i64 = 0,
         /// Drafts are a context continuation (`mtpLookupChain`): nothing to
         /// build, and no MTP statistics are fed.
         lookup: bool = false,
+        /// Proposal evidence belongs to this chain, not the mutable next-round lookup scratch.
+        lookup_receipt: ?struct { class: i64, tree: speculation.Tree = .{}, round: ?LookupReceipt = null } = null,
+        /// Exact queried offer, owned independently of selection and successor scratch.
+        lookup_offer: ?speculation.Tree = null,
+        lookup_observed: bool = false,
+        lookup_target_watch: ?io_util.Stopwatch = null,
+        lookup_head_settle_ns: u64 = 0,
         /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
         place: ?Transformer.HeadPlace = null,
 
@@ -7116,10 +8561,20 @@ pub const Generator = struct {
 
     /// End a round that stays out of the cost table. The regime clock runs from
     /// the last observed round, so an unobserved round must end the interval too.
-    fn mtpRoundUntimed(self: *Generator) void {
+    fn mtpRoundUntimed(self: *Generator, lookup: bool, drafts: u32, accepted: u32) void {
         if (self.mtp_regime_clock) |*c| c.reset();
+        self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
+        if (self.lookup_tiers) |*lr| lr.native_query_ns = 0;
         self.mtp_serial_clock = null;
         self.mtp_serial_warm = 0;
+        // The first native round after lookup pays head-history recovery, so
+        // exclude its duration, not its verified head acceptance. Its completed
+        // boundary can start the next clean native interval.
+        if (!lookup and self.mtp_serial_accept and drafts > 0 and drafts < self.xfm.mtp_depth_ms.len) {
+            self.mtpExactAccept(accepted);
+            if (self.spec_cost_solo) self.mtp_cycle_watch = io_util.Stopwatch.init(self.timer.io);
+        }
     }
 
     /// Price a lookup round into the table's lookup row: the wall since the previous round
@@ -7168,12 +8623,473 @@ pub const Generator = struct {
         return &self.mtp_lookup_idx.?;
     }
 
+    /// Acquire request-local proposals and tokenizer-bound model-cache leases.
+    pub fn lookupTiersArm(self: *Generator, allocator: std.mem.Allocator) !*LookupRound {
+        if (self.lookup_tiers == null) {
+            const setup_watch = if (lookupReceiptsEnabled() or lookupTraceEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
+            const policy = if (self.dflashTiersTreeEnabled()) &self.xfm.lookup_tree_policy else &self.xfm.lookup_policy;
+            if (policy.* == null) {
+                policy.* = speculation.Policy.init(speculation.PriceModel.load(
+                    self.timer.io,
+                    self.xfm.allocator,
+                    lookupEnvPath("MLX_SERVE_LOOKUP_PRICES") orelse "",
+                ));
+            }
+            if (self.xfm.lookup_history_cache == null)
+                self.xfm.lookup_history_cache = token_history.HistoryCache.init(self.xfm.allocator);
+            const cache = &self.xfm.lookup_history_cache.?;
+            var lr = LookupRound{
+                .drafter = token_history.Drafter.init(allocator),
+                .cut = &policy.*.?,
+                .candidates_enabled = lookupCandidatesEnabled(),
+                .trust_active = self.sampling.temperature == 0 and self.xfm.config.rowExactDecode(),
+            };
+            errdefer lr.deinit();
+            const policy_ns = if (setup_watch) |watch| watch.read() else 0;
+            lr.drafter.vocab_limit = @intCast(self.tok.definedVocabSize());
+            if (lr.candidates_enabled) try lr.drafter.prime(self.prompt_ids_owned);
+            const local_ns = if (setup_watch) |watch| watch.read() else 0;
+            var corpus_ns = local_ns;
+            if (if (lr.candidates_enabled) self.tok.content_sha256 else null) |identity| {
+                if (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS")) |path| {
+                    lr.corpus_lease = cache.acquireCorpus(self.timer.io, path, identity) catch |err| blk: {
+                        log.warn("[lookup] corpus unavailable: {s}\n", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (lr.corpus_lease) |*lease| lr.drafter.corpus = lease.index();
+                }
+                corpus_ns = if (setup_watch) |watch| watch.read() else 0;
+                if (lookupEnvPath("MLX_SERVE_LOOKUP_STORE")) |path| {
+                    if (lookupStoreWrites()) {
+                        const store = try allocator.create(token_history.PersistentStore);
+                        if (token_history.PersistentStore.open(self.timer.io, allocator, path, identity)) |opened| {
+                            store.* = opened;
+                            lr.persistent = store;
+                            lr.drafter.persistent = &store.index;
+                        } else |err| {
+                            allocator.destroy(store);
+                            log.warn("[lookup] persistent store unavailable: {s}\n", .{@errorName(err)});
+                        }
+                    } else {
+                        lr.persistent_lease = cache.acquirePersistent(self.timer.io, path, identity) catch |err| blk: {
+                            log.warn("[lookup] persistent store unavailable: {s}\n", .{@errorName(err)});
+                            break :blk null;
+                        };
+                        if (lr.persistent_lease) |*lease| lr.drafter.persistent = lease.index();
+                    }
+                    if (lookupPublicationsEnabled()) if (lr.drafter.persistent) |index| {
+                        const hex = std.fmt.bytesToHex(identity, .lower);
+                        const receipt = std.json.Stringify.valueAlloc(allocator, .{
+                            .version = @as(u32, 1),
+                            .opened = true,
+                            .read_only = !lookupStoreWrites(),
+                            .path = path,
+                            .tokenizer_sha256 = @as([]const u8, &hex),
+                            .token_count = index.tokens.len,
+                            .cache_hit = if (lr.persistent_lease) |lease| lease.cache_hit else false,
+                        }, .{}) catch null;
+                        if (receipt) |json| {
+                            defer allocator.free(json);
+                            log.info("[lookup-store] {s}\n", .{json});
+                        }
+                    };
+                }
+            } else if (lr.candidates_enabled and (lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null or lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null)) {
+                log.warn("[lookup] external stores require a tokenizer fingerprint\n", .{});
+            }
+            if (setup_watch) |watch| {
+                const total_ns = watch.read();
+                const receipt = std.json.Stringify.valueAlloc(allocator, .{
+                    .version = @as(u32, 1),
+                    .policy_ms = lookupRoundMs(policy_ns, 0, false),
+                    .local_ms = lookupRoundMs(local_ns - policy_ns, 0, false),
+                    .corpus_ms = lookupRoundMs(corpus_ns - local_ns, 0, false),
+                    .persistent_ms = lookupRoundMs(total_ns - corpus_ns, 0, false),
+                    .total_ms = lookupRoundMs(total_ns, 0, false),
+                    .corpus_cache_hit = if (lr.corpus_lease) |lease| lease.cache_hit else false,
+                    .persistent_cache_hit = if (lr.persistent_lease) |lease| lease.cache_hit else false,
+                }, .{}) catch null;
+                if (receipt) |json| {
+                    defer allocator.free(json);
+                    log.info("[lookup-setup] {s}\n", .{json});
+                }
+            }
+            if (lookupCounterfactualEnabled()) {
+                if (!self.dflashTiersTreeEnabled() or !self.spec_cost_solo or lr.persistent != null or
+                    (lr.candidates_enabled and lookupEnvPath("MLX_SERVE_LOOKUP_STORE") != null and lr.persistent_lease == null) or
+                    (lr.candidates_enabled and lookupEnvPath("MLX_SERVE_LOOKUP_CORPUS") != null and lr.corpus_lease == null))
+                    return error.DiagnosticPreconditions;
+                const conditions = cf.Preconditions{
+                    .row_exact = self.xfm.config.rowExactDecode(),
+                    .greedy = self.sampling.temperature == 0,
+                    .exclusive_owned_slot = self.diagnostic_owned_slot and self.spec_cost_solo,
+                    .prefix_cache_off = self.diagnostic_cache_off,
+                    .frozen_read_only_history = !lookupStoreWrites() and lr.persistent == null,
+                    .seed = self.sampling.seed orelse return error.DiagnosticPreconditions,
+                };
+                if (self.xfm.lookup_counterfactual == null)
+                    self.xfm.lookup_counterfactual = try cf.Probe.init(self.xfm.allocator, lr.cut, try lookupCounterfactualAction(), conditions);
+                _ = try self.xfm.lookup_counterfactual.?.beginRequest(lr.cut, &lr.trust, conditions);
+            }
+            self.lookup_tiers = lr;
+            const armed = &self.lookup_tiers.?;
+            const Once = struct {
+                var logged = false;
+            };
+            if (!Once.logged) {
+                Once.logged = true;
+                log.info("[lookup] three-tier lookup armed: max_order={d}, corpus={s}, store={s}, prices={s}\n", .{
+                    armed.drafter.maxQueryOrder(),
+                    if (armed.drafter.corpus != null) "on" else "off",
+                    if (armed.drafter.persistent != null) "on" else "off",
+                    if (lookupEnvPath("MLX_SERVE_LOOKUP_PRICES") != null) "on" else "off",
+                });
+            }
+        }
+        return &self.lookup_tiers.?;
+    }
+
+    fn captureCounterfactualCommon(self: *Generator, lr: *LookupRound) !void {
+        const watch = io_util.Stopwatch.init(self.timer.io);
+        const s = self.xfm.s;
+        // The first diagnostic offer must precede every generated token.
+        if (self.generated_ids.items.len != 0 or self.has_pending_logits or self.has_pending_token or self.spec_disabled_runtime)
+            return error.DiagnosticInvalidState;
+        var controls: cf.Hasher = .{};
+        controls.bytes(@tagName(try cf.preparation()));
+        controls.flag(lookupCandidatesEnabled());
+        controls.integer(self.dflash_block_size);
+        controls.bytes(&self.diagnostic_model_sha256.?);
+        controls.bytes(&self.diagnostic_request_sha256.?);
+        controls.bytes(&self.tok.content_sha256.?);
+        controls.integer(self.next_token_id);
+        controls.integer(self.ctx.cache.step);
+        controls.integer(self.ctx.moe_seq_offset.*);
+        controls.integer(self.step);
+        controls.integer(self.max_tokens);
+        controls.integer(self.prompt_tokens);
+        controls.integer(self.completion_tokens);
+        controls.integer(self.logprobs_n);
+        controls.integer(self.timeout_ns);
+        controls.integer(self.sampling.seed.?);
+        controls.integer(self.sampling.draw);
+        controls.integer(self.sampling.position_base);
+        controls.flag(self.sampling.keyed);
+        controls.integer(self.sampling.top_k);
+        inline for (.{ self.sampling.temperature, self.sampling.top_p, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.sampling.frequency_penalty }) |value|
+            controls.integer(@as(u32, @bitCast(value)));
+        controls.flag(self.sampling.min_p != null);
+        if (self.sampling.min_p) |value| controls.integer(@as(u32, @bitCast(value)));
+        controls.integer(self.eos_token_ids.len);
+        for (self.eos_token_ids) |id| controls.integer(id);
+        try controls.array(self.sampling.suppress_mask orelse .{ .ctx = null }, s);
+        var training: cf.Hasher = .{};
+        inline for (.{ lr.drafter.corpus, lr.drafter.persistent }) |index| {
+            training.flag(index != null);
+            if (index) |corpus| {
+                training.integer(corpus.max_order);
+                training.bytes(&cf.tokenHash(corpus.tokens));
+            }
+        }
+        var early: [1]u32 = undefined;
+        const early_ids: []const u32 = if (self.diagnostic_first_published) |token| blk: {
+            if (token != self.next_token_id) return error.DiagnosticInvalidState;
+            early[0] = token;
+            break :blk &early;
+        } else &.{};
+        try self.xfm.lookup_counterfactual.?.captureCommon(.{
+            .prefix = cf.tokenHashParts(self.prompt_ids_owned, early_ids),
+            .target_kv = try cf.fingerprintKV(self.ctx.cache, s),
+            .target_ssm = try cf.fingerprintSSM(self.ctx.ssm_entries orelse &.{}, s),
+            .assistant = try cf.fingerprintAssistant(if (self.dflash_ctx) |*context| context else null, self.dflash_pending.items, self.dflash_pending_rounds, s),
+            .controls = controls.finish(),
+            .training = training.finish(),
+            .learner = lr.cut.diagnosticFingerprint(),
+            .request_lookup = lr.trust.diagnosticFingerprint(),
+        });
+        self.diagnostic_readback_ns += watch.read();
+    }
+
+    fn lookupPromptHash(self: *Generator) u64 {
+        if (!self.lookup_prefix_primed) {
+            self.lookup_prefix_hash.update(std.mem.sliceAsBytes(self.prompt_ids_owned));
+            self.lookup_prompt_hash = self.lookup_prefix_hash.final();
+            self.lookup_prefix_primed = true;
+        }
+        return self.lookup_prompt_hash;
+    }
+
+    fn lookupPrefix(self: *Generator, anchor: u32) u64 {
+        _ = self.lookupPromptHash();
+        self.lookup_prefix_hash.update(std.mem.sliceAsBytes(self.generated_ids.items[self.lookup_prefix_count..]));
+        self.lookup_prefix_count = self.generated_ids.items.len;
+        var h = self.lookup_prefix_hash;
+        h.update(std.mem.asBytes(&anchor));
+        return h.final();
+    }
+
+    fn lookupReceipt(self: *Generator, family: []const u8, kind: []const u8, cls: i64, anchor: u32, candidate: *const speculation.Tree, selected: *const speculation.Tree, limit: u32) LookupReceipt {
+        const selection = lookupSelection();
+        var probabilities = std.hash.Wyhash.init(0);
+        probabilities.update(std.mem.sliceAsBytes(candidate.scores[0..candidate.len]));
+        probabilities.update(std.mem.sliceAsBytes(candidate.conditional_reach[0..candidate.len]));
+        probabilities.update(std.mem.sliceAsBytes(candidate.draft_confidence[0..candidate.len]));
+        probabilities.update(std.mem.sliceAsBytes(candidate.look_confidence[0..candidate.len]));
+        probabilities.update(std.mem.sliceAsBytes(candidate.look_order[0..candidate.len]));
+        const calibrated: u8 = @intFromBool(candidate.scores_calibrated);
+        probabilities.update(std.mem.asBytes(&calibrated));
+        var receipt = LookupReceipt{
+            .family = family,
+            .kind = kind,
+            .lookup_candidates = lookupCandidatesEnabled(),
+            .class = cls,
+            .anchor_pos = self.prompt_ids_owned.len + self.generated_ids.items.len,
+            .prefix_hash = self.lookupPrefix(anchor),
+            .prompt_hash = self.lookupPromptHash(),
+            .candidate_hash = lookupTreeHash(candidate),
+            .candidate_probability_hash = probabilities.final(),
+            .candidate_rows = candidate.len,
+            .legal_rows = @min(candidate.len, limit),
+            .requested_rows = if (selection.rows == std.math.maxInt(u32)) 0 else selection.rows,
+            .selection = selection.name,
+            .rows = selected.len,
+            .admissible = selection.rows == 0 or selection.rows == std.math.maxInt(u32) or selection.rows <= @min(candidate.len, limit),
+        };
+        for (selected.origins[1..selected.len]) |origin| {
+            receipt.selected_local += @intFromBool(origin & 1 != 0);
+            receipt.selected_corpus += @intFromBool(origin & 2 != 0);
+            receipt.selected_persistent += @intFromBool(origin & 4 != 0);
+            receipt.selected_neural += @intFromBool(origin & 8 != 0);
+        }
+        return receipt;
+    }
+
+    fn lookupChainReceipt(self: *Generator, family: []const u8, lr: *LookupRound, look: token_history.Look, candidate: *const speculation.Tree, choice: speculation.Choice) void {
+        lr.chain = candidate.*;
+        lr.chain.len = choice.rows + 1;
+        if (!lookupReceiptsEnabled()) return;
+        var r = self.lookupReceipt(family, "chain", lr.cls, candidate.tokens[0], candidate, &lr.chain, @intCast(candidate.len));
+        r.lookup_order = look.order;
+        r.lookup_confidence = look.confidence;
+        r.predicted_verify_ms = lr.cut.predictVerify(choice.rows + 1, .chain, lr.cls, .generic);
+        r.predicted_tokens = choice.expected + 1;
+        lr.receipt = r;
+    }
+
+    fn lookupSettle(self: *Generator) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        self.ctx.cache.appendEvalArrays(vec);
+        if (self.mtp_cache) |*cache| cache.appendEvalArrays(vec);
+        if (self.ctx.ssm_entries) |entries| {
+            for (entries) |entry| {
+                if (!entry.initialized) continue;
+                if (entry.conv_state.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, entry.conv_state);
+                if (entry.ssm_state.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, entry.ssm_state);
+            }
+        }
+        if (self.has_last_hidden) _ = mlx.mlx_vector_array_append_value(vec, self.last_hidden);
+        if (mlx.mlx_vector_array_size(vec) > 0) try mlx.check(mlx.mlx_eval(vec));
+    }
+
+    fn lookupChainOutcome(self: *const Generator, snapshot: LookupReceipt, raw_accepted: u32, committed: usize, round_ms: f32) LookupReceipt {
+        var r = snapshot;
+        r.accepted = raw_accepted;
+        r.committed = committed;
+        r.round_ms = round_ms;
+        r.verify_commit_ms = if (r.preverify_ms) |before_verify| @max(0, round_ms - before_verify) else null;
+        r.other_ms = if (r.draft_ms != null and r.verify_commit_ms != null) @max(0, r.round_ms.? - r.draft_ms.? - r.verify_commit_ms.?) else null;
+        r.priced = self.spec_cost_solo and r.verify_commit_ms != null;
+        return r;
+    }
+
+    fn lookupRootReceipt(self: *Generator, family: []const u8, lr: *LookupRound, anchor: u32, cls: i64) void {
+        lr.cls = cls;
+        lr.chain = speculation.Tree.init(anchor);
+        lr.receipt = null;
+        if (!lookupReceiptsEnabled()) return;
+        const root = speculation.Tree.init(anchor);
+        var r = self.lookupReceipt(family, "chain", cls, anchor, &root, &root, 1);
+        r.root_no_assistant = true;
+        r.draft_ms = 0;
+        r.predicted_tokens = 1;
+        r.predicted_verify_ms = lr.cut.predictVerify(1, .chain, cls, .generic);
+        lr.receipt = r;
+    }
+
+    /// The PLD arm's draft: the same three-tier lookup, cut to the rows its value pays for.
+    fn pldTiersDraft(self: *Generator, allocator: std.mem.Allocator, anchor: u32, cap: u32, miss: *bool) !?[]const u32 {
+        miss.* = false;
+        if (!lookupCandidatesEnabled()) return null;
+        const preparation_watch = io_util.Stopwatch.init(self.timer.io);
+        const lr = try self.lookupTiersArm(allocator);
+        const cls = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+        if (lookupSelection().rows == 1 or cap == 0) {
+            self.lookupRootReceipt("pld", lr, anchor, cls);
+            return null;
+        }
+        const gen = self.generated_ids.items;
+        if (gen.len > lr.gen) {
+            try lr.drafter.observe(gen[lr.gen..]);
+            lr.gen = gen.len;
+        }
+        const context = try lr.tailContext(self.prompt_ids_owned, gen, anchor);
+        const look = try lr.drafter.look(context, 16, &lr.look);
+        // Economic decline is not a match failure: retain prompt retry cadence
+        // while prices learn. Only absent proposals or zero acceptance back off.
+        miss.* = look.tokens.len == 0;
+        lr.cls = cls;
+        lr.receipt = null;
+        const candidate = lookup_adapter.lookupChain(anchor, look.tokens, look.nodes, look.order, &lr.cut.cal, cap + 1);
+        const trial_width = if (self.spec_cost_solo and lookupSelection().rows == 0 and !lookupCounterfactualEnabled())
+            lr.cut.reservePlainWidthTrial(&candidate, cls)
+        else
+            null;
+        const choice = try lr.cut.chooseLookPreparedControlled(&candidate, cls, lookupRoundMs(preparation_watch.read(), 0, false), &lr.pick, trial_width orelse lookupSelection().rows, .plain, null);
+        if (trial_width) |rows| if (lookupReceiptsEnabled())
+            log.info("[lookup-width-probe] {{\"family\":\"pld\",\"class\":{d},\"rows\":{d},\"reason\":\"upper_width_learning\",\"reservation_consumed\":true,\"max_forced_executions\":2}}\n", .{ cls, rows });
+        if (choice.rows == 0) {
+            self.lookupChainReceipt("pld", lr, look, &candidate, choice);
+            return null;
+        }
+        var alternative: f32 = 0;
+        if (lr.cut.plainFor(cls)) |plain| {
+            if (plain > 0) alternative = 1.0 / plain;
+        }
+        if (lookupTraceEnabled()) log.info("[lookup] pld order={d} conf={d:.2} src={s} rows={d} value={d:.3} alt={d:.3} learned={d}\n", .{
+            look.order, look.confidence, @tagName(look.source), choice.rows, choice.value, alternative, lr.cut.prices.count(),
+        });
+        self.lookupChainReceipt("pld", lr, look, &candidate, choice);
+        return lr.pick.items[0..@min(lr.pick.items.len, cap)];
+    }
+
+    fn lookupMtpPreparationEnabled(self: *const Generator) bool {
+        return self.mtp_serial_accept or lookupReceiptsEnabled();
+    }
+
+    fn lookupMtpPreparationScope(self: *const Generator, native_prepared: bool, scope: speculation.LookupPreparationScope) ?speculation.LookupPreparationScope {
+        return if (self.mtp_serial_accept and !native_prepared) scope else null;
+    }
+
+    fn lookupMtpPreparationSolo(self: *const Generator) bool {
+        return self.spec_cost_solo and !self.mtp_batch_head and self.mtp_group_cap == 0 and !self.mtp_planner_owned;
+    }
+
+    /// One three-tier lookup round: the request's own index, the corpus and the persistent log,
+    /// then the independent policy's chain selection. 0 retains native MTP.
+    fn mtpLookupTiers(self: *Generator, allocator: std.mem.Allocator, t1: u32, native_prepared: bool, native_depth: u32, scope: speculation.LookupPreparationScope, preparation: ?*@FieldType(MtpPreDraft, "lookup_preparation")) !u32 {
+        if (!lookupCandidatesEnabled()) return 0;
+        const preparation_watch = io_util.Stopwatch.init(self.timer.io);
+        if (preparation) |out| out.* = .{
+            .watch = preparation_watch,
+            .scope = scope,
+            .class = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1),
+            .pricing = self.mtp_serial_accept and !native_prepared,
+            .eligible = self.lookupMtpPreparationSolo(),
+            .stash_rows = if (self.mtp_hist_stash) |stash| stash.n else 0,
+            .stash_present = self.mtp_hist_stash != null,
+        };
+        const lr = try self.lookupTiersArm(allocator);
+        self.mtpExactContext(lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1));
+        var accounted_ns: ?u64 = null;
+        // Same round-end boundaries as mtpExactObserve, including empty queries
+        // and outgoing successor queries. Never subtract an incoming chain's timer.
+        defer lr.native_query_ns += accounted_ns orelse preparation_watch.read();
+        if (lookupSelection().rows == 1) {
+            lr.controlled_root = true;
+            lr.pick.clearRetainingCapacity();
+            self.lookupRootReceipt("mtp", lr, t1, lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1));
+            return 0;
+        }
+        const gen = self.generated_ids.items;
+        if (gen.len > lr.gen) {
+            try lr.drafter.observe(gen[lr.gen..]);
+            lr.gen = gen.len;
+        }
+        const context_len = self.prompt_ids_owned.len + gen.len + 1;
+        const context = try lr.tailContext(self.prompt_ids_owned, gen, t1);
+        const look = try lr.drafter.look(context, 16, &lr.look);
+        lr.offered = if (lr.trust_active and look.nodes.len > 0) lookup_adapter.lookupTree(t1, look.nodes, look.order, &lr.cut.cal, 16) else null;
+        lr.offered_position = self.generated_ids.items.len;
+        const cls = lookupCtxClass(context_len);
+        lr.cls = cls;
+        lr.receipt = null;
+        lr.controlled_root = false;
+        const controlled = !std.mem.eql(u8, lookupSelection().name, "adaptive");
+        // An absent proposal cannot beat native MTP. Keep indexing and context
+        // bookkeeping, but do not build/calibrate/price a root-only alternative.
+        // Controlled arms still need their explicit root-verification receipts.
+        if (!controlled and look.tokens.len == 0) {
+            lr.pick.clearRetainingCapacity();
+            if (lookupTraceEnabled()) log.info("[lookup] mtp order=0 rows=0 decision=empty preparation_ms={d:.3}\n", .{lookupRoundMs(preparation_watch.read(), 0, false)});
+            return 0;
+        }
+        const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
+        const cap = @min(remaining, depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active));
+        // Row-exact native yield changes with the request. A shared one-token
+        // bootstrap probe must not price a later three-token native cycle.
+        // Already-prepared work has no defensible remaining-cost estimate.
+        const native = self.lookupMtpNative(lr, cls, native_depth, native_prepared);
+        const alternative: ?f32 = if (native) |cost| cost.expected_tokens / cost.round_ms else null;
+        const fallback: speculation.LookFallback = if (native) |cost| .{ .measured = cost } else .unknown;
+        var candidate = lookup_adapter.lookupChain(t1, look.tokens, look.nodes, look.order, &lr.cut.cal, cap + 1);
+        if (lr.trust_active) candidate = lr.cut.restrictLookup(&candidate, &lr.trust);
+        accounted_ns = preparation_watch.read();
+        if (preparation) |out| out.*.?.query_ns = accounted_ns;
+        const query_ms = lookupRoundMs(accounted_ns.?, 0, false);
+        const mtp_scope = self.lookupMtpPreparationScope(native_prepared, scope);
+        var trial_evidence: ?speculation.Policy.LookWidthTrialEvidence = null;
+        const trial_width = if (!controlled and self.spec_cost_solo and native != null)
+            lr.cut.reserveLookWidthTrial(&candidate, cls, 1 + depth_bounds.floorFor(depth_bounds.active, depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active)), query_ms, native, &trial_evidence, mtp_scope)
+        else
+            null;
+        const choice = try lr.cut.chooseLookPreparedControlled(&candidate, cls, query_ms, &lr.pick, trial_width orelse lookupSelection().rows, fallback, mtp_scope);
+        if (lookupReceiptsEnabled()) if (trial_evidence) |ev|
+            log.info("[lookup-width-screen] {{\"family\":\"mtp\",\"class\":{d},\"rows\":{d},\"reference_rows\":{d},\"reference_ms\":{d:.6},\"preparation_ms\":{d:.6},\"lookup_preparation_ms\":{?d},\"lookup_preparation_scope\":\"{s}\",\"expected_tokens\":{d:.6},\"optimistic_rate\":{d:.6},\"native_rate\":{d:.6},\"reservation_consumed\":{any},\"hypothesis\":\"{s}\"}}\n", .{
+                cls, ev.rows, ev.reference_rows, ev.reference_ms, ev.preparation_ms, ev.lookup_preparation_ms,
+                if (ev.mtp_scope) |value| @tagName(value) else "not_applicable",
+                ev.expected_tokens, ev.optimistic_rate, ev.native_rate, trial_width != null,
+                if (ev.lookup_preparation_ms != null) "known_lookup_preparation_zero_added_verification_latency_not_upper_width_price" else "unknown_lookup_preparation_zero_added_verification_latency_not_upper_width_price",
+            });
+        if (trial_width) |rows| if (lookupReceiptsEnabled())
+            log.info("[lookup-width-probe] {{\"family\":\"mtp\",\"class\":{d},\"rows\":{d},\"reason\":\"upper_width_learning\",\"reservation_consumed\":true,\"max_forced_executions\":2}}\n", .{ cls, rows });
+        if (lookupTraceEnabled()) log.info("[lookup] mtp order={d} conf={d:.2} src={s} rows={d} value={d:.3} alt={d:.3} fallback={s} native_ms={d:.3} native_tokens={d:.3} native_scope={s} decision={s} lookup_preparation_ms={?d} lookup_preparation_scope={s}\n", .{
+            look.order, look.confidence, @tagName(look.source), choice.rows, choice.value, alternative orelse 0, @tagName(fallback),
+            if (native) |cost| cost.round_ms else 0, if (native) |cost| cost.expected_tokens else 0,
+            if (native == null) "unknown" else if (self.mtp_serial_accept)
+                (if (lr.native_yield_samples[native_depth] > 0) "request_cost_current_yield" else "request_cycle_query_adjusted")
+            else "isolated_probe",
+            if (controlled) "controlled" else if (look.tokens.len == 0) "empty" else if (cap == 0) "budget" else if (alternative == null) "unmeasured" else if (choice.rows == 0) "mtp_rate" else "lookup",
+            if (mtp_scope) |value| (if (choice.source == .look) lr.cut.knownMtpPreparation(choice.rows + 1, cls, value) else null) else null,
+            if (mtp_scope) |value| @tagName(value) else "not_applicable",
+        });
+        if (choice.rows == 0) {
+            lr.controlled_root = controlled;
+            if (lr.controlled_root) self.lookupChainReceipt("mtp", lr, look, &candidate, choice);
+            return 0;
+        }
+        self.lookupChainReceipt("mtp", lr, look, &candidate, choice);
+        return choice.rows;
+    }
+
+    fn lookupMtpNative(self: *const Generator, lr: *const LookupRound, class: i64, depth: u32, prepared: bool) ?speculation.RemainingRound {
+        if (prepared or !self.spec_cost_solo) return null;
+        if (!self.mtp_serial_accept) return lr.cut.specRemainingFor(class);
+        if (self.mtp_request_depth_class != class or depth >= lr.native_cycles.len) return null;
+        var measured = lr.native_cycles[depth] orelse return null;
+        // These populations have different timing eligibility. This is an
+        // admission prediction, not a newly measured paired native rate.
+        if (lr.native_yield_samples[depth] > 0) measured.expected_tokens = lr.native_yield[depth];
+        return measured;
+    }
+
     /// A chain of the context's continuation after `t1`, or null when the gate
     /// prefers the MTP head. Single-stream rounds only.
     /// How many context-continuation drafts the lookup gate takes after `t1`; 0 = the MTP head.
-    fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
+    fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32, native_prepared: bool, scope: speculation.LookupPreparationScope, preparation: ?*@FieldType(MtpPreDraft, "lookup_preparation")) !u32 {
         if (!mtpLookupEnabled() or self.mtp_batch_head) return 0;
         if (group_planner.enabled() and self.mtp_planner_owned) return 0;
+        if (lookupTiersEnabled()) return self.mtpLookupTiers(allocator, t1, native_prepared, plan.m_lo, scope, preparation);
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
@@ -7181,24 +9097,36 @@ pub const Generator = struct {
         return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
     }
 
-    fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
-        const k = try self.mtpLookupDrafts(allocator, plan, t1);
+    fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32, scope: speculation.LookupPreparationScope) !?MtpPreDraft {
+        const prepare_watch: ?io_util.Stopwatch = if (lookupTiersEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
+        if (self.lookup_tiers) |*lr| lr.controlled_root = false;
+        var preparation: @FieldType(MtpPreDraft, "lookup_preparation") = null;
+        const k = try self.mtpLookupDrafts(allocator, plan, t1, false, scope, if (self.lookupMtpPreparationEnabled()) &preparation else null);
         const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
-        if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
-        const got = (try self.mtpLookupIndex(allocator)).match(t1, lookup_cap);
+        const root = if (self.lookup_tiers) |lr| lr.controlled_root else false;
+        if (!root and (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap))) {
+            if (k > 0 and lookupTraceEnabled()) log.info("[lookup] mtp rows={d} decision=depth_floor\n", .{k});
+            return null;
+        }
         const Once = struct {
             var logged = false;
         };
         if (!Once.logged) {
             Once.logged = true;
-            log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.?.suffix });
+            log.info("[mtp] prompt-lookup drafts engaged: k={d}\n", .{k});
         }
         // No MTP chain consumes the stash this round; left pending, it would grow
         // across lookup rounds into one oversized head forward.
         try self.mtpApplyStash();
         const drafts = try allocator.alloc(u32, k);
         errdefer allocator.free(drafts);
-        @memcpy(drafts, got.?.draft[0..k]);
+        if (self.lookup_tiers) |*lr| {
+            if (lr.pick.items.len < k) return null;
+            @memcpy(drafts, lr.pick.items[0..k]);
+        } else {
+            const got = (try self.mtpLookupIndex(allocator)).match(t1, lookup_cap) orelse return null;
+            @memcpy(drafts, got.draft[0..k]);
+        }
         const draft_arrs = try allocator.alloc(mlx.mlx_array, k);
         errdefer allocator.free(draft_arrs);
         const one = [_]c_int{1};
@@ -7211,6 +9139,11 @@ pub const Generator = struct {
         lplan.m_lo = k;
         lplan.m_hi = k;
         lplan.width_trial = false;
+        if (self.lookup_tiers != null) try self.lookupSettle();
+        if (preparation) |*measurement| {
+            measurement.rows = k + 1;
+            measurement.eligible = measurement.eligible and self.lookupMtpPreparationSolo();
+        }
         return .{
             .plan = lplan,
             .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
@@ -7226,6 +9159,10 @@ pub const Generator = struct {
             .h_chain = null,
             .m = k,
             .lookup = true,
+            .lookup_prepare_ns = if (prepare_watch) |watch| watch.read() else 0,
+            .lookup_preparation = preparation,
+            .lookup_receipt = if (self.lookup_tiers) |*lr| .{ .class = lr.cls, .tree = lr.chain, .round = lr.receipt } else null,
+            .lookup_offer = if (self.lookup_tiers) |*lr| lr.takeOffer(t1, self.generated_ids.items.len) else null,
         };
     }
 
@@ -7426,7 +9363,8 @@ pub const Generator = struct {
         const plan = (lazy.* orelse return self.mtpMaybePreDraft(allocator)).plan;
         const keeps = self.mtpLazyKeeps(exact);
         // Before taking the chain: on error the round's errdefer still owns and rolls it back.
-        const lookup = keeps and try self.mtpLookupDrafts(allocator, plan, self.next_token_id) > 0;
+        const lookup_watch: ?io_util.Stopwatch = if (lookupTiersEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
+        const lookup = keeps and try self.mtpLookupDrafts(allocator, plan, self.next_token_id, true, .carried, null) > 0;
         const discard = !keeps or lookup or mtp_lazy_force_discard;
         var chain = lazy.*.?;
         lazy.* = null;
@@ -7434,11 +9372,21 @@ pub const Generator = struct {
         if (discard) {
             chain.deinit(allocator);
             try self.mtp_cache.?.truncate(st.off0, self.xfm.s);
-            if (lookup) self.mtp_pre_draft = try self.mtpLookupChain(allocator, plan, self.next_token_id);
+            if (lookup) self.mtp_pre_draft = try self.mtpLookupChain(allocator, plan, self.next_token_id, .carried);
+            if (self.mtp_pre_draft) |*prepared| {
+                if (lookup_watch) |watch| prepared.lookup_prepare_ns = watch.read();
+                if (prepared.lookup_preparation) |*measurement| {
+                    measurement.ready_ns = measurement.watch.read();
+                    // The first query and discarded native work precede this
+                    // clock. Do not present the final requery as the whole cost.
+                    measurement.shadow_requery = true;
+                }
+            }
             return;
         }
         chain.t1 = self.next_token_id;
         chain.off0 = st.off0 + st.n;
+        chain.lookup_offer = if (self.lookup_tiers) |*lr| lr.takeOffer(chain.t1, self.generated_ids.items.len) else null;
         st.deinit();
         self.mtp_hist_stash = null;
         self.mtp_pre_draft = chain;
@@ -8498,9 +10446,19 @@ pub const Generator = struct {
     /// round's entry would compute.
     fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
         if (self.mtp_batch_head) return;
+        if (self.lookupMtpProbePending() and mtpPredraftEnabled() and mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) {
+            self.lookup_mtp_probe_gaps +|= 1;
+            return;
+        }
+        const lookup_watch: ?io_util.Stopwatch = if (lookupTiersEnabled()) io_util.Stopwatch.init(self.timer.io) else null;
         var chain = (try self.mtpPreDraftOpen(allocator, true)) orelse return;
         errdefer chain.deinit(allocator);
         if (chain.lookup) {
+            if (lookup_watch) |watch| chain.lookup_prepare_ns = watch.read();
+            if (chain.lookup_preparation) |*measurement| {
+                measurement.ready_ns = measurement.watch.read();
+                measurement.eligible = measurement.eligible and self.lookupMtpPreparationSolo();
+            }
             self.mtp_pre_draft = chain;
             return;
         }
@@ -8525,8 +10483,12 @@ pub const Generator = struct {
         const plan = self.mtpRoundPlan();
         // The plan itself can end speculation or park the request on a serial probe.
         if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return null;
-        if (allow_lookup) if (try self.mtpLookupChain(allocator, plan, self.next_token_id)) |chain| return chain;
-        return try self.mtpChainInit(allocator, plan, self.next_token_id);
+        if (allow_lookup) if (try self.mtpLookupChain(allocator, plan, self.next_token_id, .carried)) |chain| return chain;
+        var chain = try self.mtpChainInit(allocator, plan, self.next_token_id);
+        if (allow_lookup) if (self.lookup_tiers) |*lr| {
+            chain.lookup_offer = lr.takeOffer(chain.t1, self.generated_ids.items.len);
+        };
+        return chain;
     }
 
     /// `mtpMaybePreDraft` for a group that just finished its round: ONE batched chain and
@@ -8645,6 +10607,9 @@ pub const Generator = struct {
     /// prefill chunk. The next round times itself and is dropped as a transition.
     pub fn invalidateRoundClock(self: *Generator) void {
         self.mtp_regime_clock = null;
+        self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
+        if (self.lookup_tiers) |*lr| lr.native_query_ns = 0;
         self.spec_round_prev_width = null;
     }
 
@@ -9003,11 +10968,29 @@ pub const Generator = struct {
             // The pre-draft consumed the history stash when it was built.
             std.debug.assert(self.mtp_hist_stash == null);
             std.debug.assert(pd.t1 == self.next_token_id);
-            break :blk pd;
+            var carried = pd;
+            carried.lookup_prepared_before_round = true;
+            break :blk carried;
         } else blk: {
             const plan_now = self.mtpRoundPlan();
-            if (try self.mtpLookupChain(allocator, plan_now, self.next_token_id)) |lc| break :blk lc;
+            if (try self.mtpLookupChain(allocator, plan_now, self.next_token_id, .cold)) |lc| break :blk lc;
+            const clean_class = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+            const clean_probe = self.lookupMtpProbePending();
+            if (clean_probe) try self.lookupSettle();
+            const clean_watch: ?io_util.Stopwatch = if (clean_probe) io_util.Stopwatch.init(self.timer.io) else null;
             var c = try self.mtpChainInit(allocator, plan_now, self.next_token_id);
+            if (self.lookup_tiers) |*lr| c.lookup_offer = lr.takeOffer(c.t1, self.generated_ids.items.len);
+            if (clean_watch) |watch| {
+                if (self.lookup_mtp_probe_class != clean_class) {
+                    self.lookup_mtp_probe_class = clean_class;
+                    self.lookup_mtp_probe_attempts = 0;
+                    self.lookup_mtp_probe_eligible = 0;
+                    self.lookup_mtp_probe_learned = 0;
+                }
+                self.lookup_mtp_probe_attempts += 1;
+                c.lookup_native_watch = watch;
+                c.lookup_native_class = clean_class;
+            }
             errdefer c.deinit(allocator);
             if (self.mtp_batch_head) {
                 return .{ .open = .{
@@ -9051,6 +11034,7 @@ pub const Generator = struct {
     ) !MtpRoundState {
         var chain = chain_in;
         errdefer chain.deinit(allocator);
+        self.mtpExactContext(lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1));
         var ph = ph_in;
         const s = self.xfm.s;
         const plan = chain.plan;
@@ -9062,6 +11046,29 @@ pub const Generator = struct {
         const m_lo: u32 = @min(plan.m_lo, cap);
         const m_max: u32 = @min(plan.m_hi, cap);
         chain.m = @min(chain.m, cap);
+        if (chain.lookup and self.lookup_tiers != null) {
+            const boundary = std.Io.Timestamp.now(round_watch.io, .boot);
+            if (chain.lookup_preparation) |*measurement| {
+                measurement.eligible = measurement.eligible and self.lookupMtpPreparationSolo() and measurement.rows == chain.m + 1;
+                chain.lookup_preverify_ns = measurement.preverify(round_watch, boundary, chain.lookup_prepared_before_round) orelse 0;
+            } else {
+                chain.lookup_preverify_ns = MtpLookupPreparation.elapsedAt(round_watch, boundary) orelse 0;
+            }
+        }
+        if (lookupReceiptsEnabled()) {
+            if (chain.lookup_receipt) |*evidence| {
+                if (evidence.round) |*r| {
+                    if (chain.lookup) if (self.lookup_tiers) |*lr| {
+                        const legal_rows = if (self.mtp_group_cap > 0) @as(usize, self.mtp_group_cap) + 1 else r.legal_rows;
+                        r.limitChain(&evidence.tree, lr.cut, chain.m, legal_rows);
+                    };
+                    const before_verify = lookupRoundMs(chain.lookup_preverify_ns, chain.lookup_prepare_ns, chain.lookup_prepared_before_round);
+                    r.preverify_ms = before_verify;
+                    r.carried_preparation_ms = lookupRoundMs(0, chain.lookup_prepare_ns, chain.lookup_prepared_before_round);
+                    r.draft_ms = if (r.root_no_assistant) 0 else before_verify;
+                }
+            }
+        }
         if (tracing) {
             self.mtp_trace.add(.draft, ph.read());
             ph.reset();
@@ -9098,6 +11105,7 @@ pub const Generator = struct {
             }
         }
         const m: u32 = chain.m;
+        try self.beginLookupNativeTarget(&chain);
         // Chain complete — release the chain hidden (only chunk B needed it).
         if (chain.h_chain) |h| {
             _ = mlx.mlx_array_free(h);
@@ -9166,6 +11174,9 @@ pub const Generator = struct {
     /// Phase 3 of a solo round: the trunk verify forward over `[t1, drafts…]`.
     /// A batched group replaces this with one forward for every slot (`mtpGroupVerify`).
     pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
+        if (st.chain.lookup_preparation) |*measurement| {
+            measurement.eligible = measurement.eligible and self.lookupMtpPreparationSolo();
+        }
         const xfm = self.xfm;
         const tracing = st.tracing;
         var new_hidden = mlx.mlx_array_new();
@@ -9239,6 +11250,9 @@ pub const Generator = struct {
         const n = gens.len;
         std.debug.assert(n == states.len);
         std.debug.assert(n >= 1 and n <= MTP_GROUP_ROWS_MAX);
+        for (states) |st| if (st.chain.lookup_preparation) |*measurement| {
+            measurement.eligible = false;
+        };
         const xfm = gens[0].xfm;
         for (gens[1..n]) |gen| {
             if (gen.xfm != xfm) return error.MtpGroupModelMismatch;
@@ -9454,10 +11468,23 @@ pub const Generator = struct {
         var ph = st.ph;
         var round_watch = st.round_watch;
         const chain = &st.chain;
+        if (chain.lookup_preparation) |*measurement| {
+            measurement.eligible = measurement.eligible and self.lookupMtpPreparationSolo() and st.verify_len == chain.m + 1;
+        }
         const plan = chain.plan;
         const m_lo: u32 = plan.m_lo;
         const m_max: u32 = plan.m_hi;
         const m: u32 = chain.m;
+        const native_yield_class: ?i64 = if (self.mtp_serial_accept and self.lookup_tiers != null)
+            lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1)
+        else
+            null;
+        var completed_native_yield: ?u32 = null;
+        // Only successful returns contribute. Outgoing preparation may cross
+        // context classes; the completion hook rejects that old-class sample.
+        defer if (native_yield_class) |class| {
+            if (completed_native_yield) |tokens| self.observeMtpNativeYield(class, m, tokens);
+        };
         const observed_limit = @min(m, self.max_tokens -| self.completion_tokens -| 1);
         const t1: u32 = chain.t1;
         const mtp_off0: usize = chain.off0;
@@ -9481,9 +11508,9 @@ pub const Generator = struct {
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
-        // A lookup round is no MTP width sample, nor is the MTP round after one:
-        // its first head step consumes a wider history stash than MTP makes.
-        const times_round = !chain.lookup and !self.mtp_after_lookup;
+        // Lookup/recovery and deliberately settled clean probes are not ordinary
+        // pipelined native width samples. Their acceptance remains useful.
+        const times_round = !chain.lookup and !self.mtp_after_lookup and chain.lookup_native_watch == null;
         self.mtp_after_lookup = chain.lookup;
         if (chain.lookup) {
             self.mtp_lookup_rounds += 1;
@@ -9536,7 +11563,11 @@ pub const Generator = struct {
         // The group already built and dispatched this row's Phase 4 with the rest
         // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
         const prepared = stochastic and st.accept_p.ctx != null;
-        if (prepared) {
+        if (stochastic and m == 0) {
+            // The legal root action has no proposal or acceptance experiment:
+            // draw its pending successor directly from the sole target row.
+            corr_batch = sampleTokenLazy(verify_logits, self.mtpSamplingDraw(self.sampling), s);
+        } else if (prepared) {
             _ = mlx.mlx_array_free(accept_p_vec);
             accept_p_vec = st.accept_p;
             accept_q_vec = st.accept_q;
@@ -9709,7 +11740,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             if (stochastic) {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
+                if (m > 0) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
                 if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
                 if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
                 if (corr_batch.ctx != null) {
@@ -9732,7 +11763,7 @@ pub const Generator = struct {
             c.deinit(allocator);
             self.mtp_cache.?.truncate(mtp_off0, s) catch {};
         };
-        if (mtpLazyPredraftAllowedFor(self.mtpLazyGate(st, !stochastic, group_argmax or prepared))) {
+        if (chain.lookup_native_watch == null and !self.lookupMtpProbePending() and mtpLazyPredraftAllowedFor(self.mtpLazyGate(st, !stochastic, group_argmax or prepared))) {
             const lazy_lap = SubLap.start(tracing, self.timer.io);
             lazy_planned = true;
             lazy = try self.mtpLazyPreDraft(allocator, chain, verify_argmax.lazy(), verify_hidden_all);
@@ -9745,6 +11776,15 @@ pub const Generator = struct {
             var v: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&v, arr));
             drafts[idx] = @intCast(v);
+        }
+        if (lookupReceiptsEnabled() and chain.lookup_receipt == null) {
+            var proposal = speculation.Tree.chain(t1, drafts[0..m], 0, 0);
+            for (proposal.origins[1..proposal.len]) |*origin| origin.* = if (chain.lookup) 1 else 8;
+            var r = self.lookupReceipt("mtp", "chain", lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1), t1, &proposal, &proposal, m + 1);
+            r.selection = "legacy";
+            r.assistant = !chain.lookup;
+            r.timing_scope = "overlapped_draft_unseparated";
+            chain.lookup_receipt = .{ .class = r.class, .round = r };
         }
         if (Transformer.deferredPleOnGpu(&self.ctx)) {
             // The verify ids are `[t1, drafts]`, read just above: the PLE history moves here,
@@ -9765,7 +11805,8 @@ pub const Generator = struct {
         var accepted: u32 = 0;
         var greedy_next_pending: u32 = 0;
         var greedy_raw: u32 = 0;
-        if (stochastic) {
+        var verified_accepted: u32 = 0;
+        if (stochastic and m > 0) {
             // Sharp drafts: full Leviathan ratio min(1, p/q) against the
             // proposal's own density. Greedy-forced drafts keep the exact
             // one-hot rule min(1, target_p).
@@ -9788,19 +11829,23 @@ pub const Generator = struct {
                 defer_data = defer_ptr[0..m];
             }
             accepted = self.acceptPrefixFor(chain.lookup)(p_data[0..m], q_data, defer_data, &self.prng);
+            verified_accepted = accepted;
             accepted = capAcceptedForTokenBudget(
                 accepted,
                 self.completion_tokens,
                 self.max_tokens,
             );
-        } else {
+        } else if (!stochastic) {
             const verdict = try mtpAcceptRowGreedy(verify_argmax, st.verify_len, drafts[0..m], self.completion_tokens, self.max_tokens);
             accepted = verdict.accepted;
             greedy_next_pending = verdict.next_pending;
-            greedy_raw = mtpGreedyPrefix(try verify_argmax.ids(st.verify_len), drafts[0..m]);
+            const reached_ids = try verify_argmax.ids(st.verify_len);
+            greedy_raw = mtpGreedyPrefix(reached_ids, drafts[0..m]);
+            self.observeMtpLookupPath(chain, reached_ids[0 .. greedy_raw + 1]);
+            verified_accepted = greedy_raw;
         }
 
-        const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned) self.eos_token_ids else &.{});
+        const stop_prefix = mtpStopPrefix(drafts, accepted, self.eos_token_ids);
         // t1 sits at generated index G, the kept drafts after it, the pending
         // token next: the serial sampler's next draw is the one after that.
         if (self.mtp_serial_accept) self.sampling.draw = self.generated_ids.items.len + stop_prefix.accepted + 2;
@@ -9922,6 +11967,9 @@ pub const Generator = struct {
                 self.mtp_trace.add(.commit, ph.read());
                 ph.reset();
             }
+            try self.observeLookupNativeRemaining(chain, m + 1, true);
+            try self.observeLookupRound(chain, verified_accepted, m, round_watch);
+            const lazy_built = lazy != null;
             try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
             if (tracing) {
                 self.mtp_trace.add(.predraft, ph.read());
@@ -9929,12 +11977,15 @@ pub const Generator = struct {
             }
             self.mtpTraceRoundEnd(m, m, m_lo);
             if (times_round) {
+                if (self.mtp_serial_accept) self.mtpExactObserve(m, m, self.mtpExactCycleShape(chain, lazy_built));
                 self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
                 if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
             } else {
                 if (chain.lookup) self.mtpLookupObserve(m, m + 1);
-                self.mtpRoundUntimed();
+                self.mtpRoundUntimed(chain.lookup, m, m);
             }
+            if (!chain.lookup and accepted == verified_accepted and stop_prefix.stop == null and
+                !isEosId(t1, self.eos_token_ids)) completed_native_yield = m + 1;
             return DrafterStepResult{
                 .tokens = tokens,
                 .accepted_tokens = m,
@@ -10017,6 +12068,10 @@ pub const Generator = struct {
         self.mtpRoundAcceptObserve(chain.lookup, m, accepted);
         self.next_token_id = next_pending;
         self.advanceStep(1 + accepted);
+        if (stop_prefix.stop != null) {
+            self.done = true;
+            self.finish_reason = "stop";
+        }
 
         if (!chain.lookup) {
             self.mtpPlannerObserve(if (stop_prefix.stop != null) accepted else observed_limit, accepted);
@@ -10028,6 +12083,9 @@ pub const Generator = struct {
             self.mtp_trace.add(.commit, ph.read());
             ph.reset();
         }
+        try self.observeLookupNativeRemaining(chain, accepted + 1, stop_prefix.stop == null and accepted == verified_accepted);
+        try self.observeLookupRound(chain, verified_accepted, accepted, round_watch);
+        const lazy_built = lazy != null;
         try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
         if (tracing) {
             self.mtp_trace.add(.predraft, ph.read());
@@ -10035,12 +12093,15 @@ pub const Generator = struct {
         }
         self.mtpTraceRoundEnd(m, accepted, m_lo);
         if (times_round) {
+            if (self.mtp_serial_accept) self.mtpExactObserve(m, accepted, self.mtpExactCycleShape(chain, lazy_built));
             self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
             if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
             if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
-            self.mtpRoundUntimed();
+            self.mtpRoundUntimed(chain.lookup, m, accepted);
         }
+        if (!chain.lookup and accepted == verified_accepted and stop_prefix.stop == null and
+            !isEosId(t1, self.eos_token_ids)) completed_native_yield = accepted + 1;
         return DrafterStepResult{
             .tokens = tokens,
             .accepted_tokens = accepted,
@@ -10556,23 +12617,64 @@ pub const Generator = struct {
     /// the kv term, the regime gate and the round-cost table all read ONE
     /// inter-round wall clock (tok/s is measured between round ends, so
     /// per-round work outside the round stopwatch belongs to the width).
-    /// The depth (1 or 2) with the most expected tokens per ms: this request's
-    /// acceptance against the model's measured round ms per depth. A depth
-    /// never measured on this model runs first; every MTP_EXACT_PROBE rounds
-    /// on the model the other depth runs, so both costs stay current.
+    /// Choose depth from fresh request-local cycles, falling back to shared prices.
+    /// Existing model-wide challenges refresh the alternative every 64 rounds;
+    /// a useful challenge must not remain hidden behind an inherited slow EMA.
+    fn mtpExactContext(self: *Generator, class: i64) void {
+        if (self.mtp_request_depth_class == class) return;
+        self.mtp_request_depth_class = class;
+        self.mtp_request_depth_ms = @splat(0);
+        if (self.lookup_tiers) |*lr| {
+            lr.native_cycles = @splat(null);
+            lr.native_query_ns = 0;
+            lr.native_yield = @splat(0);
+            lr.native_yield_samples = @splat(0);
+        }
+        // The first executed chain in a new class cannot price an old interval.
+        self.mtp_cycle_watch = null;
+        self.mtp_cycle_shape = .ineligible;
+    }
+
+    fn mtpExactPrice(self: *const Generator, depth: u32) f32 {
+        const class = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+        if (self.mtp_request_depth_class == class and depth < self.mtp_request_depth_ms.len) {
+            const fresh = self.mtp_request_depth_ms[depth];
+            if (fresh > 0) return fresh;
+        }
+        return self.xfm.mtp_depth_ms[depth];
+    }
+
     fn mtpExactDepth(self: *Generator, cap: u32) u32 {
-        const ms = &self.xfm.mtp_depth_ms;
         var d: u32 = 1;
-        while (d <= cap) : (d += 1) if (ms[d] == 0) return d;
-        if (cap < 2) return 1;
+        while (d <= cap) : (d += 1) if (self.mtpExactPrice(d) == 0) {
+            self.traceMtpExactDepth(d, true, false);
+            return d;
+        };
+        if (cap < 2) {
+            self.traceMtpExactDepth(1, false, false);
+            return 1;
+        }
         const a = self.mtpExactAcceptance();
         const tok1 = 1 + a;
         const tok2 = tok1 + a * a;
-        const best: u32 = if (tok2 / ms[2] > tok1 / ms[1]) 2 else 1;
+        const best: u32 = if (tok2 / self.mtpExactPrice(2) > tok1 / self.mtpExactPrice(1)) 2 else 1;
         self.xfm.mtp_depth_rounds +%= 1;
-        return if (self.xfm.mtp_depth_rounds % MTP_EXACT_PROBE == 0) 3 - best else best;
+        const trial = self.xfm.mtp_depth_rounds % MTP_EXACT_PROBE == 0;
+        const selected = if (trial) 3 - best else best;
+        self.traceMtpExactDepth(selected, false, trial);
+        return selected;
     }
     const MTP_EXACT_PROBE = 64;
+
+    fn traceMtpExactDepth(self: *const Generator, depth: u32, cold: bool, trial: bool) void {
+        if (!lookupReceiptsEnabled()) return;
+        log.info("[lookup-native-depth] {{\"family\":\"mtp\",\"anchor_pos\":{d},\"depth\":{d},\"cold\":{any},\"trial\":{any},\"acceptance\":{d:.6},\"one_ms\":{d:.6},\"two_ms\":{d:.6},\"shared_one_ms\":{d:.6},\"shared_two_ms\":{d:.6},\"request_tried\":{d},\"request_kept\":{d}}}\n", .{
+            self.prompt_ids_owned.len + self.generated_ids.items.len,
+            depth, cold, trial, self.mtpExactAcceptance(),
+            self.mtpExactPrice(1), self.mtpExactPrice(2),
+            self.xfm.mtp_depth_ms[1], self.xfm.mtp_depth_ms[2], self.mtp_tried, self.mtp_kept,
+        });
+    }
 
     /// This request's first-draft acceptance: its own counts over a prior of
     /// MTP_EXACT_PRIOR_ROUNDS rounds at the model's rate. A second draft is
@@ -10584,24 +12686,222 @@ pub const Generator = struct {
     }
     const MTP_EXACT_PRIOR_ROUNDS = 8;
 
+    /// Two bounded opt-in clean opportunities bootstrap a missing context price.
+    /// No native-baseline request or already-priced context loses its pipeline.
+    fn lookupMtpProbePending(self: *const Generator) bool {
+        if (!std.mem.eql(u8, lookupSelection().name, "adaptive")) return false;
+        if (!lookupTiersEnabled() or !self.spec_cost_solo or self.mtp_batch_head or self.mtp_group_cap != 0 or self.mtp_planner_owned or self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_planner_pending) return false;
+        const lr = if (self.lookup_tiers) |*round| round else return false;
+        const cls = lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1);
+        if (lr.cut.specRemainingFor(cls) != null) return false;
+        return self.lookup_mtp_probe_class != cls or self.lookup_mtp_probe_attempts < 2;
+    }
+
+    /// Consume only the verifier's naturally read, actually reached decisions.
+    /// Native and lookup chains both retain the full queried offer; no proposal
+    /// beyond a native rejection becomes a target observation.
+    fn observeMtpLookupPath(self: *Generator, chain: *MtpPreDraft, reached: []const i32) void {
+        if (chain.lookup_observed or reached.len == 0) return;
+        const lr = if (self.lookup_tiers) |*value| value else return;
+        if (!lr.trust_active) return;
+        const offer = if (chain.lookup_offer) |*value| value else return;
+        if (offer.len == 0 or offer.tokens[0] != chain.t1) return;
+        var path: [speculation.MAX_TREE_ROWS]u32 = undefined;
+        const count = @min(path.len, reached.len);
+        for (reached[0..count], path[0..count]) |id, *token| token.* = @intCast(id);
+        lr.cut.observeLookupTree(offer, path[0..count], &lr.trust);
+        if (chain.lookup) if (chain.lookup_receipt) |*evidence| {
+            lr.cut.observeLookupChainRemainder(&evidence.tree, offer, path[0..count], &lr.trust);
+        };
+        chain.lookup_observed = true;
+    }
+
+    /// Only the existing two fresh native probes may introduce this barrier.
+    /// The Qwen sidecar's request GPU state is its KV cache plus the chain's live
+    /// graphs. Other head families have additional state and are not priced here.
+    fn beginLookupNativeTarget(self: *Generator, chain: *MtpPreDraft) !void {
+        if (chain.lookup_native_watch == null or chain.lookup or chain.lookup_prepared_before_round or
+            !self.spec_cost_solo or self.mtp_group_cap != 0 or self.sampling.temperature != 0) return;
+        const head = self.mtp orelse return;
+        if (head != .qwen) return;
+        const cache = if (self.mtp_cache) |*value| value else return;
+        if (cache.* != .qwen or !self.xfm.config.rowExactDecode()) return;
+        const barrier = io_util.Stopwatch.init(self.timer.io);
+        const arrays = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(arrays);
+        _ = mlx.mlx_vector_array_append_value(arrays, chain.t1_arr);
+        for (chain.draft_arrs[0..chain.m]) |arr| _ = mlx.mlx_vector_array_append_value(arrays, arr);
+        if (chain.conf_arrs) |slots| for (slots[0..chain.n_conf]) |arr| {
+            _ = mlx.mlx_vector_array_append_value(arrays, arr);
+        };
+        if (chain.q_probs) |slots| for (slots[0..chain.n_qp]) |arr| {
+            _ = mlx.mlx_vector_array_append_value(arrays, arr);
+        };
+        if (chain.h_chain) |h| _ = mlx.mlx_vector_array_append_value(arrays, h);
+        if (chain.place) |place| _ = mlx.mlx_vector_array_append_value(arrays, place.live_end);
+        cache.appendEvalArrays(arrays);
+        try mlx.check(mlx.mlx_eval(arrays));
+        chain.lookup_head_settle_ns = barrier.read();
+        // Final chunk extension is complete; rollback anchors and verify input
+        // construction have not started. The total native clock keeps running.
+        chain.lookup_target_watch = io_util.Stopwatch.init(self.timer.io);
+    }
+
+    fn observeLookupNativeRemaining(self: *Generator, chain: *const MtpPreDraft, tokens: u32, complete: bool) !void {
+        const watch = chain.lookup_native_watch orelse return;
+        // No lazy successor was built on this round. Settle every committed
+        // target/head state before timing ends, then let normal predrafting resume.
+        try self.lookupSettle();
+        const remaining_ms = lookupRoundMs(watch.read(), 0, false);
+        const target_ms = if (chain.lookup_target_watch) |target| lookupRoundMs(target.read(), 0, false) else 0;
+        const eligible = complete and self.spec_cost_solo and !chain.lookup and tokens > 0 and std.math.isFinite(remaining_ms) and remaining_ms > 0;
+        var learned = false;
+        const target_eligible = eligible and chain.lookup_target_watch != null and target_ms > 0 and std.math.isFinite(target_ms);
+        var target_learned = false;
+        if (eligible) {
+            self.lookup_mtp_probe_eligible +|= 1;
+            if (self.lookup_tiers) |*lr|
+                learned = lr.cut.observeSpecRemainingProbe(remaining_ms, tokens, chain.lookup_native_class, 1);
+            if (learned) self.lookup_mtp_probe_learned +|= 1;
+        }
+        if (target_eligible) if (self.lookup_tiers) |*lr| {
+            target_learned = lr.cut.prices.observeKernel(chain.m + 1, target_ms, .chain, chain.lookup_native_class, .generic);
+        };
+        if (lookupReceiptsEnabled()) log.info("[lookup-native-cost] {{\"family\":\"mtp\",\"class\":{d},\"scope\":\"post_query_through_settled_commit_before_successor\",\"remaining_ms\":{d:.6},\"rows\":{d},\"tokens\":{d},\"eligible\":{any},\"learned\":{any},\"attempts\":{d},\"eligible_samples\":{d},\"learned_samples\":{d},\"pipeline_gaps_request\":{d},\"attempt_limit\":2,\"head_settle_ms\":{d:.6},\"target_verify_commit_ms\":{d:.6},\"target_price_eligible\":{any},\"target_price_learned\":{any}}}\n", .{
+            chain.lookup_native_class, remaining_ms, chain.m + 1, tokens, eligible, learned,
+            self.lookup_mtp_probe_attempts, self.lookup_mtp_probe_eligible,
+            self.lookup_mtp_probe_learned, self.lookup_mtp_probe_gaps,
+            lookupRoundMs(chain.lookup_head_settle_ns, 0, false), target_ms, target_eligible, target_learned,
+        });
+    }
+
+    /// Observe the completed chain before predrafting can replace next-round scratch or inputs.
+    fn observeLookupRound(self: *Generator, chain: *MtpPreDraft, verified_accepted: u32, accepted: u32, watch: io_util.Stopwatch) !void {
+        const evidence = if (chain.lookup_receipt) |*value| value else return;
+        if (chain.lookup or evidence.round != null) try self.lookupSettle();
+        const ms = lookupRoundMs(watch.read(), chain.lookup_prepare_ns, chain.lookup_prepared_before_round);
+        const preverify_ms = lookupRoundMs(chain.lookup_preverify_ns, chain.lookup_prepare_ns, chain.lookup_prepared_before_round);
+        if (chain.lookup) {
+            if (self.lookup_tiers) |*lr| {
+                if (!chain.lookup_observed) lr.cut.observeChainAccepted(&evidence.tree, chain.m, verified_accepted);
+                // Acceptance survives contention; wall pricing does not.
+                if (self.spec_cost_solo) {
+                    const verify_ms = @max(0, ms - preverify_ms);
+                    const warmed = lr.cut.prices.observeKernel(chain.m + 1, verify_ms, .chain, evidence.class, .generic);
+                    if (chain.m == 0 and warmed) lr.cut.observePlain(verify_ms, evidence.class);
+                }
+            }
+        }
+        if (chain.lookup_preparation) |*measurement| {
+            const solo = chain.lookup and self.lookupMtpPreparationSolo();
+            const learned = if (self.lookup_tiers) |*lr|
+                measurement.observe(lr.cut, chain.lookup_prepared_before_round, chain.lookup_preverify_ns, chain.m + 1, solo)
+            else
+                false;
+            if (lookupReceiptsEnabled() and evidence.round != null) {
+                const sample_ns = measurement.sampleNs(chain.lookup_prepared_before_round, chain.lookup_preverify_ns, chain.m + 1, solo);
+                const known_ms = if (self.lookup_tiers) |lr| lr.cut.knownMtpPreparation(chain.m + 1, measurement.class, measurement.scope) else null;
+                // These wall intervals include policy/history/materialization and
+                // the existing settle, not pure stash work or a causal penalty.
+                log.info("[lookup-mtp-preparation] {{\"version\":2,\"anchor_pos\":{d},\"prefix_hash\":{d},\"class\":{d},\"rows\":{d},\"scope\":\"{s}\",\"stash_present_at_query\":{any},\"stash_rows_at_query\":{d},\"query_ns\":{?d},\"final_query_post_ns\":{?d},\"resumed_preverify_ns\":{d},\"post_query_preparation_ns\":{?d},\"carried\":{any},\"clock_scope\":\"{s}\",\"eligible\":{any},\"learned\":{any},\"known_preparation_ms\":{?d},\"pricing_scope\":\"empirical_lookup_omitted_cost_not_same_state_total_action\",\"work_scope\":\"policy_history_materialization_existing_settle_not_pure_stash\",\"flight_storage_bytes\":{d}}}\n", .{
+                    evidence.round.?.anchor_pos, evidence.round.?.prefix_hash, measurement.class, chain.m + 1, @tagName(measurement.scope),
+                    measurement.stash_present, measurement.stash_rows, measurement.query_ns,
+                    measurement.postQueryNs(), if (chain.lookup_prepared_before_round) chain.lookup_preverify_ns else 0, sample_ns,
+                    chain.lookup_prepared_before_round,
+                    if (measurement.shadow_requery) "unknown_shadow_requery"
+                    else if (measurement.postQueryNs() == null or !measurement.preverify_complete) "unknown_query_or_handoff_boundary"
+                    else if (measurement.scope != (if (chain.lookup_prepared_before_round) speculation.LookupPreparationScope.carried else .cold)) "unknown_scope_mismatch"
+                    else if (!measurement.eligible or !solo or measurement.rows != chain.m + 1) "ineligible_execution"
+                    else if (chain.lookup_prepared_before_round) "query_to_handoff_plus_round_resume_to_preverify"
+                    else "query_to_preverify",
+                    sample_ns != null, learned, known_ms, @sizeOf(@FieldType(MtpPreDraft, "lookup_preparation")),
+                });
+            }
+        }
+        if (evidence.round) |r| self.recordLookupReceipt(self.xfm.allocator, self.lookupChainOutcome(r, verified_accepted, accepted + 1, ms));
+        if (lookupTraceEnabled()) log.info("[lookup] observed class={d} drafts={d} accepted={d} ms={d:.3}\n", .{
+            evidence.class, chain.m, accepted, ms,
+        });
+    }
+
+    const MtpCycleShape = enum { ineligible, cold, pipelined };
+
+    /// Inter-end timing includes outgoing preparation, not the incoming chain.
+    /// Only homogeneous carried/native successors or entirely cold rounds can
+    /// replace a depth's inherited price. Discarded lazy work is never free.
+    fn mtpExactCycleShape(self: *const Generator, chain: *const MtpPreDraft, lazy_built: bool) MtpCycleShape {
+        if (chain.lookup) return .ineligible;
+        if (self.mtp_pre_draft) |*prepared| {
+            if (!chain.lookup_prepared_before_round or prepared.lookup or prepared.m != chain.m or
+                prepared.n_drafted != prepared.m or prepared.plan.m_lo != prepared.plan.m_hi) return .ineligible;
+            return .pipelined;
+        }
+        return if (!chain.lookup_prepared_before_round and !lazy_built) .cold else .ineligible;
+    }
+
+    /// Recovery and contention invalidate latency, not a verified native yield.
+    /// No timing observation is fabricated when this outcome is recorded.
+    fn observeMtpNativeYield(self: *Generator, class: i64, depth: u32, tokens: u32) void {
+        if (!self.mtp_serial_accept or self.done or self.completion_tokens >= self.max_tokens or
+            self.mtp_request_depth_class != class) return;
+        const lr = if (self.lookup_tiers) |*value| value else return;
+        lr.observeNativeYield(depth, tokens);
+        if (lookupReceiptsEnabled() and depth > 0 and depth < lr.native_yield.len)
+            log.info("[lookup-native-yield] {{\"family\":\"mtp\",\"class\":{d},\"depth\":{d},\"tokens\":{d},\"samples\":{d},\"expected_tokens\":{d:.6},\"scope\":\"uncensored_native_outcomes_not_timing\"}}\n", .{
+                class, depth, tokens, lr.native_yield_samples[depth], lr.native_yield[depth],
+            });
+    }
+
     /// `m` drafts, `accepted` kept. A round's cost is the wall time since the
     /// previous round ended: everything a round adds to the request, streaming included.
-    fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
+    fn mtpExactObserve(self: *Generator, m: u32, accepted: u32, shape: MtpCycleShape) void {
+        const query_ns = if (self.lookup_tiers) |*lr| blk: {
+            const ns = lr.native_query_ns;
+            lr.native_query_ns = 0;
+            break :blk ns;
+        } else 0;
         if (m == 0 or m >= self.xfm.mtp_depth_ms.len) return;
-        if (self.mtp_cycle_watch) |*w| {
-            const cycle_ms = @as(f32, @floatFromInt(w.read())) / std.time.ns_per_ms;
-            const ms = &self.xfm.mtp_depth_ms[m];
-            // A stall (streaming, another request) is not this depth's cost.
-            if (ms.* == 0) ms.* = cycle_ms else if (cycle_ms < 2 * ms.*) ms.* += 0.2 * (cycle_ms - ms.*);
-            w.reset();
-        } else self.mtp_cycle_watch = io_util.Stopwatch.init(self.timer.io);
+        if (self.spec_cost_solo) {
+            if (self.mtp_cycle_watch) |*w| {
+                const cycle_ms = @as(f32, @floatFromInt(w.read())) / std.time.ns_per_ms;
+                const ms = &self.xfm.mtp_depth_ms[m];
+                // A stall (streaming, another request) is not this depth's cost.
+                if (cycle_ms > 0 and std.math.isFinite(cycle_ms) and (ms.* == 0 or cycle_ms < 2 * ms.*)) {
+                    if (ms.* == 0) ms.* = cycle_ms else ms.* += 0.2 * (cycle_ms - ms.*);
+                    if (m < self.mtp_request_depth_ms.len and shape != .ineligible and
+                        self.mtp_cycle_shape == shape and self.mtp_cycle_depth == m) {
+                        const fresh = &self.mtp_request_depth_ms[m];
+                        if (fresh.* == 0) fresh.* = cycle_ms else fresh.* += 0.2 * (cycle_ms - fresh.*);
+                        if (self.lookup_tiers) |*lr| {
+                            // A terminal round may publish fewer than accepted+1.
+                            // Context changes during successor preparation invalidate
+                            // the interval before it can reach this branch.
+                            if (!self.done and self.completion_tokens < self.max_tokens and
+                                self.mtp_request_depth_class == lookupCtxClass(self.prompt_ids_owned.len + self.generated_ids.items.len + 1))
+                                lr.observeNativeCycle(m, cycle_ms, query_ns, accepted + 1);
+                        }
+                    }
+                }
+                w.reset();
+            } else self.mtp_cycle_watch = io_util.Stopwatch.init(self.timer.io);
+            self.mtp_cycle_depth = m;
+            self.mtp_cycle_shape = shape;
+        } else {
+            // Acceptance remains useful, but a contended interval must neither
+            // seed a depth price nor leak into the next solo observation.
+            self.mtp_cycle_watch = null;
+            self.mtp_cycle_shape = .ineligible;
+        }
+        self.mtpExactAccept(accepted);
+    }
+
+    fn mtpExactAccept(self: *Generator, accepted: u32) void {
         self.mtp_tried += 1;
         self.mtp_kept += @intFromBool(accepted >= 1);
         self.xfm.mtp_depth_acc += 0.02 * (@as(f32, @floatFromInt(@intFromBool(accepted >= 1))) - self.xfm.mtp_depth_acc);
     }
 
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
-        if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
         if (group_planner.enabled() and self.mtp_planner_width != null) return;
         // An interval spanning a speculative round is neither arm's number.
         self.mtp_serial_clock = null;
@@ -11292,6 +13592,11 @@ pub const Generator = struct {
     /// Close one traced dflash round; emits + resets at the cadence.
     fn dflashTraceRoundEnd(self: *Generator, accepted: u32) void {
         if (!self.dflash_trace.endRound(accepted)) return;
+        self.flushDflashTrace();
+    }
+
+    fn flushDflashTrace(self: *Generator) void {
+        if (self.dflash_trace.rounds == 0) return;
         const t = &self.dflash_trace;
         log.info(
             "  [dflash-trace] rounds={d} avg_ms assist={d:.2} head={d:.2} verify={d:.2} accept={d:.2} append={d:.2} gap={d:.2} total={d:.2} | acc_avg={d:.2}\n",
@@ -12312,7 +14617,9 @@ pub const Generator = struct {
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         if (self.mtp_serial_accept) {
-            const d = depth_bounds.clampWidth(self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2)), depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
+            const cap = @min(@max(@as(u32, 1), self.mtp_depth), 2);
+            const floor = depth_bounds.floorFor(depth_bounds.active, self.mtp_depth);
+            const d = depth_bounds.clampWidth(self.mtpExactDepth(cap), floor, self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
@@ -12545,6 +14852,11 @@ pub const Generator = struct {
     fn mtpTraceRoundEnd(self: *Generator, m: u32, accepted: u32, m_lo: u32) void {
         if (!mtpTraceEnabled()) return;
         if (!self.mtp_trace.endRound(m, accepted, m > m_lo)) return;
+        self.flushMtpTrace();
+    }
+
+    fn flushMtpTrace(self: *Generator) void {
+        if (self.mtp_trace.rounds == 0) return;
         const t = &self.mtp_trace;
         var acc_buf: [64]u8 = undefined;
         log.info(
@@ -24230,4 +26542,1379 @@ test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of ove
     try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
     prefill_chunk_override = 5_000_000_000;
     try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
+}
+
+test "lookup receipt prefix identity incrementally includes emitted ids and anchor" {
+    const prompt = [_]u32{ 1, 2, 3 };
+    var gen: Generator = undefined;
+    gen.prompt_ids_owned = @constCast(&prompt);
+    gen.generated_ids = .empty;
+    defer gen.generated_ids.deinit(testing.allocator);
+    gen.lookup_prefix_hash = std.hash.Wyhash.init(0);
+    gen.lookup_prefix_count = 0;
+    gen.lookup_prefix_primed = false;
+    const first = gen.lookupPrefix(4);
+    try testing.expectEqual(first, gen.lookupPrefix(4));
+    try gen.generated_ids.appendSlice(testing.allocator, &.{ 4, 5 });
+    const next = gen.lookupPrefix(6);
+    const whole = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    try testing.expectEqual(std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&whole)), next);
+    try testing.expect(first != next);
+}
+
+test "lookup candidate identity includes ancestry and distinct selected tier origins" {
+    var tree = speculation.Tree.chain(0, &.{ 1, 2 }, 0.8, 0.7);
+    tree.origins[1] = 1;
+    tree.origins[2] = 4;
+    const original = lookupTreeHash(&tree);
+    tree.scores[1] = 0.1;
+    try testing.expectEqual(original, lookupTreeHash(&tree));
+    tree.origins[2] = 2;
+    try testing.expect(original != lookupTreeHash(&tree));
+    tree.origins[2] = 4;
+    tree.parents[2] = 0;
+    try testing.expect(original != lookupTreeHash(&tree));
+}
+
+test "lookup publication excludes an internally committed cancelled tail from durable history" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const prompt = [_]u32{ 1, 2 };
+    const published = [_]u32{ 10, 11, 12 };
+    var gen: Generator = undefined;
+    gen.prompt_ids_owned = @constCast(&prompt);
+    gen.generated_ids = .empty;
+    defer gen.generated_ids.deinit(a);
+    try gen.generated_ids.appendSlice(a, &.{ 10, 11, 12, 13, 14, 15 });
+    gen.published_output = null;
+    gen.published_finish_reason = null;
+    gen.pending_lookup_receipt = null;
+    gen.managePublication();
+    gen.recordLookupReceipt(a, .{
+        .family = "dflash", .kind = "tree", .class = 0, .anchor_pos = 4,
+        .prefix_hash = 1, .prompt_hash = 2, .candidate_hash = 3,
+        .candidate_rows = 4, .legal_rows = 4, .requested_rows = 0,
+        .selection = "adaptive", .rows = 4, .admissible = true,
+        .accepted = 3, .committed = 4,
+    });
+    gen.setPublishedOutput(&published, "cancelled");
+    const receipt = gen.takePublishedLookupReceipt(published.len).?;
+    try testing.expectEqual(@as(usize, 1), receipt.committed);
+    try testing.expectEqualStrings("published", receipt.commit_scope);
+    try testing.expect(gen.takePublishedLookupReceipt(published.len) == null);
+    try testing.expectEqualStrings("cancelled", gen.outputFinishReason());
+    {
+        var store = try token_history.PersistentStore.open(io, a, path, @splat(1));
+        defer store.deinit();
+        try gen.persistLookupTurn(a, &store);
+    }
+    var reopened = try token_history.PersistentStore.openReadOnly(io, a, path, @splat(1));
+    defer reopened.deinit();
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 10, 11, 12, token_history.separator }, reopened.tokens);
+}
+
+test "lookup MTP preparation cold closes P and opens V at one timestamp" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *i96 = @ptrCast(@alignCast(userdata.?));
+            const value = ns.*;
+            ns.* += std.time.ns_per_ms;
+            return .{ .nanoseconds = value };
+        }
+    };
+    var now_ns: i96 = 10 * std.time.ns_per_ms;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    const round_watch: io_util.Stopwatch = .{ .io = io, .started_at = .{ .nanoseconds = 0 } };
+    var measurement: Generator.MtpLookupPreparation = .{
+        .watch = .{ .io = io, .started_at = .{ .nanoseconds = 2 * std.time.ns_per_ms } },
+        .scope = .cold, .class = 0, .pricing = true, .eligible = true, .rows = 3,
+        .query_ns = std.time.ns_per_ms, .stash_rows = 0, .stash_present = false,
+    };
+    const boundary = std.Io.Timestamp.now(io, .boot);
+    const before = measurement.preverify(round_watch, boundary, false).?;
+    try testing.expectEqual(@as(i96, 11 * std.time.ns_per_ms), now_ns);
+    try testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), before);
+    const p = measurement.sampleNs(false, before, 3, true).?;
+    try testing.expectEqual(@as(u64, 7 * std.time.ns_per_ms), p);
+    const settled_ns: u64 = 20 * std.time.ns_per_ms;
+    const v = settled_ns - before;
+    // Query ended at t=3; P + V covers [3,20] with neither overlap nor gap.
+    try testing.expectEqual(@as(u64, 17 * std.time.ns_per_ms), p + v);
+}
+
+test "lookup MTP preparation carried excludes scheduler gap and requires intended scope" {
+    const watch: io_util.Stopwatch = .{ .io = testing.io, .started_at = .{ .nanoseconds = 0 } };
+    var measurement: Generator.MtpLookupPreparation = .{
+        .watch = watch, .scope = .carried, .class = 2048, .pricing = true, .eligible = true, .rows = 3,
+        .query_ns = 2 * std.time.ns_per_ms, .ready_ns = 5 * std.time.ns_per_ms,
+        .stash_rows = 2, .stash_present = true,
+    };
+    const consumer: io_util.Stopwatch = .{ .io = testing.io, .started_at = .{ .nanoseconds = 100 * std.time.ns_per_ms } };
+    const resumed = measurement.preverify(consumer, .{ .nanoseconds = 107 * std.time.ns_per_ms }, true).?;
+    try testing.expectEqual(@as(?u64, 5 * std.time.ns_per_ms), measurement.ready_ns);
+    try testing.expectEqual(@as(?u64, 10 * std.time.ns_per_ms), measurement.sampleNs(true, resumed, 3, true));
+    try testing.expect(measurement.sampleNs(false, resumed, 3, true) == null);
+    measurement.scope = .cold;
+    try testing.expect(measurement.sampleNs(true, resumed, 3, true) == null);
+}
+
+test "lookup MTP preparation rejects missing shadow contended grouped and clipped flights" {
+    const valid: Generator.MtpLookupPreparation = .{
+        .watch = .{ .io = testing.io, .started_at = .{ .nanoseconds = 0 } },
+        .scope = .cold, .class = 0, .pricing = true, .eligible = true, .rows = 3,
+        .query_ns = 2, .ready_ns = 5, .preverify_complete = true,
+        .stash_rows = 0, .stash_present = false,
+    };
+    try testing.expectEqual(@as(?u64, 3), valid.sampleNs(false, 0, 3, true));
+    try testing.expect(valid.sampleNs(false, 0, 3, false) == null);
+    try testing.expect(valid.sampleNs(false, 0, 2, true) == null);
+    for (0..7) |case| {
+        var invalid = valid;
+        switch (case) {
+            0 => invalid.query_ns = null,
+            1 => invalid.ready_ns = null,
+            2 => invalid.ready_ns = 1,
+            3 => invalid.shadow_requery = true,
+            4 => invalid.eligible = false,
+            5 => invalid.preverify_complete = false,
+            6 => invalid.pricing = false,
+            else => unreachable,
+        }
+        try testing.expect(invalid.sampleNs(false, 0, 3, true) == null);
+    }
+    var zero = valid;
+    zero.ready_ns = zero.query_ns;
+    try testing.expect(zero.sampleNs(false, 0, 3, true) == null);
+    var overflow = valid;
+    overflow.scope = .carried;
+    try testing.expect(overflow.sampleNs(true, std.math.maxInt(u64), 3, true) == null);
+}
+
+test "lookup MTP preparation learns once per actual flight without full receipts" {
+    const saved = lookup_receipts_cache;
+    defer lookup_receipts_cache = saved;
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var gen: Generator = undefined;
+    gen.mtp_serial_accept = true;
+    gen.spec_cost_solo = true;
+    gen.mtp_batch_head = false;
+    gen.mtp_group_cap = 0;
+    gen.mtp_planner_owned = false;
+    const initial: Generator.MtpLookupPreparation = .{
+        .watch = .{ .io = testing.io, .started_at = .{ .nanoseconds = 0 } },
+        .scope = .carried, .class = 2048, .pricing = true, .eligible = true, .rows = 3,
+        .query_ns = std.time.ns_per_ms, .ready_ns = 3 * std.time.ns_per_ms,
+        .preverify_complete = true, .stash_rows = 2, .stash_present = true,
+    };
+    for ([_]LookupReceiptMode{ .off, .commit }) |mode| {
+        lookup_receipts_cache = mode;
+        try testing.expect(gen.lookupMtpPreparationEnabled());
+        try testing.expect(!lookupReceiptsEnabled());
+        try testing.expectEqual(@as(?speculation.LookupPreparationScope, .cold), gen.lookupMtpPreparationScope(false, .cold));
+        try testing.expectEqual(@as(?speculation.LookupPreparationScope, .carried), gen.lookupMtpPreparationScope(false, .carried));
+        try testing.expect(gen.lookupMtpPreparationScope(true, .carried) == null);
+        var invalid = initial;
+        invalid.shadow_requery = true;
+        try testing.expect(!invalid.observe(&cut, true, std.time.ns_per_ms, 3, true));
+        var flight = initial;
+        const learned = flight.observe(&cut, true, std.time.ns_per_ms, 3, gen.lookupMtpPreparationSolo());
+        try testing.expectEqual(mode == .commit, learned);
+        try testing.expect(!flight.observe(&cut, true, std.time.ns_per_ms, 3, true));
+        if (mode == .off) try testing.expect(cut.knownMtpPreparation(3, 2048, .carried) == null);
+    }
+    try testing.expectEqual(@as(?f32, 3), cut.knownMtpPreparation(3, 2048, .carried));
+    try testing.expect(cut.knownMtpPreparation(3, 2048, .cold) == null);
+    try testing.expect(cut.knownMtpPreparation(3, 0, .carried) == null);
+    gen.mtp_group_cap = 2;
+    try testing.expect(!gen.lookupMtpPreparationSolo());
+    gen.mtp_group_cap = 0;
+    gen.spec_cost_solo = false;
+    try testing.expect(!gen.lookupMtpPreparationSolo());
+    gen.mtp_serial_accept = false;
+    try testing.expect(!gen.lookupMtpPreparationEnabled());
+    try testing.expect(gen.lookupMtpPreparationScope(false, .cold) == null);
+    lookup_receipts_cache = .full;
+    try testing.expect(gen.lookupMtpPreparationEnabled());
+    try testing.expect(gen.lookupMtpPreparationScope(false, .carried) == null);
+}
+
+test "lookup carried preparation is charged once and outcome excludes later receipt work" {
+    const prepared = lookupRoundMs(3_000_000, 2_000_000, true);
+    const live = lookupRoundMs(5_000_000, 2_000_000, false);
+    try testing.expectEqual(prepared, live);
+    var gen: Generator = undefined;
+    gen.spec_cost_solo = true;
+    const snapshot = LookupReceipt{
+        .family = "mtp", .kind = "chain", .class = 0, .anchor_pos = 3,
+        .prefix_hash = 1, .prompt_hash = 2, .candidate_hash = 3,
+        .candidate_rows = 3, .legal_rows = 3, .requested_rows = 0,
+        .selection = "adaptive", .rows = 3, .admissible = true,
+        .draft_ms = 2, .preverify_ms = 2,
+    };
+    const outcome = gen.lookupChainOutcome(snapshot, 2, 3, prepared);
+    try testing.expectEqual(@as(f32, 5), outcome.round_ms.?);
+    try testing.expectEqual(@as(f32, 3), outcome.verify_commit_ms.?);
+    try testing.expectEqual(@as(f32, 0), outcome.other_ms.?);
+    try testing.expect(outcome.priced);
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    cut.prices.observe(3, outcome.verify_commit_ms.?, .chain, 0, .generic);
+    try testing.expectEqual(outcome.verify_commit_ms.?, cut.prices.price(3, .chain, 0, .generic));
+}
+
+test "lookup suffix query preserves configured corpus order across history boundaries" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+    defer lr.deinit();
+    const prompt = [_]u32{ 90, 91, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const generated = [_]u32{ 10, 11 };
+    try testing.expectEqual(@as(usize, 64), lr.drafter.maxQueryOrder());
+    try testing.expectEqualSlices(u32, &.{ 90, 91, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, try lr.tailContext(&prompt, &generated, 12));
+    var corpus = try token_history.Corpus.build(testing.allocator, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 77, token_history.separator }, 16);
+    defer corpus.deinit();
+    lr.drafter.corpus = &corpus;
+    const context = try lr.tailContext(&prompt, &generated, 12);
+    const look = try lr.drafter.look(context, 4, &lr.look);
+    try testing.expectEqual(@as(u32, 12), look.order);
+    try testing.expectEqualSlices(u32, &.{77}, look.tokens);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 12 }, try lr.tailContext(&.{10}, &.{11}, 12));
+}
+
+test "lookup candidate ablation skips indexing and preserves neural proposals" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.failing_allocator), .cut = &cut, .candidates_enabled = false };
+    defer lr.deinit();
+    var prepared: PreparedLookupTree = undefined;
+    try lr.prepareTree(&.{ 1, 2, 3, 4 }, &.{ 1, 2 }, 3, 16, io_util.Stopwatch.init(testing.io), &prepared);
+    try testing.expectEqualSlices(u32, &.{3}, prepared.tree.tokens[0..prepared.tree.len]);
+    try testing.expectEqual(@as(usize, 0), lr.gen);
+    var neural = speculation.Tree.chain(3, &.{ 7, 8 }, 0.8, 0.8);
+    prepared.mergeInto(&neural);
+    try testing.expectEqualSlices(u32, &.{ 3, 7, 8 }, neural.tokens[0..neural.len]);
+}
+
+test "lookup preparation draft-depth budget retains final token and sibling breadth" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+    defer lr.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 77, 1, 2 };
+    try lr.drafter.prime(&prompt);
+    var prepared: PreparedLookupTree = undefined;
+    for ([_]u32{ 0, 1, 15 }) |draft_depth| {
+        try lr.prepareTree(&prompt, &.{}, 3, draft_depth, io_util.Stopwatch.init(testing.io), &prepared);
+        try testing.expectEqual(@as(usize, draft_depth + 1), prepared.tree.len);
+        for (prepared.tree.tokens[0..prepared.tree.len], 0..) |token, i|
+            try testing.expectEqual(@as(u32, @intCast(i + 3)), token);
+    }
+    var branching = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+    defer branching.deinit();
+    const alternatives = [_]u32{ 1, 2, 3, 4, 77, 1, 2, 3, 5, 88, 1, 2 };
+    try branching.drafter.prime(&alternatives);
+    // Two output tokens permit one draft depth, but multiple alternatives.
+    try branching.prepareTree(&alternatives, &.{}, 3, 1, io_util.Stopwatch.init(testing.io), &prepared);
+    try testing.expectEqual(@as(usize, 3), prepared.tree.len);
+    try testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, prepared.tree.parents[0..prepared.tree.len]);
+    try testing.expect(std.mem.indexOfScalar(u32, prepared.tree.tokens[1..prepared.tree.len], 4) != null);
+    try testing.expect(std.mem.indexOfScalar(u32, prepared.tree.tokens[1..prepared.tree.len], 5) != null);
+}
+
+test "lookup tree producer separates entry and continuation probability before merging" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+    defer lr.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 77, 1, 2 };
+    try lr.drafter.prime(&prompt);
+    var prepared: PreparedLookupTree = undefined;
+    try lr.prepareTree(&prompt, &.{}, 3, 3, io_util.Stopwatch.init(testing.io), &prepared);
+    for (0..40) |_| {
+        cut.cal.learn(.look, prepared.tree.look_confidence[1], prepared.order, false);
+        cut.cal.learn(.look_continuation, prepared.tree.look_confidence[2], prepared.order, true);
+    }
+    try lr.prepareTree(&prompt, &.{}, 3, 3, io_util.Stopwatch.init(testing.io), &prepared);
+    try testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6 }, prepared.tree.tokens[0..prepared.tree.len]);
+    const entry = prepared.tree.scores[1];
+    try testing.expect(entry > 0 and entry < 1);
+    try testing.expect(prepared.tree.scores[2] <= entry);
+    try testing.expect(prepared.tree.scores[2] > entry * entry);
+    var merged = speculation.Tree.init(3);
+    _ = merged.add(0, 4, 0.8, .draft, 0.8).?;
+    prepared.mergeInto(&merged);
+    try testing.expectEqual(speculation.NodeSource.both, merged.sources[1]);
+    try testing.expect(merged.scores[2] <= merged.scores[1]);
+    try testing.expectEqual(prepared.tree.look_confidence[2], merged.look_confidence[2]);
+    try testing.expectEqual(prepared.order, merged.look_order[2]);
+}
+
+test "lookup clean native bootstrap is opt-in bounded and stops after a warm pair" {
+    const previous_override = lookup_tiers_override;
+    defer lookup_tiers_override = previous_override;
+    lookup_tiers_override = true;
+    const previous_selection = lookup_selection_cache;
+    defer lookup_selection_cache = previous_selection;
+    lookup_selection_cache = .{};
+    var policy = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer policy.deinit();
+    var gen: Generator = undefined;
+    gen.lookup_tiers = .{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &policy };
+    defer gen.lookup_tiers.?.deinit();
+    gen.spec_cost_solo = true;
+    gen.mtp_batch_head = false;
+    gen.mtp_group_cap = 0;
+    gen.mtp_planner_owned = false;
+    gen.spec_disabled_runtime = false;
+    gen.mtp_serial_left = 0;
+    gen.mtp_planner_pending = false;
+    gen.prompt_ids_owned = &.{};
+    gen.generated_ids = .empty;
+    gen.lookup_mtp_probe_class = 0;
+    gen.lookup_mtp_probe_attempts = 0;
+    try testing.expect(gen.lookupMtpProbePending());
+    for ([_]LookupSelection{ .{ .name = "fixed", .rows = 1 }, .{ .name = "max", .rows = std.math.maxInt(u32) }, .{ .name = "cut" } }) |selection| {
+        lookup_selection_cache = selection;
+        try testing.expect(!gen.lookupMtpProbePending());
+    }
+    lookup_selection_cache = .{};
+    gen.lookup_mtp_probe_attempts = 2;
+    try testing.expect(!gen.lookupMtpProbePending());
+    gen.lookup_mtp_probe_attempts = 1;
+    try testing.expect(!policy.observeSpecRemainingProbe(12, 3, 0, 1));
+    try testing.expect(gen.lookupMtpProbePending());
+    try testing.expect(policy.observeSpecRemainingProbe(9, 3, 0, 1));
+    try testing.expect(!gen.lookupMtpProbePending());
+    lookup_tiers_override = false;
+    try testing.expect(!gen.lookupMtpProbePending());
+}
+
+test "lookup exact MTP prices exclude lookup, prefill and contended intervals" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    var now_ns: i96 = 0;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    var xfm: Transformer = undefined;
+    xfm.mtp_depth_ms = @splat(0);
+    xfm.mtp_depth_acc = 0.5;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.mtp_cycle_watch = null;
+    gen.mtp_request_depth_ms = @splat(0);
+    gen.lookup_tiers = null;
+    gen.mtp_regime_clock = null;
+    gen.mtp_tried = 0;
+    gen.mtp_kept = 0;
+    gen.spec_cost_solo = true;
+
+    gen.mtpExactObserve(1, 1, .cold);
+    now_ns = 100 * std.time.ns_per_ms;
+    gen.mtpRoundUntimed(true, 14, 14); // Lookup duration and acceptance are not native evidence.
+    now_ns = 1500 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 0, .cold);
+    try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[1]);
+    now_ns = 1540 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
+
+    gen.spec_cost_solo = false;
+    now_ns = 2540 * std.time.ns_per_ms;
+    const tried_before = gen.mtp_tried;
+    const kept_before = gen.mtp_kept;
+    gen.mtpExactObserve(2, 1, .cold);
+    try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
+    try testing.expectEqual(tried_before + 1, gen.mtp_tried);
+    try testing.expectEqual(kept_before + 1, gen.mtp_kept);
+    gen.spec_cost_solo = true;
+    now_ns = 3540 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .cold);
+    try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
+    now_ns = 3600 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 60), xfm.mtp_depth_ms[2], 1e-5);
+
+    now_ns = 4000 * std.time.ns_per_ms;
+    gen.invalidateRoundClock(); // an intervening prefill is not a head cycle
+    now_ns = 5100 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
+    now_ns = 5140 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[1], 1e-5);
+}
+
+test "lookup native recovery retains acceptance and rearms only clean solo pricing" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    var now_ns: i96 = 0;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    var xfm: Transformer = undefined;
+    xfm.mtp_depth_ms = @splat(0);
+    xfm.mtp_depth_acc = 0.5;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.mtp_cycle_watch = io_util.Stopwatch.init(io);
+    gen.mtp_request_depth_ms = @splat(0);
+    gen.lookup_tiers = null;
+    gen.mtp_regime_clock = null;
+    gen.mtp_serial_accept = true;
+    gen.mtp_tried = 0;
+    gen.mtp_kept = 0;
+    gen.spec_cost_solo = true;
+
+    now_ns = 1000 * std.time.ns_per_ms;
+    gen.mtpRoundUntimed(true, 14, 14);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_tried);
+    try testing.expectEqual(@as(f32, 0.5), xfm.mtp_depth_acc);
+    try testing.expect(gen.mtp_cycle_watch == null);
+    now_ns = 2000 * std.time.ns_per_ms;
+    gen.mtpRoundUntimed(false, 2, 2);
+    try testing.expectEqual(@as(u32, 1), gen.mtp_tried);
+    try testing.expectEqual(@as(u32, 1), gen.mtp_kept);
+    try testing.expectApproxEqAbs(@as(f32, 0.51), xfm.mtp_depth_acc, 1e-6);
+    try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[2]);
+    now_ns = 2040 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 40), xfm.mtp_depth_ms[2], 1e-5);
+    try testing.expectEqual(@as(u32, 2), gen.mtp_tried);
+
+    gen.spec_cost_solo = false;
+    now_ns = 3000 * std.time.ns_per_ms;
+    gen.mtpRoundUntimed(false, 1, 0);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_tried);
+    try testing.expectEqual(@as(u32, 2), gen.mtp_kept);
+    try testing.expect(gen.mtp_cycle_watch == null);
+    gen.spec_cost_solo = true;
+    now_ns = 4000 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .cold);
+    try testing.expectEqual(@as(f32, 0), xfm.mtp_depth_ms[1]);
+    now_ns = 4050 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .cold);
+    try testing.expectApproxEqAbs(@as(f32, 50), xfm.mtp_depth_ms[1], 1e-5);
+    gen.mtpRoundUntimed(true, 14, 14);
+    try testing.expect(gen.mtp_cycle_watch == null);
+}
+
+
+test "MTP lookup chain receipts and delayed learning retain selected per-edge suffix evidence" {
+    const previous_receipts = lookup_receipts_cache;
+    defer lookup_receipts_cache = previous_receipts;
+    const previous_selection = lookup_selection_cache;
+    defer lookup_selection_cache = previous_selection;
+    lookup_selection_cache = .{ .name = "fixed", .rows = 3 };
+    for ([_]LookupReceiptMode{ .off, .commit, .full }) |receipts| {
+        lookup_receipts_cache = receipts;
+        var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+        defer cut.deinit();
+        var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+        defer lr.deinit();
+        const nodes = [_]token_history.VoteNode{
+            .{ .token = 31, .parent = null, .depth = 1, .conditional_confidence = 1, .origins = 4 },
+            .{ .token = 32, .parent = 0, .depth = 2, .conditional_confidence = 0.25, .origins = 2 },
+            .{ .token = 33, .parent = 1, .depth = 3, .conditional_confidence = 0.8, .origins = 1 },
+        };
+        const look: token_history.Look = .{ .tokens = &.{ 31, 32, 33 }, .nodes = &nodes, .order = 2, .confidence = 1, .source = .local, .nodes_truncated = false };
+        var candidate = lookup_adapter.lookupChain(3, look.tokens, look.nodes, look.order, &cut.cal, 4);
+        const choice = try cut.chooseLookPreparedControlled(&candidate, 0, 0, &lr.pick, 3, .unknown, null);
+        const prompt = [_]u32{ 1, 2 };
+        var gen: Generator = undefined;
+        gen.prompt_ids_owned = @constCast(&prompt);
+        gen.generated_ids = .empty;
+        gen.lookup_prefix_hash = std.hash.Wyhash.init(0);
+        gen.lookup_prefix_count = 0;
+        gen.lookup_prefix_primed = false;
+        gen.lookupChainReceipt("mtp", &lr, look, &candidate, choice);
+        try testing.expectEqual(@as(usize, 3), lr.chain.len);
+        try testing.expectApproxEqAbs(@as(f32, 1.25), choice.expected, 0.00001);
+        if (receipts == .full) {
+            try testing.expectApproxEqAbs(@as(f32, 2.25), lr.receipt.?.predicted_tokens.?, 0.00001);
+            const hash = lr.receipt.?.candidate_probability_hash;
+            candidate.look_order[2] = 32;
+            const changed = gen.lookupReceipt("mtp", "chain", 0, 3, &candidate, &lr.chain, 4);
+            try testing.expect(hash != changed.candidate_probability_hash);
+        } else try testing.expect(lr.receipt == null);
+        var flight: Generator.MtpPreDraft = undefined;
+        flight.lookup_receipt = .{ .class = lr.cls, .tree = lr.chain, .round = lr.receipt };
+        flight.m = 1;
+        cut.prices.observe(2, 12, .chain, lr.cls, .generic);
+        if (flight.lookup_receipt.?.round) |*r| {
+            r.limitChain(&flight.lookup_receipt.?.tree, &cut, flight.m, 2);
+            try testing.expectEqual(@as(usize, 2), r.rows);
+            try testing.expectEqual(@as(usize, 2), r.legal_rows);
+            try testing.expectEqual(@as(f32, 12), r.predicted_verify_ms.?);
+            try testing.expectEqual(@as(f32, 2), r.predicted_tokens.?);
+            try testing.expectEqual(@as(usize, 1), r.selected_persistent);
+            try testing.expectEqual(@as(usize, 0), r.selected_corpus);
+            try testing.expectEqual(@as(usize, 0), r.selected_local);
+            try testing.expectEqual(@as(usize, 0), r.selected_neural);
+            try testing.expect(!r.admissible);
+            try testing.expectEqual(@as(u32, 3), r.requested_rows);
+            try testing.expectEqual(lr.receipt.?.candidate_rows, r.candidate_rows);
+            try testing.expectEqual(lr.receipt.?.candidate_hash, r.candidate_hash);
+            try testing.expectEqual(lr.receipt.?.candidate_probability_hash, r.candidate_probability_hash);
+        }
+        // A successor query may replace scratch before this verification finishes.
+        lr.chain.look_order = @splat(32);
+        lr.chain.look_confidence = @splat(1);
+        // All executed drafts accepted: the next stored edge was never verified.
+        cut.observeChainAccepted(&flight.lookup_receipt.?.tree, flight.m, flight.m);
+        try testing.expectEqual(@as(f32, 0), cut.cal.samples(.look_continuation));
+        try testing.expectEqual(@as(f32, 0.25), cut.cal.q(.look_continuation, 0.25, 2));
+        flight.m = 2;
+        cut.observeChainAccepted(&flight.lookup_receipt.?.tree, flight.m, 1);
+        try testing.expectApproxEqAbs(@as(f32, 0.2), cut.cal.q(.look_continuation, 0.25, 2), 0.00001);
+        try testing.expectEqual(@as(f32, 1), cut.cal.q(.look_continuation, 1, 32));
+        try testing.expectEqual(@as(f32, 1), cut.cal.samples(.look_continuation));
+    }
+}
+
+test "DFlash routing preserves full lookup evidence when execution keeps only root or prefix" {
+    for ([_]bool{ false, true }) |lookup_route| {
+        var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+        defer cut.deinit();
+        var lr = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &cut };
+        defer lr.deinit();
+        const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 77, 1, 2 };
+        try lr.drafter.prime(&prompt);
+        var prepared: PreparedLookupTree = undefined;
+        try lr.prepareTree(&prompt, &.{}, 3, 3, io_util.Stopwatch.init(testing.io), &prepared);
+        const original = try cf.fingerprintOffer(&prepared.tree);
+        cut.observePlain(if (lookup_route) 10 else 1, 0);
+        _ = cut.observeSpecRemainingProbe(20, 1, 0, 0);
+        for (2..5) |rows| cut.prices.observe(@intCast(rows), if (lookup_route and rows == 2) 1 else 100, .tree, 0, .generic);
+        prepared.routeBeforeAssistant(&cut, 0, 0, 4, .generic, prompt.len);
+        try testing.expect(prepared.route.?.decision.skip);
+        try testing.expectEqual(@as(usize, if (lookup_route) 2 else 1), prepared.execution.len);
+        try testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6 }, prepared.tree.tokens[0..prepared.tree.len]);
+        try testing.expectEqualDeep(original, try cf.fingerprintOffer(&prepared.tree));
+        for (prepared.tree.look_order[1..prepared.tree.len]) |order| try testing.expectEqual(prepared.order, order);
+        // Reusing drafter scratch cannot change the round-owned, anchor-excluded offer.
+        _ = try lr.drafter.look(&.{77}, 2, &lr.look);
+        try testing.expectEqualDeep(original, try cf.fingerprintOffer(&prepared.tree));
+        var gen: Generator = undefined;
+        gen.prompt_ids_owned = @constCast(&prompt);
+        gen.generated_ids = .empty;
+        gen.lookup_prefix_hash = std.hash.Wyhash.init(0);
+        gen.lookup_prefix_count = 0;
+        gen.lookup_prefix_primed = false;
+        const receipt = gen.lookupReceipt("dflash", "tree", 0, 3, &prepared.tree, &prepared.execution, 4);
+        try testing.expectEqual(@as(usize, 4), receipt.candidate_rows);
+        try testing.expectEqual(@as(usize, if (lookup_route) 1 else 0), receipt.selected_local);
+        try testing.expectEqual(@as(usize, 0), receipt.selected_neural);
+        const reached: []const u32 = if (lookup_route) &.{ 4, 99 } else &.{99};
+        cut.observeLookupTree(&prepared.tree, reached, null);
+        try testing.expectEqual(@as(f32, 1), cut.cal.samples(.look));
+        try testing.expectEqual(@as(f32, if (lookup_route) 1 else 0), cut.cal.samples(.look_continuation));
+    }
+}
+
+test "lookup MTP native and carried offers learn only naturally reached decisions once" {
+    for ([_]bool{ false, true }) |lookup_chain| {
+        var policy = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+        defer policy.deinit();
+        var gen: Generator = undefined;
+        gen.lookup_tiers = .{
+            .drafter = token_history.Drafter.init(testing.allocator),
+            .cut = &policy,
+            .trust_active = true,
+        };
+        defer gen.lookup_tiers.?.deinit();
+        const lr = &gen.lookup_tiers.?;
+        var offer = speculation.Tree.chain(10, &.{ 11, 12, 13 }, 1, 1);
+        offer.look_order = @splat(2);
+        lr.offered = offer;
+        lr.offered_position = 7;
+        try testing.expect(lr.takeOffer(10, 8) == null);
+        try testing.expect(lr.offered == null);
+        lr.offered = offer;
+        try testing.expect(lr.takeOffer(20, 7) == null);
+        lr.offered = offer;
+        var flight: Generator.MtpPreDraft = undefined;
+        flight.t1 = 10;
+        flight.m = 1; // A scheduler cap leaves one draft and its naturally read bonus.
+        flight.lookup = lookup_chain;
+        flight.lookup_receipt = if (lookup_chain) .{ .class = 0, .tree = offer } else null;
+        flight.lookup_prepared_before_round = true;
+        flight.lookup_observed = false;
+        flight.lookup_offer = lr.takeOffer(10, 7);
+        try testing.expect(flight.lookup_offer != null);
+        // A planned successor query owns different scratch and cannot replace
+        // the previous native-prepared/carried chain's exact prefix evidence.
+        lr.offered = speculation.Tree.chain(20, &.{ 21, 22 }, 0.3, 0.4);
+        lr.offered_position = 9;
+        gen.observeMtpLookupPath(&flight, &.{});
+        try testing.expect(!flight.lookup_observed);
+        try testing.expectEqual(@as(f32, 0), lr.trust.q(.look, 1));
+        const read_ids = [_]i32{ 11, 12, 99, 99 };
+        gen.observeMtpLookupPath(&flight, read_ids[0..2]);
+        try testing.expect(flight.lookup_observed);
+        try testing.expectEqual(@as(f32, 1), policy.cal.samples(.look));
+        try testing.expectEqual(@as(f32, 1), policy.cal.samples(.look_continuation));
+        try testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), lr.trust.q(.look_continuation, 1), 0.00001);
+        gen.observeMtpLookupPath(&flight, &.{ 11, 99 });
+        try testing.expectEqual(@as(f32, 1), policy.cal.samples(.look_continuation));
+        try testing.expectEqual(@as(u32, 2), flight.lookup_offer.?.look_order[2]);
+        var next_request = LookupRound{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &policy, .trust_active = true };
+        defer next_request.deinit();
+        try testing.expectEqual(@as(f32, 0), next_request.trust.q(.look, 1));
+    }
+}
+
+test "lookup MTP rejection censors speculative native rows after the first mismatch" {
+    var policy = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer policy.deinit();
+    var gen: Generator = undefined;
+    gen.lookup_tiers = .{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &policy, .trust_active = true };
+    defer gen.lookup_tiers.?.deinit();
+    var flight: Generator.MtpPreDraft = undefined;
+    flight.t1 = 10;
+    flight.lookup = false;
+    flight.lookup_observed = false;
+    flight.lookup_offer = speculation.Tree.chain(10, &.{ 11, 12, 13 }, 1, 1);
+    // The native draft 90 was rejected at the root. Later native-row logits
+    // happen to equal lookup tokens but are not on the target's reached path.
+    const ids = [_]i32{ 99, 11, 12, 13 };
+    gen.observeMtpLookupPath(&flight, ids[0..1]);
+    try testing.expectEqual(@as(f32, 1), policy.cal.samples(.look));
+    try testing.expectEqual(@as(f32, 0), policy.cal.samples(.look_continuation));
+    try testing.expectEqual(@as(f32, 0), gen.lookup_tiers.?.trust.q(.look, 1));
+}
+
+test "lookup native target bootstrap excludes carried grouped contended and unmapped heads" {
+    var gen: Generator = undefined;
+    gen.spec_cost_solo = true;
+    gen.mtp_group_cap = 0;
+    gen.sampling = .{ .temperature = 0 };
+    // Deliberately no target or head graph is initialized: each unsupported
+    // route must return before evaluating or consulting those resources.
+    gen.mtp = .{ .qwen4 = undefined };
+    var chain: Generator.MtpPreDraft = undefined;
+    chain.lookup_native_watch = null;
+    chain.lookup = false;
+    chain.lookup_prepared_before_round = false;
+    chain.lookup_target_watch = null;
+    chain.lookup_head_settle_ns = 0;
+    try gen.beginLookupNativeTarget(&chain);
+    chain.lookup_native_watch = io_util.Stopwatch.init(testing.io);
+    chain.lookup = true;
+    try gen.beginLookupNativeTarget(&chain);
+    chain.lookup = false;
+    chain.lookup_prepared_before_round = true;
+    try gen.beginLookupNativeTarget(&chain);
+    chain.lookup_prepared_before_round = false;
+    gen.spec_cost_solo = false;
+    try gen.beginLookupNativeTarget(&chain);
+    gen.spec_cost_solo = true;
+    gen.mtp_group_cap = 1;
+    try gen.beginLookupNativeTarget(&chain);
+    gen.mtp_group_cap = 0;
+    gen.sampling.temperature = 0.5;
+    try gen.beginLookupNativeTarget(&chain);
+    gen.sampling.temperature = 0;
+    try gen.beginLookupNativeTarget(&chain); // Qwen4 state is intentionally unmapped.
+    try testing.expect(chain.lookup_target_watch == null);
+    try testing.expectEqual(@as(u64, 0), chain.lookup_head_settle_ns);
+}
+
+test "tiered PLD miss backoff emits exactly 1 2 4 8 plain tokens including drains" {
+    const Action = Generator.PldBackoff.Action;
+    for ([_]bool{ false, true }) |native_entry| {
+        var backoff = Generator.PldBackoff{};
+        var total: u64 = 0;
+        for ([_]u8{ 1, 2, 4, 8, 8 }) |budget| {
+            if (native_entry) {
+                try testing.expect(backoff.beginNativeMiss(true, true, 0));
+            } else backoff.miss("no_match");
+            try testing.expectEqual(budget, backoff.left);
+            // The miss emission is not a skip; native entry leaves a successor.
+            try testing.expectEqual(total, backoff.plain_tokens);
+            var pending = native_entry;
+            var emitted: u8 = 0;
+            while (backoff.action(pending) != .lookup) {
+                const action = backoff.action(pending);
+                if (emitted == budget - 1)
+                    try testing.expectEqual(if (pending) Action.drain else Action.cold, action);
+                pending = action == .native;
+                backoff.emitted(@tagName(action));
+                emitted += 1;
+            }
+            total += budget;
+            try testing.expectEqual(budget, emitted);
+            try testing.expect(!pending);
+            try testing.expectEqual(total, backoff.plain_tokens);
+            try testing.expectEqual(backoff.plain_tokens, backoff.native_tokens + backoff.drain_tokens + backoff.cold_tokens);
+        }
+        try testing.expectEqual(@as(u64, if (native_entry) 5 else 4), backoff.drain_tokens);
+        try testing.expectEqual(@as(u64, if (native_entry) 0 else 1), backoff.cold_tokens);
+        backoff.success();
+        try testing.expectEqual(@as(u8, 0), backoff.window);
+        try testing.expectEqual(Action.lookup, backoff.action(false));
+        backoff.miss("zero_accepted");
+        try testing.expectEqual(@as(u8, 1), backoff.left);
+    }
+}
+
+test "tiered PLD native miss excludes declines disabled backoff and width controls" {
+    var backoff = Generator.PldBackoff{};
+    try testing.expect(!backoff.beginNativeMiss(false, true, 0));
+    try testing.expect(!backoff.beginNativeMiss(true, false, 0));
+    for ([_]u32{ 1, 2, 4, 16, std.math.maxInt(u32) }) |rows|
+        try testing.expect(!backoff.beginNativeMiss(true, true, rows));
+    try testing.expectEqual(@as(u64, 0), backoff.misses);
+    try testing.expectEqual(@as(u8, 0), backoff.left);
+    try testing.expect(backoff.beginNativeMiss(true, true, 0));
+    try testing.expectEqual(@as(u64, 1), backoff.misses);
+    try testing.expectEqual(@as(u8, 1), backoff.left);
+    try testing.expectEqual(@as(u64, 0), backoff.plain_tokens);
+    try testing.expectEqual(Generator.PldBackoff.Action.drain, backoff.action(true));
+    // Decline must not change the miss streak or learn an unexecuted proposal.
+    try testing.expect(!backoff.beginNativeMiss(true, false, 0));
+    try testing.expectEqual(@as(u64, 1), backoff.misses);
+    try testing.expectEqual(@as(u8, 1), backoff.window);
+}
+
+test "tiered PLD native miss stop conditions leave unspent skips uncounted" {
+    for ([_]bool{ false, true }) |at_cap| {
+        var gen: Generator = undefined;
+        gen.pld_backoff = .{};
+        try testing.expect(gen.pld_backoff.beginNativeMiss(true, true, 0));
+        gen.done = false;
+        gen.max_tokens = 2;
+        gen.step = if (at_cap) 2 else 1;
+        gen.next_token_id = if (at_cap) 42 else 2;
+        gen.eos_token_ids = &.{2};
+        gen.consecutive_pad = 0;
+        gen.timer = io_util.Stopwatch.init(testing.io);
+        gen.timeout_ns = 0;
+        gen.stall = .{};
+        gen.generated_ids = .empty;
+        // The same stop check guards native emission and terminal drain.
+        // A stopped successor is not an emitted token or a consumed skip.
+        try testing.expect(try gen.checkStop());
+        try testing.expect(gen.done);
+        try testing.expectEqualStrings(if (at_cap) "length" else "stop", gen.finish_reason);
+        try testing.expectEqual(@as(u8, 1), gen.pld_backoff.left);
+        try testing.expectEqual(@as(u64, 0), gen.pld_backoff.plain_tokens);
+    }
+
+    // Entry and native handoff both check the same root; only one check's
+    // pad advance may survive. The third actual pad, not the second, stops.
+    var pads: u32 = 1;
+    const before_stop = pads;
+    try testing.expect(!tokenStops(0, &.{2}, &pads));
+    pads = before_stop;
+    try testing.expect(!tokenStops(0, &.{2}, &pads));
+    try testing.expectEqual(@as(u32, 2), pads);
+    try testing.expect(tokenStops(0, &.{2}, &pads));
+}
+
+test "tiered PLD backoff boundary handles shim pending and clean slow paths" {
+    var backoff = Generator.PldBackoff{};
+    backoff.miss("zero_accepted");
+    // A pending-logits-only shim and a full lazy pipeline both owe one token.
+    try testing.expectEqual(Generator.PldBackoff.Action.drain, backoff.action(true));
+    backoff.emitted("drain");
+    try testing.expectEqual(@as(u64, 1), backoff.plain_tokens);
+    try testing.expectEqual(@as(u8, 0), backoff.left);
+    // A native slow path may leave no pending state: the final token still
+    // uses a clean cold step rather than creating an unbudgeted pipeline tail.
+    backoff.miss("no_match");
+    try testing.expectEqual(Generator.PldBackoff.Action.native, backoff.action(false));
+    backoff.emitted("native");
+    try testing.expectEqual(Generator.PldBackoff.Action.cold, backoff.action(false));
+    backoff.emitted("cold");
+    try testing.expectEqual(@as(u64, 3), backoff.plain_tokens);
+    // An economic decline does not call miss or success and keeps the streak.
+    try testing.expectEqual(@as(u8, 2), backoff.window);
+    try testing.expectEqual(Generator.PldBackoff.Action.lookup, backoff.action(false));
+}
+
+test "lookup native prices replace inherited costs only after stable depth cycles" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    var now_ns: i96 = 0;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    var xfm: Transformer = undefined;
+    xfm.mtp_depth_ms = @splat(0);
+    xfm.mtp_depth_ms[1] = 131;
+    xfm.mtp_depth_ms[2] = 256;
+    xfm.mtp_depth_acc = 0.92;
+    xfm.mtp_depth_rounds = 0;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.mtp_cycle_watch = null;
+    gen.mtp_request_depth_ms = @splat(0);
+    gen.lookup_tiers = null;
+    gen.mtp_request_depth_class = null;
+    gen.prompt_ids_owned = &.{};
+    gen.generated_ids = .empty;
+    gen.mtp_tried = 0;
+    gen.mtp_kept = 0;
+    gen.spec_cost_solo = true;
+    gen.mtpExactContext(0);
+    try testing.expectEqual(@as(u32, 1), gen.mtpExactDepth(2));
+    gen.mtpExactObserve(1, 1, .pipelined); // No preceding cycle: no fabricated local price.
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[1]);
+    now_ns += 146 * std.time.ns_per_ms;
+    gen.mtpExactObserve(1, 1, .pipelined);
+    xfm.mtp_depth_rounds = Generator.MTP_EXACT_PROBE - 1;
+    try testing.expectEqual(@as(u32, 2), gen.mtpExactDepth(2));
+    now_ns += 191 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 243), xfm.mtp_depth_ms[2], 0.0001);
+    // A one-round challenge contains a width transition, not a fresh full-cycle price.
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+    try testing.expectApproxEqAbs(@as(f32, 243), gen.mtpExactPrice(2), 0.0001);
+    // Ordinary cycles continue updating the request estimate; no extra probes.
+    now_ns += 181 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 181), gen.mtpExactPrice(2), 0.0001);
+    try testing.expectEqual(@as(u32, 2), gen.mtpExactDepth(2));
+    try testing.expectEqual(@as(u32, 1), gen.mtpExactDepth(1));
+    gen.spec_cost_solo = false;
+    now_ns += 400 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 181), gen.mtpExactPrice(2), 0.0001);
+    gen.spec_cost_solo = true;
+    var longer_prompt: [2047]u32 = @splat(0);
+    gen.prompt_ids_owned = &longer_prompt;
+    // Future-class planning uses shared prices, not old-class local evidence.
+    try testing.expectEqual(xfm.mtp_depth_ms[2], gen.mtpExactPrice(2));
+    gen.mtpExactContext(2048);
+    try testing.expect(gen.mtp_cycle_watch == null);
+    now_ns += 1000 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+    now_ns += 190 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 1, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 190), gen.mtpExactPrice(2), 0.0001);
+}
+
+test "lookup native cycle shape excludes missing, replaced and discarded preparation" {
+    var gen: Generator = undefined;
+    var current: Generator.MtpPreDraft = undefined;
+    current.lookup = false;
+    current.m = 2;
+    current.lookup_prepared_before_round = true;
+    var successor: Generator.MtpPreDraft = undefined;
+    successor.lookup = false;
+    successor.m = 2;
+    successor.n_drafted = 2;
+    successor.plan = .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 };
+    gen.mtp_pre_draft = successor;
+    try testing.expectEqual(.pipelined, gen.mtpExactCycleShape(&current, false));
+    try testing.expectEqual(.pipelined, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft.?.m = 1;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.n_drafted = 1;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.lookup = true;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft = successor;
+    gen.mtp_pre_draft.?.plan.m_hi = 3;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    gen.mtp_pre_draft = null;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+    current.lookup_prepared_before_round = false;
+    try testing.expectEqual(.cold, gen.mtpExactCycleShape(&current, false));
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, true));
+    gen.mtp_pre_draft = successor;
+    try testing.expectEqual(.ineligible, gen.mtpExactCycleShape(&current, false));
+}
+
+test "lookup mixed successor costs never seed a request-local depth price" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    for ([_]u32{ 10, 70 }) |successor_ms| {
+        var now_ns: i96 = 0;
+        var vtable: std.Io.VTable = undefined;
+        vtable.now = Clock.now;
+        const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+        var xfm: Transformer = undefined;
+        xfm.mtp_depth_ms = @splat(200);
+        xfm.mtp_depth_acc = 0.9;
+        var gen: Generator = undefined;
+        gen.xfm = &xfm;
+        gen.timer = io_util.Stopwatch.init(io);
+        gen.mtp_cycle_watch = null;
+        gen.mtp_request_depth_ms = @splat(0);
+        gen.lookup_tiers = null;
+        gen.mtp_tried = 0;
+        gen.mtp_kept = 0;
+        gen.spec_cost_solo = true;
+        var current: Generator.MtpPreDraft = undefined;
+        current.lookup = false;
+        current.m = 1;
+        current.lookup_prepared_before_round = true;
+        var successor: Generator.MtpPreDraft = undefined;
+        successor.lookup = false;
+        successor.m = 1;
+        successor.n_drafted = 1;
+        successor.plan = .{ .m_lo = 1, .m_hi = 1, .tau_ln = 0 };
+        gen.mtp_pre_draft = successor;
+        gen.mtpExactObserve(1, 1, gen.mtpExactCycleShape(&current, false));
+        // The current chain was built before the preceding boundary. Only
+        // outgoing width-two preparation varies within this width-one interval.
+        gen.mtp_pre_draft.?.m = 2;
+        gen.mtp_pre_draft.?.n_drafted = 2;
+        gen.mtp_pre_draft.?.plan = .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 };
+        now_ns += @as(i96, 100 + successor_ms) * std.time.ns_per_ms;
+        gen.mtpExactObserve(1, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[1]);
+        try testing.expectEqual(@as(u32, 2), gen.mtp_tried);
+        try testing.expectEqual(@as(u32, 2), gen.mtp_kept);
+        current.m = 2;
+        now_ns += 180 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 2, gen.mtpExactCycleShape(&current, true));
+        try testing.expectEqual(@as(f32, 0), gen.mtp_request_depth_ms[2]);
+        now_ns += 160 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 2, gen.mtpExactCycleShape(&current, true));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        // A discarded lazy successor must not masquerade as a cold full cycle.
+        current.lookup_prepared_before_round = false;
+        gen.mtp_pre_draft = null;
+        now_ns += 170 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, true));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        now_ns += 150 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectApproxEqAbs(@as(f32, 160), gen.mtp_request_depth_ms[2], 0.0001);
+        now_ns += 140 * std.time.ns_per_ms;
+        gen.mtpExactObserve(2, 1, gen.mtpExactCycleShape(&current, false));
+        try testing.expectApproxEqAbs(@as(f32, 156), gen.mtp_request_depth_ms[2], 0.0001);
+        try testing.expectEqual(@as(u32, 7), gen.mtp_tried);
+    }
+}
+
+test "lookup routing replaces stale probes with paired request native cycles" {
+    const Clock = struct {
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const ns: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .{ .nanoseconds = ns.* };
+        }
+    };
+    var now_ns: i96 = 0;
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &now_ns, .vtable = &vtable };
+    var policy = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer policy.deinit();
+    try testing.expect(policy.observeSpecRemainingProbe(96, 1, 0, 0));
+    var xfm: Transformer = undefined;
+    xfm.mtp_depth_ms = @splat(150);
+    xfm.mtp_depth_acc = 0.9;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.timer = io_util.Stopwatch.init(io);
+    gen.mtp_cycle_watch = null;
+    gen.mtp_request_depth_ms = @splat(0);
+    gen.mtp_request_depth_class = null;
+    gen.lookup_tiers = .{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &policy };
+    defer gen.lookup_tiers.?.deinit();
+    gen.prompt_ids_owned = &.{};
+    gen.generated_ids = .empty;
+    gen.mtp_tried = 0;
+    gen.mtp_kept = 0;
+    gen.spec_cost_solo = true;
+    gen.mtp_serial_accept = true;
+    gen.done = false;
+    gen.completion_tokens = 0;
+    gen.max_tokens = 192;
+    gen.mtpExactContext(0);
+    const lr = &gen.lookup_tiers.?;
+    // A model-shared slow one-token probe cannot authorize a request's lookup.
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, false) == null);
+    gen.mtpExactObserve(2, 2, .pipelined);
+    lr.native_query_ns = 3 * std.time.ns_per_ms;
+    now_ns += 138 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    const fresh = gen.lookupMtpNative(lr, 0, 2, false).?;
+    try testing.expectApproxEqAbs(@as(f32, 135), fresh.round_ms, 0.0001);
+    try testing.expectEqual(@as(f32, 3), fresh.expected_tokens);
+    var selected: std.ArrayList(u32) = .empty;
+    defer selected.deinit(testing.allocator);
+    const offer = speculation.Tree.chain(0, &.{1}, 0.4, 1);
+    policy.prices.observe(2, 94, .chain, 0, .generic);
+    const old = try policy.chooseLookPreparedControlled(&offer, 0, 3, &selected, 0, .{ .measured = policy.specRemainingFor(0).? }, null);
+    try testing.expectEqual(@as(u32, 1), old.rows);
+    const corrected = try policy.chooseLookPreparedControlled(&offer, 0, 3, &selected, 0, .{ .measured = fresh }, null);
+    try testing.expectEqual(@as(u32, 0), corrected.rows);
+    // Cost and yield adapt together; do not divide a new cost by an old yield.
+    lr.native_query_ns = 5 * std.time.ns_per_ms;
+    now_ns += 155 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 0, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 138), lr.native_cycles[2].?.round_ms, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2.6), lr.native_cycles[2].?.expected_tokens, 0.0001);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 1, false) == null);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, true) == null);
+    gen.spec_cost_solo = false;
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, false) == null);
+    lr.native_query_ns = 900 * std.time.ns_per_ms;
+    now_ns += 1000 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    try testing.expectEqual(@as(u64, 0), lr.native_query_ns);
+    gen.spec_cost_solo = true;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    gen.done = true;
+    now_ns += 100 * std.time.ns_per_ms;
+    gen.mtpExactObserve(2, 2, .pipelined);
+    try testing.expectApproxEqAbs(@as(f32, 138), lr.native_cycles[2].?.round_ms, 0.0001);
+    // A context crossing during outgoing preparation invalidates the interval.
+    lr.native_query_ns = 7 * std.time.ns_per_ms;
+    gen.mtpExactContext(2048);
+    try testing.expect(gen.mtp_cycle_watch == null);
+    try testing.expectEqual(@as(u64, 0), lr.native_query_ns);
+    try testing.expect(gen.lookupMtpNative(lr, 2048, 2, false) == null);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, false) == null);
+    lr.observeNativeCycle(2, 5, 6 * std.time.ns_per_ms, 3);
+    try testing.expect(lr.native_cycles[2] == null);
+}
+
+test "lookup native diagnostic preserves admission subset rather than final preorder prefix" {
+    const allocator = std.testing.allocator;
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22 };
+    // Make each continuation less likely than the other root, so admission
+    // order starts with siblings but final preorder starts down the first branch.
+    var unary = [_]f32{ 3, 2.9, -9, 1, 0, -9 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [9]f32 = @splat(0);
+    const lattice = dflash_mod.Lattice{ .m = 2, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var admissions: [4]usize = undefined;
+    var full = try dflash_mod.bestFirstTree(allocator, &lattice, .{
+        .max_nodes = 4, .tau = 1, .edge_w = 1, .children = 2, .admission_order = &admissions,
+    });
+    defer full.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 11, 20 }, full.tokens);
+    const native = nativeAdmissionTree(99, &full, &admissions, 2, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11 }, native.tokens[0..native.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, native.parents[0..native.len]);
+    const root = nativeAdmissionTree(99, &full, &admissions, 0, 2);
+    try std.testing.expectEqual(@as(usize, 1), root.len);
+    const all = nativeAdmissionTree(99, &full, &admissions, 4, 2);
+    try std.testing.expectEqualSlices(u32, full.tokens, all.tokens[1..all.len]);
+    for (all.parents[1..all.len], full.parents) |parent, original| try std.testing.expectEqual(original + 1, parent);
+    const shallow = nativeAdmissionTree(99, &full, &admissions, 4, 1);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 10, 11 }, shallow.tokens[0..shallow.len]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, shallow.parents[0..shallow.len]);
+}
+
+test "lookup native membership requires matching ancestry for repeated token IDs" {
+    var native = speculation.Tree.init(9);
+    _ = native.add(0, 10, 0.5, .draft, 0.5);
+    _ = native.add(1, 20, 0.5, .draft, 1);
+    _ = native.add(0, 11, 0.5, .draft, 0.5);
+    _ = native.add(3, 20, 0.5, .draft, 1);
+    var selected = speculation.Tree.init(9);
+    _ = selected.add(0, 11, 0.5, .draft, 0.5);
+    _ = selected.add(1, 20, 0.5, .draft, 1);
+    _ = selected.add(0, 10, 0.5, .draft, 0.5);
+    const matched = nativeSelectedRows(&native, &selected);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 3, -1, 1, 2 }, matched[0..native.len]);
+    selected.tokens[0] = 99;
+    const foreign = nativeSelectedRows(&native, &selected);
+    for (foreign[0..native.len]) |row| try std.testing.expectEqual(@as(i32, -1), row);
+}
+
+test "lookup native witness is bounded offered geometry not terminal publication or yield evidence" {
+    const tokens: [speculation.MAX_TREE_ROWS - 1]u32 = @splat(std.math.maxInt(u32));
+    const tree = speculation.Tree.chain(std.math.maxInt(u32), &tokens, 1, 1);
+    const receipt = LookupReceipt{
+        .family = "dflash", .kind = "tree", .class = 262144,
+        .anchor_pos = std.math.maxInt(usize),
+        .prefix_hash = std.math.maxInt(u64), .prompt_hash = std.math.maxInt(u64),
+        .candidate_hash = std.math.maxInt(u64), .candidate_rows = tree.len,
+        .legal_rows = tree.len, .requested_rows = 8, .selection = "fixed",
+        .rows = tree.len, .admissible = true,
+    };
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeNativeCandidate(&writer, &receipt, &tree, &tree, 0, 7);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("offered_geometry_only", object.get("scope").?.string);
+    try std.testing.expectEqualStrings("not_publication_evidence", object.get("commit_scope").?.string);
+    try std.testing.expect(object.get("terminal_censoring_required").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), object.get("remaining_token_budget").?.integer);
+    try std.testing.expect(object.get("expected_tokens") == null);
+    try std.testing.expect(object.get("accepted") == null);
+    const native = object.get("native").?.object;
+    try std.testing.expectEqual(tree.len, native.get("tokens").?.array.items.len);
+    try std.testing.expectEqual(tree.len, native.get("selected_rows").?.array.items.len);
+    var short_buffer: [16]u8 = undefined;
+    var short_writer = std.Io.Writer.fixed(&short_buffer);
+    try std.testing.expectError(error.WriteFailed, writeNativeCandidate(&short_writer, &receipt, &tree, &tree, 0, 7));
+}
+
+test "lookup native recovery yields update admission without fabricating timing" {
+    var policy = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer policy.deinit();
+    var gen: Generator = undefined;
+    gen.lookup_tiers = .{ .drafter = token_history.Drafter.init(testing.allocator), .cut = &policy };
+    defer gen.lookup_tiers.?.deinit();
+    gen.mtp_serial_accept = true;
+    gen.mtp_request_depth_class = 0;
+    gen.spec_cost_solo = true;
+    gen.done = false;
+    gen.completion_tokens = 1;
+    gen.max_tokens = 192;
+    const lr = &gen.lookup_tiers.?;
+
+    // Valid outcomes alone cannot create a timing estimate.
+    gen.observeMtpNativeYield(0, 2, 1);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, false) == null);
+    lr.observeNativeCycle(2, 120, 0, 1);
+    var selected: std.ArrayList(u32) = .empty;
+    defer selected.deinit(testing.allocator);
+    const offer = speculation.Tree.chain(0, &.{1}, 0.4, 1);
+    policy.prices.observe(2, 94, .chain, 0, .generic);
+    const stale = try policy.chooseLookPreparedControlled(&offer, 0, 0, &selected, 0,
+        .{ .measured = gen.lookupMtpNative(lr, 0, 2, false).? }, null);
+    try testing.expectEqual(@as(u32, 1), stale.rows);
+
+    // Recovery and contention still reveal native acceptance. They do not
+    // refresh the homogeneous cycle cost or its original paired yield.
+    gen.spec_cost_solo = false;
+    for (0..10) |_| gen.observeMtpNativeYield(0, 2, 3);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, false) == null);
+    gen.spec_cost_solo = true;
+    const current = gen.lookupMtpNative(lr, 0, 2, false).?;
+    try testing.expectApproxEqAbs(@as(f32, 3 - 2 * std.math.pow(f32, 0.8, 10)), current.expected_tokens, 0.00001);
+    try testing.expectEqual(@as(f32, 120), current.round_ms);
+    try testing.expectEqual(@as(f32, 1), lr.native_cycles[2].?.expected_tokens);
+    try testing.expectEqual(@as(u32, 11), lr.native_yield_samples[2]);
+    const fresh = try policy.chooseLookPreparedControlled(&offer, 0, 0, &selected, 0, .{ .measured = current }, null);
+    try testing.expectEqual(@as(u32, 0), fresh.rows);
+
+    gen.observeMtpNativeYield(0, 1, 1);
+    try testing.expectEqual(current.expected_tokens, gen.lookupMtpNative(lr, 0, 2, false).?.expected_tokens);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 1, false) == null);
+    try testing.expect(gen.lookupMtpNative(lr, 0, 2, true) == null);
+    gen.done = true;
+    gen.observeMtpNativeYield(0, 2, 1);
+    gen.done = false;
+    gen.completion_tokens = gen.max_tokens;
+    gen.observeMtpNativeYield(0, 2, 1);
+    gen.completion_tokens = 1;
+    gen.observeMtpNativeYield(2048, 2, 1);
+    gen.observeMtpNativeYield(0, 0, 1);
+    gen.observeMtpNativeYield(0, 2, 4);
+    try testing.expectEqual(@as(u32, 11), lr.native_yield_samples[2]);
+    gen.mtpExactContext(2048);
+    gen.observeMtpNativeYield(0, 2, 3); // Outgoing preparation crossed the boundary.
+    try testing.expectEqual(@as(u32, 0), lr.native_yield_samples[2]);
+    try testing.expect(gen.lookupMtpNative(lr, 2048, 2, false) == null);
+}
+
+test "DFlash native copy query retains complete native tokens and respects adaptive controls" {
+    var prompt: [71]u32 = undefined;
+    for (prompt[0..32], 1..) |*token, value| token.* = @intCast(value);
+    for (prompt[32..40], 100..) |*token, value| token.* = @intCast(value);
+    for (prompt[40..], 1..) |*token, value| token.* = @intCast(value);
+    var scratch: [Generator.DFLASH_COPY_WINDOW]u32 = undefined;
+    var silent: u8 = 0;
+    const copy = NativeCopyAction.query(&prompt, &.{}, 32, 8, 15, &silent, true, &scratch).?;
+    try testing.expectEqualSlices(u32, prompt[32..40], copy.tokens[0..copy.len]);
+    try testing.expect(copy.backing_length >= Generator.DFLASH_COPY_MATCH);
+    @memset(&scratch, 0);
+    try testing.expectEqualSlices(u32, prompt[32..40], copy.tokens[0..copy.len]);
+    try testing.expect(NativeCopyAction.query(&prompt, &.{}, 32, 8, 7, &silent, true, &scratch) == null);
+    try testing.expect(NativeCopyAction.query(&prompt, &.{}, 32, 16, 16, &silent, true, &scratch) == null);
+    const short: [40]u32 = @splat(1);
+    try testing.expect(NativeCopyAction.query(&short, &.{}, 1, 8, 15, &silent, true, &scratch) == null);
+    try testing.expect(nativeCopyAdaptiveEnabled(true, true, "adaptive", false));
+    for ([_][]const u8{ "fixed", "cut", "max" }) |selection| {
+        try testing.expect(!nativeCopyAdaptiveEnabled(true, true, selection, false));
+    }
+    try testing.expect(!nativeCopyAdaptiveEnabled(false, true, "adaptive", false));
+    try testing.expect(!nativeCopyAdaptiveEnabled(true, false, "adaptive", false));
+    try testing.expect(!nativeCopyAdaptiveEnabled(true, true, "adaptive", true));
+    silent = 16;
+    try testing.expect(NativeCopyAction.query(&prompt, &.{}, 32, 8, 15, &silent, false, &scratch) == null);
+    try testing.expectEqual(@as(u8, 16), silent);
+    for (0..16) |_| try testing.expect(NativeCopyAction.query(&prompt, &.{}, 32, 8, 15, &silent, true, &scratch) == null);
+    try testing.expectEqual(@as(u8, 0), silent);
+    try testing.expect(NativeCopyAction.query(&prompt, &.{}, 32, 8, 15, &silent, true, &scratch) != null);
+}
+
+test "DFlash native copy preselection preserves bounded lookup identity and nullable real yield" {
+    const saved_selection = lookup_selection_cache;
+    defer lookup_selection_cache = saved_selection;
+    lookup_selection_cache = .{};
+    const prompt = [_]u32{ 1, 2 };
+    for ([_]bool{ false, true }) |known| {
+        var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+        defer cut.deinit();
+        var action = NativeCopyAction{ .len = 15, .backing_length = 26 };
+        for (action.tokens[0..action.len], 20..) |*token, value| token.* = @intCast(value);
+        const offer = speculation.Tree.chain(3, &.{99}, 0.5, 0.5);
+        var prepared = PreparedLookupTree{
+            .tree = offer,
+            .execution = offer,
+            .watch = io_util.Stopwatch.init(testing.io),
+            .order = 2,
+            .confidence = 0.5,
+            .source = .local,
+            .native_copy = action,
+        };
+        if (known) {
+            _ = cut.observeNativeCopyRemaining(12, 3, 16, 0); // Cold, independently excluded.
+            _ = cut.observeNativeCopyRemaining(12, 3, 16, 0);
+        }
+        const offer_hash = try cf.fingerprintOffer(&prepared.tree);
+        prepared.routeBeforeAssistant(&cut, 0, 3, 16, .linear_gdn, prompt.len);
+        try testing.expect(prepared.route.?.decision.skip); // No assistant call is admitted.
+        try testing.expect(prepared.nativeCopySelected());
+        try testing.expectEqual(@as(usize, 16), prepared.execution.len);
+        try testing.expectEqualSlices(u32, action.tokens[0..action.len], prepared.execution.tokens[1..prepared.execution.len]);
+        for (prepared.execution.parents[1..prepared.execution.len], 0..) |parent, row| try testing.expectEqual(@as(i32, @intCast(row)), parent);
+        try testing.expectEqualDeep(offer_hash, try cf.fingerprintOffer(&prepared.tree));
+        try testing.expectEqual(@as(usize, 2), prepared.tree.len);
+        var gen: Generator = undefined;
+        gen.prompt_ids_owned = @constCast(&prompt);
+        gen.generated_ids = .empty;
+        gen.lookup_prefix_hash = std.hash.Wyhash.init(0);
+        gen.lookup_prefix_count = 0;
+        gen.lookup_prefix_primed = false;
+        var receipt = gen.lookupReceipt("dflash", "tree", 0, 3, &prepared.tree, &prepared.execution, 16);
+        receipt.executed_geometry_hash = lookupTreeHash(&prepared.execution);
+        receipt.recordNativeCopy(&prepared);
+        try testing.expectEqual(@as(usize, 2), receipt.candidate_rows);
+        try testing.expectEqual(@as(usize, 2), receipt.legal_rows);
+        try testing.expectEqual(@as(usize, 16), receipt.rows);
+        try testing.expectEqual(@as(usize, 15), receipt.selected_local);
+        try testing.expect(!receipt.assistant);
+        try testing.expect(receipt.native_copy.?.selected);
+        try testing.expectEqual(@as(usize, 26), receipt.native_copy.?.backing_length);
+        try testing.expectEqual(receipt.executed_geometry_hash.?, receipt.native_copy.?.geometry_hash);
+        if (known) {
+            try testing.expectApproxEqAbs(@as(f32, 3), receipt.predicted_tokens.?, 0.00001);
+            try testing.expectApproxEqAbs(@as(f32, 5), receipt.native_copy.?.ms_per_token.?, 0.00001);
+        } else {
+            try testing.expect(receipt.predicted_tokens == null);
+            try testing.expect(receipt.native_copy.?.expected_tokens == null);
+            try testing.expect(receipt.native_copy.?.ms_per_token == null);
+            const json = try std.json.Stringify.valueAlloc(testing.allocator, receipt, .{});
+            defer testing.allocator.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+            defer parsed.deinit();
+            try testing.expect(parsed.value.object.get("predicted_tokens").? == .null);
+            try testing.expect(parsed.value.object.get("native_copy").?.object.get("expected_tokens").? == .null);
+        }
+        // Only the retained, reached lookup offer learns, not zero-score copy geometry.
+        cut.observeLookupTree(&prepared.tree, &.{20}, null);
+        try testing.expectEqual(@as(f32, 1), cut.cal.samples(.look));
+        try testing.expectEqual(@as(f32, 0), cut.cal.samples(.look_continuation));
+    }
+}
+
+test "DFlash native copy misses silence only actual uncensored outcomes" {
+    var misses: u8 = 0;
+    var silent: u8 = 0;
+    for (0..3) |_| {
+        try testing.expect(nativeCopyOutcomeEligible(0, 0, false, 10, 100));
+        nativeCopyFeedback(&misses, &silent, 0);
+    }
+    try testing.expectEqual(@as(u8, 3), misses);
+    try testing.expectEqual(@as(u8, 0), silent);
+    try testing.expect(!nativeCopyOutcomeEligible(7, 0, false, 100, 100));
+    try testing.expect(!nativeCopyOutcomeEligible(0, 0, true, 10, 100));
+    try testing.expect(!nativeCopyOutcomeEligible(0, 0, false, 100, 100));
+    nativeCopyFeedback(&misses, &silent, 7);
+    try testing.expectEqual(@as(u8, 0), misses);
+    for (0..4) |_| nativeCopyFeedback(&misses, &silent, 0);
+    try testing.expectEqual(@as(u8, 0), misses);
+    try testing.expectEqual(@as(u8, 16), silent);
+}
+
+test "DFlash native copy runtime admits only actual solo uncensored paired outcomes" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    for (0..4) |ineligible| {
+        var eligible = [_]bool{ true, true, true, true };
+        eligible[ineligible] = false;
+        if (nativeCopySampleEligible(eligible[0], eligible[1], eligible[2], eligible[3])) {
+            _ = cut.observeNativeCopyRemaining(9, 9, 9, 0);
+        }
+        try testing.expect(cut.nativeCopyRemainingFor(9, 0) == null);
+        try testing.expectEqual(@as(u32, 0), cut.rounds.count());
+    }
+    try testing.expect(nativeCopySampleEligible(true, true, true, true));
+    _ = cut.observeNativeCopyRemaining(100, 9, 9, 0);
+    try testing.expect(cut.nativeCopyRemainingFor(9, 0) == null);
+    _ = cut.observeNativeCopyRemaining(3, 1, 9, 0); // A real zero-draft acceptance is one committed anchor.
+    _ = cut.observeNativeCopyRemaining(9, 7, 9, 0);
+    const learned = cut.nativeCopyRemainingFor(9, 0).?;
+    try testing.expectEqual(@as(f32, 6), learned.round_ms);
+    try testing.expectEqual(@as(f32, 4), learned.expected_tokens);
+    try testing.expect(cut.specRemainingFor(0) == null);
+}
+
+test "DFlash native copy metadata survives a cheaper actual assistant route" {
+    var cut = speculation.Policy.init(speculation.PriceModel.init(testing.allocator));
+    defer cut.deinit();
+    var copy = NativeCopyAction{ .len = 3, .backing_length = 26 };
+    @memcpy(copy.tokens[0..3], &[_]u32{ 7, 8, 9 });
+    const offer = speculation.Tree.init(3);
+    var prepared = PreparedLookupTree{
+        .tree = offer,
+        .execution = offer,
+        .watch = io_util.Stopwatch.init(testing.io),
+        .order = 0,
+        .confidence = 0,
+        .source = .local,
+        .native_copy = copy,
+    };
+    _ = cut.observeNativeCopyRemaining(12, 3, 4, 0);
+    _ = cut.observeNativeCopyRemaining(12, 3, 4, 0);
+    _ = cut.observeSpecRemainingProbe(1, 2, 0, 0);
+    prepared.routeBeforeAssistant(&cut, 0, 3, 16, .linear_gdn, 0);
+    try testing.expect(!prepared.route.?.decision.skip);
+    try testing.expect(!prepared.nativeCopySelected());
+    try testing.expectEqual(@as(usize, 1), prepared.execution.len);
+    var receipt = LookupReceipt{
+        .family = "dflash", .kind = "tree", .class = 0, .anchor_pos = 0,
+        .prefix_hash = 0, .prompt_hash = 0, .candidate_hash = 0, .candidate_rows = 1,
+        .legal_rows = 1, .requested_rows = 0, .selection = "adaptive", .rows = 1,
+        .admissible = true, .assistant = true, .predicted_tokens = 2,
+    };
+    receipt.recordNativeCopy(&prepared);
+    try testing.expect(!receipt.native_copy.?.selected);
+    try testing.expectEqual(@as(f32, 2), receipt.predicted_tokens.?);
+    try testing.expectEqual(@as(f32, 3), receipt.native_copy.?.expected_tokens.?);
+    try testing.expectEqual(@as(f32, 5), receipt.native_copy.?.ms_per_token.?);
 }

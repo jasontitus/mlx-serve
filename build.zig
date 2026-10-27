@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
+    addPleBench(b, target, optimize, git_sha);
 
     const mlx_stamp = mlxStampModule(b, "lib/mlx/.version");
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
@@ -386,6 +387,39 @@ pub fn build(b: *std.Build) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse b.fmt("{s}/include", .{brew_prefix});
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+}
+
+/// Opt-in CPU component executable: reuses config/tokenizer/table loaders but links
+/// no MLX library and never constructs a target model or a Metal device.
+fn addPleBench(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, git_sha: []const u8) void {
+    const options = b.addOptions();
+    options.addOption(bool, "ios", false);
+    options.addOption(bool, "ds4_engine", false);
+    options.addOption(bool, "llama_engine", false);
+    options.addOption(bool, "mlx_stream", false);
+    options.addOption(bool, "mas", false);
+    options.addOption(bool, "plugin_profile", false);
+    options.addOption(bool, "slow_tests", false);
+    options.addOption([]const u8, "git_sha", git_sha);
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/ple_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
+    const exe = b.addExecutable(.{ .name = "ple-bench", .root_module = mod });
+    b.step("ple-bench-build", "Build the CPU learned ngram embedding component benchmark")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
+    const run = b.addRunArtifact(exe);
+    run.addPassthruArgs();
+    run.has_side_effects = true;
+    b.step("ple-bench", "Run the opt-in CPU learned ngram embedding component benchmark").dependOn(&run.step);
+    const validation = b.addTest(.{ .root_module = mod, .filters = &.{ "PLE benchmark protocol:", "ngram benchmark controls", "embedded PLE reads TensorFold" } });
+    b.step("ple-bench-test", "Run lightweight benchmark protocol regressions (no staged table)")
+        .dependOn(&b.addRunArtifact(validation).step);
 }
 
 /// Hermetic Latent2RGB + JPEG tests. No MLX, no Homebrew — the only `zig build`

@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "license": "CC0-1.0: these original deterministic public benchmark documents are dedicated to the public domain.",
+  "notes": "Raw completion prompts, not chat templates. Corpus continuation contains one source prefix only, with no repeated passage inside the request. No context length is inferred or silently truncated; runner records actual prompt token count from /tokenize.",
+  "corpus_texts": [
+    "Harbor maintenance notebook, entry twenty-seven. The copper lantern stood beside the eastern gate while Mira checked the tide chart. At dawn she carried three clean lenses to the workshop, labeled each wooden drawer, and wrote the water temperature in a blue ledger. Across the inlet a small ferry sounded its bell. The keeper answered with a green flag, then closed the cabinet before the rain arrived. By noon the fog had lifted and every marker along the channel was visible from the upper window.",
+    "A deterministic queue processes records in arrival order. Assign each record a monotonically increasing sequence number, store the immutable payload beside that number, and acknowledge only after the append has completed. On recovery, scan complete entries, reject a partial final record, and resume from the greatest committed sequence. A consumer may remember its own cursor, but it must not reinterpret an uncommitted write as a successful delivery. This simple rule keeps replay predictable when a process stops between two operations.",
+    "def stable_unique(values):\n    seen = set()\n    result = []\n    for value in values:\n        if value not in seen:\n            seen.add(value)\n            result.append(value)\n    return result\n\ndef running_totals(values):\n    total = 0\n    result = []\n    for value in values:\n        total += value\n        result.append(total)\n    return result\n"
+  ],
+  "cases": [
+    {
+      "id": "lookup-hit",
+      "kind": "lookup-first-offer-hit",
+      "prompt": "Continue the exact copy of the passage, preserving every word and punctuation. Output only the missing continuation after the supplied prefix.\n\nPassage:\nThe amber compass rests on a folded map. Seven narrow bridges cross the quiet canal. A gardener places white stones beside the cedar fence. The last train leaves the valley before sunset.\n\nExact copy:\nThe amber compass rests on",
+      "max_tokens": 128,
+      "temperature": 0,
+      "seed": 0,
+      "economics_required_origin": "local",
+      "repetition": "synthetic known-hit witness; supplied output prefix makes local lookup available at the first measured decision"
+    },
+    {
+      "id": "lookup-edit",
+      "kind": "lookup-first-offer-conflict",
+      "prompt": "Continue the edited copy of the passage. Change only white to black; preserve all other words and punctuation. Output only the missing continuation after the supplied prefix.\n\nPassage:\nThe amber compass rests on a folded map. Seven narrow bridges cross the quiet canal. A gardener places white stones beside the cedar fence. The last train leaves the valley before sunset.\n\nEdited copy:\nA gardener",
+      "max_tokens": 128,
+      "temperature": 0,
+      "seed": 0,
+      "economics_required_origin": "local",
+      "repetition": "synthetic conflict witness; local continuation contains the unedited word; actual acceptance, not the prompt label, establishes rejection coverage"
+    },
+    {
+      "id": "copy",
+      "kind": "copy",
+      "prompt": "Copy the following passage exactly, preserving spelling and punctuation. Output only the passage.\n\nThe amber compass rests on a folded map. Seven narrow bridges cross the quiet canal. A gardener places white stones beside the cedar fence. The last train leaves the valley before sunset.\n\nExact copy:\n",
+      "max_tokens": 128,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "source passage appears once; output should copy it"
+    },
+    {
+      "id": "edit",
+      "kind": "edit",
+      "prompt": "Rewrite the following paragraph, changing only the name Rowan to Ellis and the color red to blue. Preserve all other words and punctuation. Output only the edited paragraph.\n\nRowan carried a red notebook through the market. Near the fountain, Rowan stopped to sketch a red bicycle. The notebook stayed dry beneath a broad umbrella.\n\nEdited paragraph:\n",
+      "max_tokens": 128,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "controlled repeated names and colors"
+    },
+    {
+      "id": "code",
+      "kind": "code",
+      "prompt": "Complete the Python function. Keep input order, use a set for membership, and return the result list. Output code only, continuing after the last line.\n\ndef stable_unique(values):\n    seen = set()\n    result = []\n    for value in values:\n",
+      "max_tokens": 128,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "single code prefix"
+    },
+    {
+      "id": "prose",
+      "kind": "prose",
+      "prompt": "Write one concise paragraph explaining why a lighthouse keeper records weather observations every morning. Use plain language, concrete examples, and no headings.\n\n",
+      "max_tokens": 160,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "open prose; no supplied repeated continuation"
+    },
+    {
+      "id": "corpus",
+      "kind": "corpus-continuation",
+      "prompt": "Harbor maintenance notebook, entry twenty-seven. The copper lantern stood beside the eastern gate while Mira checked the tide chart. At dawn she carried",
+      "max_tokens": 160,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "one prefix only; continuation available exclusively in external corpus before learning",
+      "corpus_document_index": 0
+    },
+    {
+      "id": "budget",
+      "kind": "budget2",
+      "prompt": "Continue the sequence with the next two words only.\n\nJanuary February March April",
+      "max_tokens": 2,
+      "temperature": 0,
+      "seed": 0,
+      "repetition": "single short sequence; strict two-token generation budget"
+    },
+    {
+      "id": "keyed",
+      "kind": "keyed-sampling",
+      "prompt": "Write a short, vivid description of a small observatory above a forest at night. Mention a telescope, a cool breeze, and a distant river.\n\n",
+      "max_tokens": 128,
+      "temperature": 0.7,
+      "seed": 0,
+      "repetition": "open prose with deterministic keyed sampling seed"
+    }
+  ]
+}

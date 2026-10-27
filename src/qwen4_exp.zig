@@ -232,7 +232,7 @@ pub const NgramTable = struct {
             .embedded = ptr,
             .fmt = ptr.fmt,
         };
-        if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
+        table.initPool();
         return table;
     }
 
@@ -260,8 +260,25 @@ pub const NgramTable = struct {
         if (hlen > size - 8) return error.NgramTableTruncated;
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
-        if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
+        t.initPool();
         return t;
+    }
+
+    fn initPool(self: *NgramTable) void {
+        if (plePrefetchEnabled()) self.pool = PrefetchPool.create(self.decodedCacheDim()) catch null;
+        log.info("[qwen4] PLE row cache: MLX_SERVE_PLE_ROW_CACHE={d} payload_bytes={d} pool_threads={d}\n", .{
+            @intFromBool(pleRowCacheEnabled()),
+            if (self.pool) |p| p.decoded.values.len * @sizeOf(f32) else 0,
+            if (self.pool != null) PrefetchPool.N else @as(usize, 0),
+        });
+    }
+
+    /// The cache-only control leaves workers, calibration and warming unchanged.
+    /// Do not allocate decoded payload for formats/shapes that can never use the pool.
+    fn decodedCacheDim(self: *const NgramTable) u32 {
+        if (!pleRowCacheEnabled() or self.bits == 16) return 0;
+        const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
+        return if (need <= PrefetchPool.ROW_BUF) self.dim else 0;
     }
 
     /// Widths `mx.quantize` packs and `dequantRow` unpacks, plus 16 = raw
@@ -374,7 +391,15 @@ pub const NgramTable = struct {
         }
         live_warm_bytes.store(0, .release);
         live_warm_total.store(0, .release);
-        if (self.pool) |p| p.destroy();
+        if (self.pool) |p| {
+            log.info("[qwen4] PLE row cache final: payload_bytes={d} hits={d} misses={d} pool_rounds={d}\n", .{
+                p.decoded.values.len * @sizeOf(f32),
+                p.decoded.hits,
+                p.decoded.misses,
+                p.runs.load(.monotonic),
+            });
+            p.destroy();
+        }
         self.pool = null;
         if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
@@ -435,6 +460,52 @@ pub const NgramTable = struct {
         });
     }
 
+    pub const BenchmarkArm = enum { serial, pooled };
+
+    /// Explicit component-benchmark controls over the SAME implementations used by gather.
+    /// No environment/policy mutation and no silent pooled-to-serial fallback: a failed or
+    /// unavailable control must fail the benchmark rather than mislabel its measurements.
+    pub fn gatherForBenchmark(self: *const NgramTable, arm: BenchmarkArm, row_ids: []const i64, out: []f32) !void {
+        if (out.len != (std.math.mul(usize, row_ids.len, self.dim) catch return error.InvalidBenchmarkShape))
+            return error.InvalidBenchmarkShape;
+        for (row_ids) |r| if (r < 0 or r >= self.rows) return error.InvalidBenchmarkRow;
+        switch (arm) {
+            .serial => self.gatherSerial(row_ids, out),
+            .pooled => {
+                if (self.bits == 16) return error.BenchmarkPoolUnsupported;
+                const pool = self.pool orelse return error.BenchmarkPoolUnavailable;
+                if ((self.fd < 0 and self.embedded == null) or
+                    self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2 > PrefetchPool.ROW_BUF)
+                    return error.BenchmarkPoolUnsupported;
+                if (!self.gatherPooled(pool, row_ids, out)) return error.BenchmarkPoolReadFailed;
+            },
+        }
+    }
+
+    pub fn benchmarkPoolInfo(self: *const NgramTable) struct { threads: usize, max_rows_per_round: usize, row_buffer_bytes: usize, rounds: u64, calibrated_prefer_pool: bool, decoded_cache_bytes: usize, decoded_cache_capacity_rows: usize, decoded_cache_ways: usize, decoded_cache_hits: u64, decoded_cache_misses: u64 } {
+        return .{
+            .threads = if (self.pool != null) PrefetchPool.N else 0,
+            .max_rows_per_round = PrefetchPool.MAX_ROWS,
+            .row_buffer_bytes = PrefetchPool.ROW_BUF,
+            .rounds = if (self.pool) |p| p.runs.load(.monotonic) else 0,
+            .calibrated_prefer_pool = if (self.pool) |p| p.prefer_pool else false,
+            .decoded_cache_bytes = if (self.pool) |p| @sizeOf(DecodedRows) + p.decoded.values.len * @sizeOf(f32) else 0,
+            .decoded_cache_capacity_rows = if (self.pool) |p| if (p.decoded.values.len != 0) DecodedRows.CAPACITY else 0 else 0,
+            .decoded_cache_ways = DecodedRows.WAYS,
+            .decoded_cache_hits = if (self.pool) |p| p.decoded.hits else 0,
+            .decoded_cache_misses = if (self.pool) |p| p.decoded.misses else 0,
+        };
+    }
+
+    /// Benchmark isolation only. Retains storage/cumulative counters; invalidates keys
+    /// without touching the mmap, OS page cache, or calibrated production policy.
+    pub fn resetDecodedCacheForBenchmark(self: *const NgramTable) void {
+        if (self.pool) |p| {
+            @memset(&p.decoded.keys, -1);
+            @memset(&p.decoded.next, 0);
+        }
+    }
+
     fn gatherSerial(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
     }
@@ -452,6 +523,35 @@ pub const NgramTable = struct {
                 const b = &p.bufs[i - start];
                 self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], out[i * self.dim ..][0..self.dim]);
             }
+        }
+        return true;
+    }
+
+    /// Only narrow pooled gathers use the bounded decoded cache. Misses retain parallel
+    /// preads; neither elapsed time nor a previous access is a claim of mmap residency.
+    fn gatherCached(self: *const NgramTable, p: *PrefetchPool, row_ids: []const i64, out: []f32) bool {
+        var missing: [PrefetchPool.MAX_ROWS]i64 = undefined;
+        var positions: [PrefetchPool.MAX_ROWS]usize = undefined;
+        var count: usize = 0;
+        // Copy all hits before replacing any slot: a later colliding miss must not
+        // invalidate an earlier hit, even for reordered or duplicate row ids.
+        for (row_ids, 0..) |r, i| {
+            const dst = out[i * self.dim ..][0..self.dim];
+            if (!p.decoded.get(r, dst)) {
+                missing[count] = r;
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        if (count == 0) return true;
+        if (!p.run(self, missing[0..count])) return false;
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
+        for (missing[0..count], positions[0..count], 0..) |r, i, j| {
+            const b = &p.bufs[j];
+            const dst = out[i * self.dim ..][0..self.dim];
+            self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], dst);
+            p.decoded.put(r, dst);
         }
         return true;
     }
@@ -565,6 +665,16 @@ pub const NgramTable = struct {
     /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the context position this
     /// gather runs at and picks the wide arm; the output is byte-identical either way.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
+        self.gatherImpl(row_ids, out, kv_len, true);
+    }
+
+    /// Frozen pre-cache production policy, including the same wide-batch calibration/KV
+    /// gate. Benchmark-only: unlike forced serial/pool controls this is a policy baseline.
+    pub fn gatherBaselineForBenchmark(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
+        self.gatherImpl(row_ids, out, kv_len, false);
+    }
+
+    fn gatherImpl(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64, use_cache: bool) void {
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
         const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
@@ -578,7 +688,9 @@ pub const NgramTable = struct {
         const pooled = wide_ok and self.pool != null and readable and need <= PrefetchPool.ROW_BUF;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, prefer_pool);
         if (self.pool) |p| if (readable and need <= PrefetchPool.ROW_BUF and wide_ok) {
-            if (self.gatherPooled(p, row_ids, out)) return;
+            if (use_cache and !wide and p.decoded.values.len != 0) {
+                if (self.gatherCached(p, row_ids, out)) return;
+            } else if (self.gatherPooled(p, row_ids, out)) return;
         };
         self.gatherSerial(row_ids, out);
     }
@@ -624,6 +736,60 @@ fn dequantNvfp4Row(codes: []const u8, scales: []const u8, global: f32, out: []f3
     }
 }
 
+/// Four-way set-associative exact f32 rows owned by one table's pool. No references into the
+/// mapping or caller output survive a gather. The inference thread is the sole user,
+/// just like the pool itself; close frees it before unmapping/closing the table.
+/// Immutable weights/scales need no request/KV invalidation. Full sets evict round-robin;
+/// hits do not change replacement order. 1024 * dim * 4 payload bytes plus
+/// @sizeOf(DecodedRows), no disk storage.
+const DecodedRows = struct {
+    const SETS = 256;
+    const WAYS = 4;
+    const CAPACITY = SETS * WAYS;
+    keys: [CAPACITY]i64 = @splat(-1),
+    next: [SETS]u8 = @splat(0),
+    values: []f32 = &.{},
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    fn set(row_id: i64) usize {
+        const mixed = @as(u64, @intCast(row_id)) *% 0x9e3779b97f4a7c15;
+        return @intCast(mixed >> 56);
+    }
+
+    fn get(self: *DecodedRows, row_id: i64, out: []f32) bool {
+        const base = set(row_id) * WAYS;
+        inline for (0..WAYS) |way| {
+            const index = base + way;
+            if (self.keys[index] == row_id) {
+                @memcpy(out, self.values[index * out.len ..][0..out.len]);
+                self.hits += 1;
+                return true;
+            }
+        }
+        self.misses += 1;
+        return false;
+    }
+
+    fn put(self: *DecodedRows, row_id: i64, value: []const f32) void {
+        const group = set(row_id);
+        const base = group * WAYS;
+        // A batch can miss the same row more than once. Refresh its existing slot
+        // rather than consuming another way or changing replacement order.
+        inline for (0..WAYS) |way| {
+            const index = base + way;
+            if (self.keys[index] == row_id) {
+                @memcpy(self.values[index * value.len ..][0..value.len], value);
+                return;
+            }
+        }
+        const index = base + self.next[group];
+        @memcpy(self.values[index * value.len ..][0..value.len], value);
+        self.keys[index] = row_id;
+        self.next[group] = (self.next[group] + 1) % WAYS;
+    }
+};
+
 /// Persistent gather workers. Every row's three regions are one SSD read on
 /// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
 /// of every decode step, 16 fault threads ~0.7 ms, and more threads got SLOWER
@@ -650,19 +816,24 @@ const PrefetchPool = struct {
     /// Fan-out rounds issued; the engagement counter the prefill test reads.
     runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
+    decoded: DecodedRows = .{},
 
     fn recordCalibration(self: *PrefetchPool, result: Calibration) void {
         self.calib = result;
         self.prefer_pool = plePrefillPrefetchArm(result.serial_ns, result.pool_ns);
     }
 
-    fn create() !*PrefetchPool {
+    fn create(dim: u32) !*PrefetchPool {
         const a = std.heap.page_allocator;
         const p = try a.create(PrefetchPool);
         p.* = .{};
+        // Allocation failure retains the old policy, rather than disabling cold reads.
+        const count = std.math.mul(usize, DecodedRows.CAPACITY, dim) catch 0;
+        if (count != 0) p.decoded.values = a.alloc(f32, count) catch &.{};
         var started: usize = 0;
         errdefer {
             p.shutdown(started);
+            a.free(p.decoded.values);
             a.destroy(p);
         }
         for (0..N) |i| {
@@ -675,6 +846,7 @@ const PrefetchPool = struct {
 
     fn destroy(self: *PrefetchPool) void {
         self.shutdown(N);
+        std.heap.page_allocator.free(self.decoded.values);
         std.heap.page_allocator.destroy(self);
     }
 
@@ -726,6 +898,18 @@ const PrefetchPool = struct {
         }
     }
 };
+
+/// Process-lifetime control, read only during table initialization, never per gather.
+fn pleRowCacheEnabled() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PLE_ROW_CACHE");
+    const v = raw == null or raw.?[0] != '0';
+    S.v = v;
+    return v;
+}
 
 fn plePrefetchEnabled() bool {
     const S = struct {
@@ -1375,6 +1559,158 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const after_refresh = pool.runs.load(.monotonic);
     t.gather(ids, got, 0);
     try testing.expectEqual(after_refresh + @as(u64, if (pool.prefer_pool) ROWS / PrefetchPool.MAX_ROWS else 0), pool.runs.load(.monotonic));
+}
+
+test "ngram benchmark controls preserve vectors and reject mislabeled pooled fallback" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeFixture(&td, .scale_nonunit);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+    defer table.close();
+    if (table.pool == null) table.pool = try PrefetchPool.create(table.dim);
+    var rows: [128]i64 = undefined;
+    for (&rows, 0..) |*r, i| r.* = @intCast(i % 6);
+    var serial: [128 * 32]f32 = undefined;
+    var pooled: [128 * 32]f32 = undefined;
+    for ([_]usize{ 16, 32, 64, 128 }) |n| {
+        const before = table.pool.?.runs.load(.monotonic);
+        try table.gatherForBenchmark(.serial, rows[0..n], serial[0 .. n * 32]);
+        try testing.expectEqual(before, table.pool.?.runs.load(.monotonic));
+        try table.gatherForBenchmark(.pooled, rows[0..n], pooled[0 .. n * 32]);
+        try testing.expectEqual(before + (n + 63) / 64, table.pool.?.runs.load(.monotonic));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial[0 .. n * 32]), std.mem.sliceAsBytes(pooled[0 .. n * 32]));
+    }
+    try testing.expectError(error.InvalidBenchmarkShape, table.gatherForBenchmark(.serial, &.{0}, &.{}));
+    try testing.expectError(error.InvalidBenchmarkRow, table.gatherForBenchmark(.pooled, &.{6}, pooled[0..32]));
+    var no_pool = table;
+    no_pool.pool = null;
+    try testing.expectError(error.BenchmarkPoolUnavailable, no_pool.gatherForBenchmark(.pooled, &.{0}, pooled[0..32]));
+    no_pool.gather(&.{0}, serial[0..32], 0);
+    try table.gatherForBenchmark(.serial, &.{0}, pooled[0..32]);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial[0..32]), std.mem.sliceAsBytes(pooled[0..32]));
+}
+
+test "ngram benchmark controls decoded reuse owns exact rows and evicts collisions" {
+    var cache: DecodedRows = .{};
+    cache.values = try testing.allocator.alloc(f32, DecodedRows.CAPACITY * 2);
+    defer testing.allocator.free(cache.values);
+    var value = [_]f32{ @bitCast(@as(u32, 0x80000000)), @bitCast(@as(u32, 0x7fc01234)) };
+    const expected = value;
+    var got: [2]f32 = undefined;
+    try testing.expect(!cache.get(0, &got));
+    cache.put(0, &value);
+    @memset(&value, 17);
+    try testing.expect(cache.get(0, &got));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&got));
+    @memset(&got, 23);
+    try testing.expect(cache.get(0, &got));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&got));
+    var colliding: [DecodedRows.WAYS + 1]i64 = undefined;
+    colliding[0] = 0;
+    var candidate: i64 = 1;
+    for (colliding[1..]) |*row_id| {
+        while (DecodedRows.set(candidate) != DecodedRows.set(0)) candidate += 1;
+        row_id.* = candidate;
+        candidate += 1;
+    }
+    for (colliding[1..DecodedRows.WAYS]) |row_id| cache.put(row_id, &value);
+    for (colliding[0..DecodedRows.WAYS]) |row_id| try testing.expect(cache.get(row_id, &got));
+    try testing.expectEqual(@as(u8, 0), cache.next[DecodedRows.set(0)]);
+    cache.put(colliding[1], &value); // duplicate must not evict or advance
+    try testing.expectEqual(@as(u8, 0), cache.next[DecodedRows.set(0)]);
+    cache.put(colliding[DecodedRows.WAYS], &value);
+    try testing.expect(!cache.get(0, &got)); // oldest slot, despite the earlier hit
+    for (colliding[1..]) |row_id| {
+        try testing.expect(cache.get(row_id, &got));
+        try testing.expectEqualSlices(f32, &value, &got);
+    }
+}
+
+test "ngram benchmark controls decoded cache holds every way of every set" {
+    var cache: DecodedRows = .{};
+    cache.values = try testing.allocator.alloc(f32, DecodedRows.CAPACITY);
+    defer testing.allocator.free(cache.values);
+    var counts: [DecodedRows.SETS]usize = @splat(0);
+    var keys: [DecodedRows.CAPACITY]i64 = undefined;
+    var remaining: usize = DecodedRows.CAPACITY;
+    var row_id: i64 = 0;
+    while (remaining != 0) : (row_id += 1) {
+        const group = DecodedRows.set(row_id);
+        if (counts[group] == DecodedRows.WAYS) continue;
+        keys[group * DecodedRows.WAYS + counts[group]] = row_id;
+        counts[group] += 1;
+        remaining -= 1;
+        cache.put(row_id, &.{@floatFromInt(row_id)});
+    }
+    for (keys) |key| {
+        var got: [1]f32 = undefined;
+        try testing.expect(cache.get(key, &got));
+        try testing.expectEqual(@as(f32, @floatFromInt(key)), got[0]);
+    }
+}
+
+test "ngram benchmark controls production reuse preserves affine and NVFP4 scales" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]bool{ false, true }) |nvfp4| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        if (nvfp4) try embedded_ple.writeNvfp4Fixture(&td) else try embedded_ple.writeFixture(&td, .scale_nonunit);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = if (nvfp4) 3 else 6, .dim = 32, .shards = if (nvfp4) 2 else 3 });
+        defer table.close();
+        // This regression exercises the enabled arm regardless of the process control.
+        if (table.pool) |p| p.destroy();
+        table.pool = null;
+        table.pool = try PrefetchPool.create(table.dim);
+        const p = table.pool.?;
+        try testing.expect(p.decoded.values.len != 0);
+        var got: [4 * 32]f32 = undefined;
+        var want: [4 * 32]f32 = undefined;
+        table.gather(&.{ 0, 1, 0, 1 }, &got, 0);
+        try table.gatherForBenchmark(.serial, &.{ 0, 1, 0, 1 }, &want);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        const before_mixed = p.runs.load(.monotonic);
+        table.gather(&.{ 2, 0, 2, 1 }, &got, 0); // hits plus duplicate misses
+        try testing.expectEqual(before_mixed + 1, p.runs.load(.monotonic));
+        try table.gatherForBenchmark(.serial, &.{ 2, 0, 2, 1 }, &want);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        const before = p.runs.load(.monotonic);
+        // Different order, duplicate rows, and overwritten caller memory must not alias.
+        @memset(&got, 999);
+        table.gather(&.{ 2, 0, 2, 1 }, &got, 999999);
+        try testing.expectEqual(before, p.runs.load(.monotonic));
+        try table.gatherForBenchmark(.serial, &.{ 2, 0, 2, 1 }, &want);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        table.gatherBaselineForBenchmark(&.{ 2, 0, 2, 1 }, &want, 0);
+        try testing.expectEqual(before + 1, p.runs.load(.monotonic));
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        table.resetDecodedCacheForBenchmark();
+        table.gather(&.{ 2, 0, 2, 1 }, &got, 0);
+        try testing.expectEqual(before + 2, p.runs.load(.monotonic));
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        // A freshly allocated no-cache pool must still read through real workers.
+        p.destroy();
+        table.pool = null;
+        table.pool = try PrefetchPool.create(0);
+        const uncached = table.pool.?;
+        try testing.expectEqual(@as(usize, 0), uncached.decoded.values.len);
+        for (0..2) |round| {
+            @memset(&got, 999);
+            table.gather(&.{ 2, 0, 2, 1 }, &got, 0);
+            const info = table.benchmarkPoolInfo();
+            try testing.expectEqual(@as(usize, PrefetchPool.N), info.threads);
+            try testing.expectEqual(@as(u64, @intCast(round + 1)), info.rounds);
+            try testing.expectEqual(@as(u64, 0), info.decoded_cache_hits);
+            try testing.expectEqual(@as(u64, 0), info.decoded_cache_misses);
+            try testing.expectEqual(@as(usize, 0), info.decoded_cache_capacity_rows);
+            try testing.expectEqual(@sizeOf(DecodedRows), info.decoded_cache_bytes);
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        }
+    }
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {

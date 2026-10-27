@@ -341,15 +341,20 @@ const K1P_SOURCE =
     \\}
 ;
 
-// Row t restarts from its parent's state unless the parent is row t - 1.
-const K1TR_SOURCE =
+// Both variants share every arithmetic operation and per-token state rounding.
+// A host-proven chain needs neither saved restart states nor parent reads.
+fn treeRecurSource(comptime linear: bool) [:0]const u8 {
+    return
     \\constexpr int GRP = HV / HK;
     \\uint lane = thread_index_in_simdgroup;
     \\uint dv = thread_position_in_grid.y;
     \\uint hv = thread_position_in_grid.z;
     \\uint hk = hv / GRP;
     \\float st[4];
-    \\float kept[TL][4];
+    ++ (if (linear) "" else
+        \\float kept[TL][4];
+        \\
+    ) ++
     \\uint base = (hv * DV + dv) * DK + lane * 4;
     \\for (int i = 0; i < 4; ++i) st[i] = float(state_in[base + i]);
     \\// Row t + 1's inputs load while row t reduces.
@@ -364,8 +369,11 @@ const K1TR_SOURCE =
     \\    gn = pg[((t + 1) * HV + hv) * 2]; bn = pg[((t + 1) * HV + hv) * 2 + 1];
     \\    vn = pv[((t + 1) * HV + hv) * DV + dv];
     \\  }
-    \\  const int p = parents[t];
-    \\  if (t > 0 && p != t - 1) for (int i = 0; i < 4; ++i) st[i] = kept[p][i];
+    ++ (if (linear) "" else
+        \\  const int p = parents[t];
+        \\  if (t > 0 && p != t - 1) for (int i = 0; i < 4; ++i) st[i] = kept[p][i];
+        \\
+    ) ++
     \\  float kv_mem = 0.0f;
     \\  for (int i = 0; i < 4; ++i) { st[i] = st[i] * g; kv_mem += st[i] * kk[i]; }
     \\  kv_mem = simd_sum(kv_mem);
@@ -376,9 +384,13 @@ const K1TR_SOURCE =
     \\  if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
     \\  // The next token reads the state serial decoding stored (StT), not the f32.
     \\  for (int i = 0; i < 4; ++i) st[i] = float(static_cast<StT>(st[i]));
-    \\  if (parents[5 * TL + t] != 0) for (int i = 0; i < 4; ++i) kept[t][i] = st[i];
+    ++ (if (linear) "" else
+        \\  if (parents[5 * TL + t] != 0) for (int i = 0; i < 4; ++i) kept[t][i] = st[i];
+        \\
+    ) ++
     \\}
 ;
+}
 
 // The recurrence along `path` (window rows, oldest first) from the round's
 // input state, the tree kernel's ops and per-token rounding: the state serial
@@ -670,7 +682,9 @@ pub const Joined = struct { all: mlx.mlx_array, a_off: c_int, b_off: c_int };
 pub const RecurTree = struct { y: mlx.mlx_array, conv_input: mlx.mlx_array, prework: Prework };
 
 var k1p_cache: ?mlx.mlx_fast_metal_kernel = null;
-var k1tr_cache: ?mlx.mlx_fast_metal_kernel = null;
+var k1tr_cache: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
+var chain_engaged = false;
+// Both kernel variants consume the same immutable launch/output configuration.
 var tree_cfgs: [MAX_SEQ + 1]?[2]mlx.mlx_fast_metal_kernel_config = @splat(null);
 const TreeKey = struct { k: CfgKey, cols: [4]c_int };
 var tree_cfg_key: ?TreeKey = null;
@@ -706,8 +720,9 @@ fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dt
 /// the last row of a chain over its own path), the conv input [1,3+T,C] the
 /// commit slices, and the per-row recurrence inputs `replay` reads. The
 /// states stay where they were: the commit replays the kept path. `joined`,
-/// when in.qkv/a/b are slices of it, is read in place.
-pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: mlx.mlx_array, s: mlx.mlx_stream) !?RecurTree {
+/// when in.qkv/a/b are slices of it, is read in place. `linear` must only be
+/// true when the host has proven parents[t] == t - 1 for every row.
+pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: mlx.mlx_array, linear: bool, s: mlx.mlx_stream) !?RecurTree {
     if (!mlx.streamIsGpu(s)) return null;
     const key = seqDtypes(g, t_len, in) orelse return null;
     if (!sizeIs(table, 6 * t_len)) return null;
@@ -721,7 +736,11 @@ pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: 
         srcs = .{ j.all, j.all, j.all };
     }
     if (k1p_cache == null) k1p_cache = try makeKernel("msv_gdn_decode_tree_pre", &.{ "qkv", "a_in", "b_in", "conv_state", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "parents" }, &.{ "pq", "pk", "pv", "pg", "conv_in" }, K1P_SOURCE, HEADER);
-    if (k1tr_cache == null) k1tr_cache = try makeKernel("msv_gdn_decode_tree", &.{ "pq", "pk", "pv", "pg", "state_in", "parents" }, &.{"y"}, K1TR_SOURCE, "");
+    const mode: usize = @intFromBool(linear);
+    if (k1tr_cache[mode] == null) k1tr_cache[mode] = if (linear)
+        try makeKernel("msv_gdn_decode_tree_chain", &.{ "pq", "pk", "pv", "pg", "state_in", "parents" }, &.{"y"}, treeRecurSource(true).ptr, "")
+    else
+        try makeKernel("msv_gdn_decode_tree", &.{ "pq", "pk", "pv", "pg", "state_in", "parents" }, &.{"y"}, treeRecurSource(false).ptr, "");
     const tkey = TreeKey{ .k = key, .cols = cols };
     if (tree_cfg_key == null or !std.meta.eql(tree_cfg_key.?, tkey)) {
         for (&tree_cfgs) |*slot| if (slot.*) |cs| {
@@ -754,10 +773,40 @@ pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: 
     defer _ = mlx.mlx_vector_array_free(v2);
     var o2 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o2);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k1tr_cache.?, v2, cfgs[1], s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k1tr_cache[mode].?, v2, cfgs[1], s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, o2, 0));
+    if (linear and t_len > 1 and !chain_engaged) {
+        chain_engaged = true;
+        log.info("[gdn-chain] no-restart recurrence engaged: rows={d} Hk={d} Hv={d} state={s}\n", .{ t_len, g.hk, g.hv, @tagName(key.st) });
+    }
     return .{ .y = y, .conv_input = pre[4], .prework = .{ .k = pre[1], .v = pre[2], .gb = pre[3] } };
+}
+
+/// Host-only proof for the no-restart recurrence specialization; empty is not a chain.
+pub fn linearParents(parents: []const i32) bool {
+    if (parents.len == 0) return false;
+    for (parents, 0..) |p, t| {
+        if (p != @as(i32, @intCast(t)) - 1) return false;
+    }
+    return true;
+}
+
+test "lookup linearParents: only rooted consecutive chains skip restarts" {
+    var parents: [MAX_SEQ]i32 = undefined;
+    for (&parents, 0..) |*p, t| p.* = @as(i32, @intCast(t)) - 1;
+    for ([_]usize{ 1, 2, 8, 9, 15, 16 }) |w| {
+        try std.testing.expect(linearParents(parents[0..w]));
+        // Changing any parent, including the root, must disable specialization.
+        for (0..w) |t| {
+            const saved = parents[t];
+            parents[t] = if (t == 0) 0 else -1;
+            try std.testing.expect(!linearParents(parents[0..w]));
+            parents[t] = saved;
+        }
+    }
+    try std.testing.expect(!linearParents(&.{}));
+    try std.testing.expect(!linearParents(&.{ -1, 0, 0 }));
 }
 
 /// `recurTree`'s table for rows with `parents` (-1 = the root): the parents,

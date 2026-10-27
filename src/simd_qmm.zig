@@ -391,7 +391,9 @@ const PREP =
 
 /// `frag` is `mma` over inputs `prep` wrote once; only 2..FRAGMENT_ROWS rows take it.
 const Kind = enum { scalar, rows, mma, frag, prep };
-pub const FRAGMENT_ROWS = 8;
+// PREP stores ceil(R / 8) tiles; MMA_FRAG addresses rb / 8 + rt, with
+// identical last-row padding and group reduction order to direct MMA.
+pub const FRAGMENT_ROWS = 16;
 /// Widest window `rows` serves: past it `mma` is cheaper. At 6 and 8 bits
 /// `mma` is cheaper from two rows.
 pub const SCALAR_ROWS_MAX = 3;
@@ -855,7 +857,7 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
     };
 }
 
-test "simd_qmm: reading pre-scaled input fragments gives the direct mma's bits at 2..8 rows and 4, 6 and 8 bits" {
+test "simd_qmm: lookup pre-scaled fragments give direct mma bits at 2..16 rows including partial tiles and 4, 6 and 8 bits" {
     const s = mlx.gpuStream();
     errdefer {
         var buf: [512]u8 = undefined;
@@ -888,3 +890,4 @@ test "simd_qmm: reading pre-scaled input fragments gives the direct mma's bits a
         }
     };
 }
+

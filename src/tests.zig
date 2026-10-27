@@ -26,6 +26,11 @@ test {
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("mtp_replay_test.zig");
     _ = @import("mtp_lookup.zig");
+    _ = @import("token_history.zig");
+    _ = @import("speculation_policy.zig");
+    _ = @import("lookup_adapter.zig");
+    _ = @import("lookup_counterfactual.zig");
+    _ = @import("lookup_validation_tests.zig");
     _ = @import("server.zig");
     _ = @import("generation_settings.zig");
     _ = @import("model.zig");

@@ -1,0 +1,21 @@
+{
+  "purpose": "Unseen similar requests sharing reusable output spans; no evaluated answer may enter training history.",
+  "request_contract": {"endpoint": "chat", "temperature": 0, "seed": 0, "enable_thinking": false, "reasoning_effort": "none", "max_tokens": 192},
+  "system": "Follow the requested output format exactly. Do not include reasoning, explanations, or Markdown fences.",
+  "training": [
+    {"id": "train-config-a", "kind": "config", "name": "catalog", "port": 8101, "log_level": "info", "health_path": "/health"},
+    {"id": "train-config-b", "kind": "config", "name": "billing", "port": 8102, "log_level": "info", "health_path": "/health"},
+    {"id": "train-code-a", "kind": "code", "function": "load_catalog", "fallback": "{}"},
+    {"id": "train-code-b", "kind": "code", "function": "load_billing", "fallback": "{}"}
+  ],
+  "evaluation": [
+    {"id": "related-config", "kind": "config", "name": "inventory", "port": 8201, "log_level": "info", "health_path": "/health"},
+    {"id": "conflicting-config", "kind": "config", "name": "returns", "port": 8202, "log_level": "error", "health_path": "/ready"},
+    {"id": "related-code", "kind": "code", "function": "load_inventory", "fallback": "None"},
+    {"id": "unrelated-prose", "kind": "miss", "prompt": "Explain the difference between tidal locking and orbital resonance in four concise sentences. Use no examples involving software or configuration files."}
+  ],
+  "config_prompt": "Return a JSON service configuration. The service field must be exactly the literal string \"NAME\", without a prefix or suffix. Use port PORT. Use exactly these fields in this order: service (\"NAME\"); server (an object with host 127.0.0.1, port PORT, protocol http); logging (an object with level LEVEL and format json); health (an object with path PATH, interval_seconds 30, timeout_seconds 5); retry (an object with attempts 3 and backoff_seconds 2). Output only the JSON object.",
+  "code_prompt": "Write a complete Python function FUNCTION(path). Import json. Open the path as UTF-8 and parse its JSON. Return the parsed value only if it is a dictionary. Return FALLBACK for a missing file, invalid JSON, or a non-dictionary value. Use a with statement and catch FileNotFoundError and json.JSONDecodeError. Output only Python source, without Markdown fences.",
+  "validation": ["all train/eval rendered request hashes distinct", "seed from completed training requests only, preserve exact published IDs and tokenizer identity", "freeze history before any evaluation request; clone per boot; store writes disabled during evaluation; hash unchanged", "JSON outputs parse and exactly match declared fields/values, including conflict changes", "code outputs parse as Python with required function name; do not execute model-generated code without review", "evaluate target-token, HTTP text, usage and finish equality across arms; identify truncation separately, reject truncated structured outputs", "positive accepted external-origin lower bound plus shared generated-token span evidence where attribution is provable", "report unrelated control by actual origin selection, not assumed cache miss", "keep first exposure separate from repetitions", "same target, output limits, thinking disabled, fresh model-owned learning state, balanced arm order, actual MTP/DFlash engagement", "one bounded window <=290 seconds including cleanup; preserve partial evidence; no automatic chained sweeps"],
+  "benchmark": {"default_family": "mtp", "default_arms": ["legacy", "persistent"], "pairs": 2, "warmup_per_case": 1, "timed_per_case": 1, "comparison_scope": "matched end-to-end request latency, not canonical throughput"}
+}

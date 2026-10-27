@@ -21,6 +21,8 @@ The focused branches descend from upstream `refactor/big-bang` at `9d5cfc73b5c01
 
 Existing **fork draft PR**, against the older `main` layout: <https://github.com/jasontitus/mlx-serve/pull/9>. It is a research/review entry point, not the patch to apply to Sushi. No focused refactor PR has been submitted upstream yet.
 
+Upstream has since merged the refactor into `main` at `d0a51ca8b1deedb65e71daef56f692bc246bddaa`; `refactor/big-bang` is no longer advertised. Local current-main ports are prepared as `feature/token-history-main` (`12016e26`), `feature/speculation-economics-main` (`8a13b088`) and `feature/decoded-ple-main` (`cbaee97b`). These are **not yet built, runtime-verified or published**. The running benchmark still uses the frozen refactor binaries above; its measurements must not be relabeled as current-main results. Use the published, verified source snapshots until the current-main ports pass their own checks.
+
 Read [the architecture and porting write-up](lookup-staircut-port.md), especially “Sushi HEAD compatibility,” “Adapter-boundary correctness” and “Upstream refactor submission boundary.” [The results ledger](lookup-staircut-results.md) retains favorable results, regressions and qualification failures.
 
 ## Mechanisms and preferred order

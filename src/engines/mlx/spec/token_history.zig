@@ -698,7 +698,7 @@ fn writeTokens(file: File, io: Io, ids: []const u32, start: u64) !void {
     var buffer: [4096]u8 = undefined;
     var cursor: usize = 0;
     while (cursor < ids.len) {
-        const count = @min(buffer.len / 4, ids.len - cursor);
+        const count: usize = @min(buffer.len / 4, ids.len - cursor);
         for (ids[cursor..][0..count], 0..) |token, i| std.mem.writeInt(u32, buffer[i * 4..][0..4], token, .little);
         try file.writePositionalAll(io, buffer[0 .. count * 4], start + cursor * 4);
         cursor += count;

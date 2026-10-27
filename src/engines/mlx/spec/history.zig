@@ -44,6 +44,12 @@ pub const Request = struct {
     queried: bool = false,
     rounds: u32 = 0,
     accepted: u32 = 0,
+    queries: u32 = 0,
+    suffix_matches: u32 = 0,
+    max_suffix: u32 = 0,
+    admission_checks: u32 = 0,
+    admitted_checks: u32 = 0,
+    floor_rejections: u32 = 0,
 
     pub fn init(gen: *Generator, allocator: std.mem.Allocator) !Request {
         const identity = gen.tok.content_sha256 orelse return error.TokenizerRequired;
@@ -74,7 +80,7 @@ pub const Request = struct {
     /// Cache only the immutable candidate, never the changing admission gate.
     /// A lazy successor probe and its build can ask the same question twice.
     pub fn match(self: *Request, committed: []const u32, t1: u32, cap: u32) !?lookup.Match {
-        const n = @min(committed.len, tokens.max_order - 1);
+        const n: usize = @min(committed.len, tokens.max_order - 1);
         var query: [tokens.max_order]u32 = undefined;
         @memcpy(query[0..n], committed[committed.len - n ..]);
         query[n] = t1;
@@ -87,6 +93,9 @@ pub const Request = struct {
             self.query_len = length;
             self.query_cap = cap;
             self.matched_order = got.order;
+            self.queries += 1;
+            if (got.order >= lookup.MIN_SUFFIX and self.output.items.len != 0) self.suffix_matches += 1;
+            self.max_suffix = @max(self.max_suffix, got.order);
             self.queried = true;
         }
         if (self.output.items.len == 0) return null;
@@ -106,7 +115,10 @@ pub fn match(gen: *Generator, allocator: std.mem.Allocator, committed: []const u
 }
 
 pub fn logStats(gen: *const Generator) void {
-    if (gen.external_history) |request| log.info("[history] external_rounds={d} accepted_drafts={d}\n", .{ request.rounds, request.accepted });
+    if (gen.external_history) |request| log.info("[history] external_rounds={d} accepted_drafts={d} queries={d} suffix_matches={d} max_suffix={d} admission_checks={d} admitted_checks={d} floor_rejections={d}\n", .{
+        request.rounds, request.accepted, request.queries, request.suffix_matches,
+        request.max_suffix, request.admission_checks, request.admitted_checks, request.floor_rejections,
+    });
 }
 
 /// Called only at a terminal slot boundary, never a retry's generator teardown.
@@ -131,4 +143,22 @@ pub fn publish(slot: anytype, outcome: @import("history_publication.zig").Outcom
         return;
     };
     log.info("[history] published prompt_tokens={d} output_tokens={d} outcome={s}\n", .{ slot.full_prompt.len, ids.len, @tagName(outcome) });
+}
+
+test "external history query retains maximum suffix and invalidates changed context" {
+    const a = std.testing.allocator;
+    var ids: [100]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
+    var corpus = try tokens.Corpus.build(a, &ids, tokens.max_order);
+    defer corpus.deinit();
+    var request = Request{ .allocator = a, .drafter = tokens.Drafter.init(a) };
+    defer request.deinit();
+    request.drafter.corpus = &corpus;
+    for ([_]usize{ 62, 63, 64, 90 }) |n| {
+        const matched = (try request.match(ids[0..n], ids[n], 7)) orelse return error.MissingContinuation;
+        try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..7], matched.draft);
+        try std.testing.expectEqual(@as(u32, @intCast(@min(n + 1, tokens.max_order))), matched.suffix);
+        const repeated = (try request.match(ids[0..n], ids[n], 3)) orelse return error.MissingShortContinuation;
+        try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..3], repeated.draft);
+    }
 }

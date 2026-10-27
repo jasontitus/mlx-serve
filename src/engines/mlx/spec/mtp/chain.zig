@@ -344,6 +344,10 @@ fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRound
     if (remaining == 0 or idx.toks.items.len + 1 < mtp_lookup.MIN_SUFFIX) return null;
     const got = try @import("../history.zig").match(self, allocator, idx.toks.items, t1, lookup_cap) orelse return null;
     const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
+    if (self.external_history) |request| {
+        request.admission_checks += 1;
+        if (k > 0) request.admitted_checks += 1;
+    }
     return if (k > 0) .{ .match = got, .drafts = k, .external = true } else null;
 }
 
@@ -356,7 +360,12 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     const proposal = try lookupProposal(self, allocator, plan, t1) orelse return null;
     const k = proposal.drafts;
     const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
-    if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
+    if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) {
+        if (proposal.external) if (self.external_history) |request| {
+            request.floor_rejections += 1;
+        };
+        return null;
+    }
     const got = proposal.match;
     const Once = struct {
         var logged = false;

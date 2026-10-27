@@ -12,7 +12,7 @@ Repository: <https://github.com/jasontitus/mlx-serve>.
 
 | Source | Revision / branch | Use |
 |---|---|---|
-| Focused cross-request history | `72419820`, `feature/token-history-refactor` | Preferred storage/ownership/publication design; real MTP integration on the refactored engine. |
+| Focused cross-request history | `8f2278b2`, `feature/token-history-refactor` | Preferred storage/ownership/publication design; includes the maximum-order query fix and permanent HTTP overlap regression. |
 | Focused decoded learned-embedding cache | `ac7861b0`, `feature/decoded-ple-refactor` | Preferred narrow host-gather cache and TensorFold affine shard-name compatibility. |
 | Independent economics and DFlash research implementation | `27e70fbc6cffab3cc753bf3754dcfe8edc9d1ddb`, `feature/independent-speculative-lookup` | Own StairCut policy, candidate adapters, native-incumbent preservation, matched-scope pricing and diagnostic contracts. Older engine layout; not a mechanical patch. |
 
@@ -82,11 +82,12 @@ The inspected Sushi had a Flash-Next chain-width policy and separate GLM tree/co
 
 ## Evidence available now — not Sushi claims
 
-- Focused history: 154 passed / four skipped / zero failed in the history-filtered suite; actual plugin MTP tests cover ownership, gates, zero/partial/full verification and native recovery. Real Qwen3.8-27B HTTP overlap preserved all three documents with output matching the streams and no `StoreBusy` warning.
+- Focused history: the corrected long-context coding diagnostic executes 43 external rounds with 456 accepted drafts across eight source-valid responses. The permanent HTTP regression preserves all three documents when overlapping requests finish B before A. These establish operation, not matched timing or task-semantic correctness.
 - Focused PLE: embedded suite 67 passed / one skipped; real Flash-Next off/on smoke emitted identical text and 59-token counts, with cache hits observed. This is operation/parity evidence, not a performance comparison or token-ID equivalence proof.
 - Older combined coding cohort: MTP +28.31%, DFlash2 +6.13% throughput overall; favorable immediate repeats, first-exposure regressions, and failed swap qualification. These are neither isolated history gains nor Sushi predictions.
 - Older PLE full-decode comparison: +0.28%, interval -0.34% to +0.98%; no established end-to-end win. StairCut has promising isolated measurements but no qualified universal or additive gain.
-- Full refactor-suite verification remains pending. The untouched baseline exposed an EXL3 hardware-eligibility test issue and a confirmed recurrent-fixture teardown use-after-free; targeted repairs are being checked separately.
+- The history validation worktree reports 4,516 passed / 448 skipped / zero failed from the full `zig build test`. It includes separate, still-uncommitted baseline fixture repairs: EXL3 hardware eligibility, recurrent-state teardown lifetime, and a GGUF tokenizer test mutating a constant object. Do not attribute this full-suite result to the published history commit alone.
+- Use the updated history revision: at `72419820`, Zig 0.17 inferred the capped query-tail length as `u6`, so adding the pending token wrapped 63 + 1 to zero in ReleaseFast. The fix explicitly widens the arithmetic and tests queries below, at and beyond the 64-token boundary. The same correction is applied to the in-progress DFlash query assembly.
 
 ## Attribution and source boundary
 

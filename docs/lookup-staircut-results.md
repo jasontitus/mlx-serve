@@ -1310,3 +1310,28 @@ These are observed results on the old main-based v31 implementation, not qualifi
 DFlash native boot 08 completed. Feature boot 09 finished its client successfully with no client-stage errors and produced a valid 35-document, 110,435-token history. However, one overlapping request logged **`[lookup] persistent store unavailable: StoreBusy`**. The predeclared history-availability gate therefore marked that boot failed and stopped the campaign; boots 10–15 were not run. No balanced DFlash standard-suite claim is available. Retain this failed cohort without replacing, resuming or relabeling it.
 
 Adversarial port review traced two incompatible overlap assumptions in the old implementation: a writable request retains an exclusive store lock throughout generation, and cached leases allow only one active borrower. The refactor port must use shared immutable request snapshots and short terminal append transactions against the current durable log. Appending an old request snapshot would lose another request's completed document; simply suppressing `StoreBusy` would hide missing history. The new baseline also permits preserving stock MTP numerical/head routing while adding external candidate sources, rather than carrying the global row-exact/cap-2 configuration responsible for additional cold and batching costs.
+
+## Refactor history: maximum-order query correction and full-suite recovery
+
+The focused history branch is now `8f2278b2`. In `Request.match`, Zig 0.17 inferred `@min(committed.len, 63)` as `u6`; adding the pending token wrapped the query length from 64 to zero in ReleaseFast. Runtime diagnostics showed 20–52 match calls but only one actual query per request, with no matches. A direct compiler reproduction printed `n_type=u6 count_type=u6 n=63 count=0`; the new production-method regression failed before the fix. Explicit `usize` arithmetic fixes the query. The independently ported DFlash assembly receives the same correction.
+
+The unchanged eight-case coding diagnostic then passed its source-quality and engagement checks, using stock native MTP and eight prefix-cache entries. No future answers were seeded; each request could learn only from earlier requests:
+
+| Request | Output tokens | External rounds | Accepted external drafts |
+|---|---:|---:|---:|
+| First catalog helper | 144 | 0 | 0 |
+| Similar billing helper | 144 | 10 | 123 |
+| Unrelated interval function | 218 | 0 | 0 |
+| Related inventory helper | 182 | 5 | 22 |
+| Related semantic edit | 196 | 1 | 1 |
+| Related completion | 116 | 4 | 7 |
+| Repeated catalog helper | 144 | 10 | 134 |
+| Repeated inventory helper | 182 | 13 | 169 |
+
+This is mechanism evidence, **not a speedup estimate**. The diagnostic had no native timing arm, and compilation overlapped the investigation. Syntax, requested-function presence and preserved helpers were checked; task semantics were not executed. The two repeated prompts also reused 89/120 and 95/126 prefix tokens, respectively: history engagement was additional to enabled prefix caching.
+
+The permanent `tests/test_token_history.py` HTTP regression passed on the corrected binary. It verifies a seed document plus overlapping requests finishing B before A, exact prompt prefixes, emitted output counts and detokenized stream equality, with no `StoreBusy` or publication warnings. Artifacts: `runs/refactor-history-coding-diagnostic-v4` and `runs/refactor-history-http-v2` under the private benchmark directory. Failed diagnostics v1–v3 remain unchanged.
+
+The history validation worktree's complete `zig build test -Doptimize=ReleaseFast --summary all` reported **33/33 steps succeeded, 4,516 tests passed, 448 skipped, zero failed**. This tree also includes separate baseline fixture repairs not included in `8f2278b2`: EXL3 hardware-eligibility gating, dropping recurrent group references before freeing their fixture lanes, and replacing const-cast mutation of a GGUF tokenizer fixture with mutable storage. The last issue caused the previously missing shard: ordered protocol execution reached test 420 and timed out in `appendDerivedMerges`; a process sample captured that stack. The full suite completes after the fixture repair. Do not claim the published feature commit alone has that full-suite result.
+
+A bounded CPU setup probe at the full 1,048,616-byte history log measured 291.796 microseconds for initialization plus cached acquisition versus 38.180 microseconds for cached acquisition alone, with 400 calls per arm in ABBA/BAAB order. The redundant validation costs approximately 0.254 milliseconds per request on this run; it is not the main cause of the missing speedup and has not been removed. No GPU throughput claim follows from this microbenchmark.

@@ -1335,3 +1335,26 @@ The permanent `tests/test_token_history.py` HTTP regression passed on the correc
 The history validation worktree's complete `zig build test -Doptimize=ReleaseFast --summary all` reported **33/33 steps succeeded, 4,516 tests passed, 448 skipped, zero failed**. This tree also includes separate baseline fixture repairs not included in `8f2278b2`: EXL3 hardware-eligibility gating, dropping recurrent group references before freeing their fixture lanes, and replacing const-cast mutation of a GGUF tokenizer fixture with mutable storage. The last issue caused the previously missing shard: ordered protocol execution reached test 420 and timed out in `appendDerivedMerges`; a process sample captured that stack. The full suite completes after the fixture repair. Do not claim the published feature commit alone has that full-suite result.
 
 A bounded CPU setup probe at the full 1,048,616-byte history log measured 291.796 microseconds for initialization plus cached acquisition versus 38.180 microseconds for cached acquisition alone, with 400 calls per arm in ABBA/BAAB order. The redundant validation costs approximately 0.254 milliseconds per request on this run; it is not the main cause of the missing speedup and has not been removed. No GPU throughput claim follows from this microbenchmark.
+
+## Refactor history: completed coding ABBA/BAAB comparison
+
+`runs/refactor-history-coding-abba-v1` completed all eight boots and 64 requests on Qwen3.8-27B. Both arms use the same history-port binary, stock native MTP, and eight prefix-cache entries. A disables external history; every B boot starts with an empty writable store. No StairCut controller, DFlash2 changes or decoded-PLE cache participates in this comparison. Client request time includes terminal publication but excludes model boot.
+
+| Workload group | Request-time reduction | Inverse-latency gain |
+|---|---:|---:|
+| Entire eight-request sequence | 8.41% | 9.19% |
+| First two chronological requests | 22.79% | 29.52% |
+| Four unseen/related evaluation requests | −13.72% | −12.07% |
+| Two repeated requests | 50.15% | 100.61% |
+
+Each estimate is the geometric mean of two quartet mean(B)/mean(A) ratios; no confidence interval or significance claim is made. Both quartets improved overall (7.33% and 9.48% shorter), and both regressed on the four evaluation requests (16.50% and 11.01% longer). The first-two-request group is **not wholly cache-cold**: the second request can reuse the first turn. The evaluation group is unseen-at-entry but online learning continues; it is not a frozen-history transfer experiment.
+
+Across four boots per arm, A took 244.344 client-request seconds for 5,311 output tokens; B took 223.636 seconds for 5,314 tokens. B executed 172 external rounds and accepted 1,759 external draft tokens. Related inventory, edit and completion requests accepted 79, 4 and 28 external drafts respectively yet regressed; accepted-token counts alone do not establish a worthwhile candidate. The first catalog request and unrelated interval request accepted none and showed 2.48% and 4.68% inverse-latency regressions.
+
+All responses pass the declared source checks. A separate static review of every distinct text found the interval function omitted requested type annotations in **both** arms (4/4 each); no differing functional defect was found by inspection. This is neither an executed semantic pass rate nor proof of complete task adherence. The original source-only quality result is retained, not reclassified.
+
+**Qualification:** the campaign was explicitly declared contended/unknown-isolation. Telemetry also rejected whole-campaign changes in swap usage and swap-ins; individual request telemetry reported no errors. These are observed same-session performance differences, not an isolated causal or universal speedup claim. Do not discard the regressing cases or retroactively relax the gates.
+
+**Incremental costs:** B stored 9,956–9,960 logical bytes and 12,288 allocated bytes per boot. Mean post-request sampled RSS maxima were 8,468.254 MiB for A and 8,470.906 MiB for B, an observed difference of 2.652 MiB. This is not peak unified-memory measurement or an exact attribution of allocator overhead. No extra model weights were needed.
+
+Adversarial benchmark review corrected future runners to check effective server configuration before timing, explicitly gate performance qualification on declared GPU isolation, and allowlist recorded environment values. Four earlier private diagnostic launch files had inherited environment fields removed with a redaction annotation; request measurements were unchanged.

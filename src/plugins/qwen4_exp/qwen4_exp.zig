@@ -15,6 +15,7 @@ const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const log = @import("../../sdk/util/log.zig");
+const env = @import("../../env.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("ple_table.zig");
 pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
@@ -230,7 +231,7 @@ pub const NgramTable = struct {
             .embedded = ptr,
             .fmt = ptr.fmt,
         };
-        table.pool = PrefetchPool.create() catch null;
+        table.initPool();
         return table;
     }
 
@@ -258,8 +259,25 @@ pub const NgramTable = struct {
         if (hlen > size - 8) return error.NgramTableTruncated;
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
-        t.pool = PrefetchPool.create() catch null;
+        t.initPool();
         return t;
+    }
+
+    fn initPool(self: *NgramTable) void {
+        self.pool = PrefetchPool.create(self.decodedCacheDim()) catch null;
+        log.info("[qwen4] PLE row cache: metadata_bytes={d} payload_bytes={d} pool_threads={d}\n", .{
+            if (self.pool != null) @sizeOf(DecodedRows) else @as(usize, 0),
+            if (self.pool) |p| p.decoded.values.len * @sizeOf(f32) else 0,
+            if (self.pool != null) PrefetchPool.N else @as(usize, 0),
+        });
+    }
+
+    /// The cache-only switch leaves workers, calibration and warming unchanged.
+    fn decodedCacheDim(self: *const NgramTable) u32 {
+        if (env.get(.MLX_SERVE_PLE_ROW_CACHE)) |raw| if (raw[0] == '0') return 0;
+        if (self.bits == 16) return 0;
+        const need = @as(usize, self.wcols) * 4 + @as(usize, self.scols) * embedded_ple.scaleBytes(self.fmt) * 2;
+        return if (need <= PrefetchPool.ROW_BUF) self.dim else 0;
     }
 
     /// Widths `mx.quantize` packs and `dequantRow` unpacks, plus 16 = raw
@@ -372,7 +390,12 @@ pub const NgramTable = struct {
         }
         warmBytes().live_warm_bytes.store(0, .release);
         warmBytes().live_warm_total.store(0, .release);
-        if (self.pool) |p| p.destroy();
+        if (self.pool) |p| {
+            log.info("[qwen4] PLE row cache final: hits={d} misses={d} pool_rounds={d}\n", .{
+                p.decoded.hits, p.decoded.misses, p.runs.load(.monotonic),
+            });
+            p.destroy();
+        }
         self.pool = null;
         if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
@@ -450,6 +473,33 @@ pub const NgramTable = struct {
                 const b = &p.bufs[i - start];
                 self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], out[i * self.dim ..][0..self.dim]);
             }
+        }
+        return true;
+    }
+
+    /// Narrow gathers copy every hit before a colliding miss can replace its slot.
+    fn gatherCached(self: *const NgramTable, p: *PrefetchPool, row_ids: []const i64, out: []f32) bool {
+        std.debug.assert(row_ids.len <= PrefetchPool.MAX_ROWS);
+        var missing: [PrefetchPool.MAX_ROWS]i64 = undefined;
+        var positions: [PrefetchPool.MAX_ROWS]usize = undefined;
+        var count: usize = 0;
+        for (row_ids, 0..) |r, i| {
+            const dst = out[i * self.dim ..][0..self.dim];
+            if (!p.decoded.get(r, dst)) {
+                missing[count] = r;
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        if (count == 0) return true;
+        if (!p.run(self, missing[0..count])) return false;
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
+        for (missing[0..count], positions[0..count], 0..) |r, i, j| {
+            const b = &p.bufs[j];
+            const dst = out[i * self.dim ..][0..self.dim];
+            self.dequantRow(b[0..wl], b[wl .. wl + sl], b[wl + sl .. wl + 2 * sl], dst);
+            p.decoded.put(r, dst);
         }
         return true;
     }
@@ -575,7 +625,9 @@ pub const NgramTable = struct {
         const pooled = wide_ok and self.pool != null and readable and need <= PrefetchPool.ROW_BUF;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, prefer_pool);
         if (self.pool) |p| if (readable and need <= PrefetchPool.ROW_BUF and wide_ok) {
-            if (self.gatherPooled(p, row_ids, out)) return;
+            if (!wide and p.decoded.values.len != 0) {
+                if (self.gatherCached(p, row_ids, out)) return;
+            } else if (self.gatherPooled(p, row_ids, out)) return;
         };
         self.gatherSerial(row_ids, out);
     }
@@ -620,6 +672,61 @@ fn dequantNvfp4Row(codes: []const u8, scales: []const u8, global: f32, out: []f3
     }
 }
 
+/// Table-owned exact rows, used only by the inference thread; no caller or mmap borrows.
+/// Immutable rows need no request/KV invalidation. Payload: 1024 * dim * 4 bytes.
+/// Metadata: 8192 key + 256 replacement + 16 slice + 16 counter bytes on 64-bit hosts.
+const DecodedRows = struct {
+    const SETS = 256;
+    const WAYS = 4;
+    const CAPACITY = SETS * WAYS;
+    keys: [CAPACITY]i64 = @splat(-1),
+    next: [SETS]u8 = @splat(0),
+    values: []f32 = &.{},
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    fn init(a: std.mem.Allocator, dim: u32) DecodedRows {
+        const count = std.math.mul(usize, CAPACITY, dim) catch 0;
+        return .{ .values = if (count == 0) &.{} else a.alloc(f32, count) catch &.{} };
+    }
+
+    fn set(row_id: i64) usize {
+        const mixed = @as(u64, @intCast(row_id)) *% 0x9e3779b97f4a7c15;
+        return @intCast(mixed >> 56);
+    }
+
+    fn get(self: *DecodedRows, row_id: i64, out: []f32) bool {
+        const base = set(row_id) * WAYS;
+        inline for (0..WAYS) |way| {
+            const index = base + way;
+            if (self.keys[index] == row_id) {
+                @memcpy(out, self.values[index * out.len ..][0..out.len]);
+                self.hits += 1;
+                return true;
+            }
+        }
+        self.misses += 1;
+        return false;
+    }
+
+    fn put(self: *DecodedRows, row_id: i64, value: []const f32) void {
+        const group = set(row_id);
+        const base = group * WAYS;
+        // Duplicate misses refresh a slot without consuming another way.
+        inline for (0..WAYS) |way| {
+            const index = base + way;
+            if (self.keys[index] == row_id) {
+                @memcpy(self.values[index * value.len ..][0..value.len], value);
+                return;
+            }
+        }
+        const index = base + self.next[group];
+        @memcpy(self.values[index * value.len ..][0..value.len], value);
+        self.keys[index] = row_id;
+        self.next[group] = (self.next[group] + 1) % WAYS;
+    }
+};
+
 /// Persistent gather workers. Every row's three regions are one SSD read on
 /// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
 /// of every decode step, 16 fault threads ~0.7 ms, and more threads got SLOWER
@@ -646,19 +753,23 @@ const PrefetchPool = struct {
     /// Fan-out rounds issued; the engagement counter the prefill test reads.
     runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
+    decoded: DecodedRows = .{},
 
     fn recordCalibration(self: *PrefetchPool, result: Calibration) void {
         self.calib = result;
         self.prefer_pool = plePrefillPrefetchArm(result.serial_ns, result.pool_ns);
     }
 
-    fn create() !*PrefetchPool {
+    fn create(dim: u32) !*PrefetchPool {
         const a = std.heap.page_allocator;
         const p = try a.create(PrefetchPool);
         p.* = .{};
+        // A payload allocation failure must not disable the cold-read workers.
+        p.decoded = DecodedRows.init(a, dim);
         var started: usize = 0;
         errdefer {
             p.shutdown(started);
+            a.free(p.decoded.values);
             a.destroy(p);
         }
         for (0..N) |i| {
@@ -671,6 +782,7 @@ const PrefetchPool = struct {
 
     fn destroy(self: *PrefetchPool) void {
         self.shutdown(N);
+        std.heap.page_allocator.free(self.decoded.values);
         std.heap.page_allocator.destroy(self);
     }
 
@@ -956,7 +1068,10 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     const data = buf[264..];
     const vals = [_]u16{ 0x3F80, 0xC000, 0x4000, 0x0000, 0xBF80, 0x3F00, 0xC040, 0x4040 };
     for (vals, 0..) |v, k| std.mem.writeInt(u16, data[k * 2 ..][0..2], v, .little);
-    const t = try NgramTable.parse(buf, buf[8..264], 264);
+    var t = try NgramTable.parse(buf, buf[8..264], 264);
+    t.initPool();
+    defer t.pool.?.destroy();
+    try testing.expectEqual(@as(usize, 0), t.pool.?.decoded.values.len);
     try testing.expectEqual(@as(u32, 16), t.bits);
     try testing.expectEqual(@as(u64, 2), t.rows);
     try testing.expectEqual(@as(u32, 4), t.dim);
@@ -965,6 +1080,10 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 2.0, 0.0 }, &out);
     t.row(1, &out);
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
+    var gathered: [8]f32 = undefined;
+    t.gather(&.{ 1, 0 }, &gathered, 0);
+    try testing.expectEqualSlices(f32, &.{ -1.0, 0.5, -3.0, 3.0, 1.0, -2.0, 2.0, 0.0 }, &gathered);
+    try testing.expectEqual(@as(u64, 0), t.pool.?.runs.load(.monotonic));
 }
 
 test "embedded PLE rows carry the pack's global weight scale" {
@@ -1174,6 +1293,8 @@ test "ngram prefill calibration: sampled rows are bounded and disjoint" {
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
+    const control = env.override(.MLX_SERVE_PLE_ROW_CACHE, "1");
+    defer control.restore();
     // 4-bit, group 32, dim 32 -> wcols 4 u32, scols 1. 4096 rows = 64 pool batches.
     const ROWS: usize = 4096;
     const HDR: usize = 512;
@@ -1315,6 +1436,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const after_refresh = pool.runs.load(.monotonic);
     t.gather(ids, got, 0);
     try testing.expectEqual(after_refresh + @as(u64, if (pool.prefer_pool) ROWS / PrefetchPool.MAX_ROWS else 0), pool.runs.load(.monotonic));
+    try exerciseDecodedGather(&t);
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {
@@ -1540,4 +1662,189 @@ test "WarmProgress emits on the byte step, on the silence timeout, and never twi
     try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
     try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
     try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
+}
+
+test "ngram decoded rows own exact bits and evict colliding rows round-robin" {
+    var cache = DecodedRows.init(testing.allocator, 2);
+    defer testing.allocator.free(cache.values);
+    try testing.expectEqual(@as(usize, 1024 * 2), cache.values.len);
+    var value = [_]f32{ @bitCast(@as(u32, 0x80000000)), @bitCast(@as(u32, 0x7fc01234)) };
+    const expected = value;
+    var got: [2]f32 = undefined;
+    try testing.expect(!cache.get(0, &got));
+    cache.put(0, &value);
+    @memset(&value, 17);
+    try testing.expect(cache.get(0, &got));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&got));
+    @memset(&got, 23);
+    try testing.expect(cache.get(0, &got));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&got));
+    var other = DecodedRows.init(testing.allocator, 2);
+    defer testing.allocator.free(other.values);
+    try testing.expect(!other.get(0, &got));
+    other.put(0, &value);
+    try testing.expect(other.get(0, &got));
+    try testing.expectEqualSlices(f32, &value, &got);
+    try testing.expect(cache.get(0, &got));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&got));
+    const colliding = decodedCollisionRows();
+    for (colliding[1..DecodedRows.WAYS]) |row_id| cache.put(row_id, &value);
+    for (colliding[0..DecodedRows.WAYS]) |row_id| try testing.expect(cache.get(row_id, &got));
+    try testing.expectEqual(@as(u8, 0), cache.next[DecodedRows.set(0)]);
+    cache.put(colliding[1], &value);
+    try testing.expectEqual(@as(u8, 0), cache.next[DecodedRows.set(0)]);
+    cache.put(colliding[DecodedRows.WAYS], &value);
+    try testing.expect(!cache.get(0, &got));
+    for (colliding[1..]) |row_id| {
+        try testing.expect(cache.get(row_id, &got));
+        try testing.expectEqualSlices(f32, &value, &got);
+    }
+}
+
+test "ngram decoded rows fill every set and allocation failure leaves no payload" {
+    var cache = DecodedRows.init(testing.allocator, 1);
+    defer testing.allocator.free(cache.values);
+    var counts: [DecodedRows.SETS]usize = @splat(0);
+    var keys: [DecodedRows.CAPACITY]i64 = undefined;
+    var remaining: usize = DecodedRows.CAPACITY;
+    var row_id: i64 = 0;
+    while (remaining != 0) : (row_id += 1) {
+        const group = DecodedRows.set(row_id);
+        if (counts[group] == DecodedRows.WAYS) continue;
+        keys[group * DecodedRows.WAYS + counts[group]] = row_id;
+        counts[group] += 1;
+        remaining -= 1;
+        cache.put(row_id, &.{@floatFromInt(row_id)});
+    }
+    for (keys) |key| {
+        var got: [1]f32 = undefined;
+        try testing.expect(cache.get(key, &got));
+        try testing.expectEqual(@as(f32, @floatFromInt(key)), got[0]);
+    }
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const disabled = DecodedRows.init(failing.allocator(), 32);
+    try testing.expectEqual(@as(usize, 0), disabled.values.len);
+    try testing.expectEqual(@as(usize, 0), DecodedRows.init(testing.allocator, 0).values.len);
+}
+
+fn decodedCollisionRows() [DecodedRows.WAYS + 1]i64 {
+    var rows: [DecodedRows.WAYS + 1]i64 = undefined;
+    rows[0] = 0;
+    var candidate: i64 = 1;
+    for (rows[1..]) |*row_id| {
+        while (DecodedRows.set(candidate) != DecodedRows.set(0)) candidate += 1;
+        row_id.* = candidate;
+        candidate += 1;
+    }
+    return rows;
+}
+
+fn exerciseDecodedGather(table: *NgramTable) !void {
+    const p = table.pool.?;
+    p.decoded.keys = @splat(-1);
+    p.decoded.next = @splat(0);
+    const colliding = decodedCollisionRows();
+    try testing.expect(@as(u64, @intCast(colliding[4])) < table.rows);
+    var got: [4 * 32]f32 = undefined;
+    var want: [4 * 32]f32 = undefined;
+    table.gather(colliding[0..4], &got, 0);
+    const before = p.runs.load(.monotonic);
+    const ids = [_]i64{ colliding[4], colliding[0], colliding[4], colliding[1] };
+    table.gatherSerial(&ids, &want);
+    table.gather(&ids, &got, 0);
+    try testing.expectEqual(before + 1, p.runs.load(.monotonic));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+    var row: [32]f32 = undefined;
+    try testing.expect(!p.decoded.get(colliding[0], &row));
+
+    // Poison a hit so a failed miss must overwrite the entire output, not only misses.
+    const poison: [32]f32 = @splat(999);
+    p.decoded.put(colliding[1], &poison);
+    const fd = table.fd;
+    table.fd = std.math.maxInt(c_int);
+    defer table.fd = fd;
+    const failing_ids = [_]i64{ colliding[1], colliding[0], colliding[1], colliding[0] };
+    table.gatherSerial(&failing_ids, &want);
+    table.gather(&failing_ids, &got, 0);
+    try testing.expectEqual(before + 2, p.runs.load(.monotonic));
+    try testing.expect(p.failed.load(.monotonic) != 0);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+    try testing.expect(!p.decoded.get(colliding[0], &row));
+}
+
+test "ngram decoded gather handles embedded formats bounds disabled storage and table lifetime" {
+    const control = env.override(.MLX_SERVE_PLE_ROW_CACHE, "1");
+    defer control.restore();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    inline for ([_]?embedded_ple.FixtureVariant{ .valid, .scale_nonunit, null }) |variant| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        if (variant) |v| try embedded_ple.writeFixture(&td, v) else try embedded_ple.writeNvfp4Fixture(&td);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        const spec: EmbeddedSpec = if (variant == null)
+            .{ .rows = 3, .dim = 32, .shards = 2 }
+        else
+            .{ .rows = 6, .dim = 32, .shards = 3 };
+        for (0..2) |_| {
+            var table = try NgramTable.openEmbedded(path_buf[0..path_len], spec);
+            defer table.close();
+            const p = table.pool.?;
+            try testing.expectEqual(@as(u64, 0), p.decoded.hits);
+            try testing.expectEqual(@as(usize, DecodedRows.CAPACITY * 32), p.decoded.values.len);
+            var got: [4 * 32]f32 = undefined;
+            var want: [4 * 32]f32 = undefined;
+            table.gather(&.{ 0, 1, 0, 1 }, &got, 0);
+            table.gatherSerial(&.{ 0, 1, 0, 1 }, &want);
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+            const before = p.runs.load(.monotonic);
+            table.gather(&.{ 1, 0, 1, 0 }, &got, 0);
+            try testing.expectEqual(before, p.runs.load(.monotonic));
+            table.gatherSerial(&.{ 1, 0, 1, 0 }, &want);
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+            table.gather(&.{ 2, 0, 2, 1 }, &got, 0);
+            table.gatherSerial(&.{ 2, 0, 2, 1 }, &want);
+            try testing.expectEqual(before + 1, p.runs.load(.monotonic));
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+            const ids: [PrefetchPool.MAX_ROWS + 1]i64 = @splat(0);
+            var wide: [(PrefetchPool.MAX_ROWS + 1) * 32]f32 = undefined;
+            var wide_want: [(PrefetchPool.MAX_ROWS + 1) * 32]f32 = undefined;
+            table.gather(ids[0..PrefetchPool.MAX_ROWS], wide[0 .. PrefetchPool.MAX_ROWS * 32], 0);
+            try testing.expectEqual(before + 1, p.runs.load(.monotonic));
+            ple_prefill_prefetch_override = true;
+            defer ple_prefill_prefetch_override = null;
+            table.gather(&ids, &wide, 0);
+            table.gatherSerial(&ids, &wide_want);
+            try testing.expectEqual(before + 3, p.runs.load(.monotonic));
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&wide_want), std.mem.asBytes(&wide));
+            std.heap.page_allocator.free(p.decoded.values);
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+            p.decoded = DecodedRows.init(failing.allocator(), table.dim);
+            for (0..2) |round| {
+                table.gather(&.{ 2, 0, 2, 1 }, &got, 0);
+                try testing.expectEqual(before + 4 + round, p.runs.load(.monotonic));
+                try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+            }
+            var bypass = table;
+            bypass.bits = 16;
+            try testing.expectEqual(@as(u32, 0), bypass.decodedCacheDim());
+            bypass.bits = 4;
+            bypass.wcols = PrefetchPool.ROW_BUF / 4 + 1;
+            try testing.expectEqual(@as(u32, 0), bypass.decodedCacheDim());
+        }
+        const disabled = env.override(.MLX_SERVE_PLE_ROW_CACHE, "0");
+        defer disabled.restore();
+        var uncached = try NgramTable.openEmbedded(path_buf[0..path_len], spec);
+        defer uncached.close();
+        const p = uncached.pool.?;
+        try testing.expectEqual(@as(usize, 0), p.decoded.values.len);
+        var got: [32]f32 = undefined;
+        var want: [32]f32 = undefined;
+        uncached.row(0, &want);
+        for (0..2) |round| {
+            uncached.gather(&.{0}, &got, 0);
+            try testing.expectEqual(@as(u64, @intCast(round + 1)), p.runs.load(.monotonic));
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&want), std.mem.asBytes(&got));
+        }
+    }
 }

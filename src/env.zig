@@ -308,6 +308,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+    pub const MLX_SERVE_PLE_ROW_CACHE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "unreleased", .doc = "bounded decoded PLE rows for narrow host gathers (=0: keep pooled preads without decoded storage); read at table load" };
 
     // ── diagnostics ──
     pub const ANE_DRAFT_DEBUG: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/ane", .since = "26.10.3", .doc = "keeps the ANE drafter program's intermediate tensors for the parity test" };

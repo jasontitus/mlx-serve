@@ -14,9 +14,10 @@ Repository: <https://github.com/jasontitus/mlx-serve>.
 |---|---|---|
 | Focused cross-request history | `8f2278b2`, `feature/token-history-refactor` | Preferred storage/ownership/publication design; includes the maximum-order query fix and permanent HTTP overlap regression. |
 | Focused decoded learned-embedding cache | `ac7861b0`, `feature/decoded-ple-refactor` | Preferred narrow host-gather cache and TensorFold affine shard-name compatibility. |
-| Independent economics and DFlash research implementation | `27e70fbc6cffab3cc753bf3754dcfe8edc9d1ddb`, `feature/independent-speculative-lookup` | Own StairCut policy, candidate adapters, native-incumbent preservation, matched-scope pricing and diagnostic contracts. Older engine layout; not a mechanical patch. |
+| Refactored economics and DFlash integration | `12cd42e5`, `feature/speculation-economics-refactor` | Preferred current-engine integration of independent StairCut policy, candidate adapters, native-incumbent preservation and matched-scope pricing. Includes separate baseline fixture repair commit `0b497db2`. |
+| Historical independent economics research | `27e70fbc6cffab3cc753bf3754dcfe8edc9d1ddb`, `feature/independent-speculative-lookup` | Older engine layout and richer experiment history; not a mechanical patch. |
 
-Both focused branches start from upstream `refactor/big-bang` at `9d5cfc73b5c014e8e16b8a523082c8516079a179`. They are published source snapshots, not upstream-approved or fully release-qualified PRs. Further economics/DFlash integration is underway separately; do not wait for it to start a Sushi port, and do not assume it is already in the focused history branch.
+The focused branches descend from upstream `refactor/big-bang` at `9d5cfc73b5c014e8e16b8a523082c8516079a179`. They are published source snapshots, not upstream-approved or fully release-qualified PRs. The economics integration includes the history implementation but is not already part of the focused history branch; the decoded-PLE cache remains separate.
 
 Existing **fork draft PR**, against the older `main` layout: <https://github.com/jasontitus/mlx-serve/pull/9>. It is a research/review entry point, not the patch to apply to Sushi. No focused refactor PR has been submitted upstream yet.
 
@@ -49,7 +50,7 @@ This is not another next-token drafter: Qwen PLE and DeepSeek Engram produce mod
 
 ### 3. Own StairCut / matched-cost routing
 
-Inspect research `src/speculation_policy.zig`, `lookup_adapter.zig`, `lookup_counterfactual.zig` and their integration in `generate.zig`. Choose ancestor-closed candidate subsets using expected useful tokens per measured completed-work cost. Respect discrete kernel-width costs; never infer a hardware staircase from token count alone.
+Inspect refactored `src/engines/mlx/spec/speculation_policy.zig`, `lookup_adapter.zig`, `mtp/economics.zig` and `dflash/economics.zig`. The historical research branch additionally retains `lookup_counterfactual.zig` experiments. Choose ancestor-closed candidate subsets using expected useful tokens per measured completed-work cost. Respect discrete kernel-width costs; never infer a hardware staircase from token count alone.
 
 Keep native neural and native copied-continuation actions explicitly eligible. Duplicate neural/lookup support is correlated evidence, not additive probability. Calibrate only reached decisions; clipped or unreachable descendants are censored. Keep flight-owned proposal evidence stable when the next query replaces scratch.
 
@@ -89,6 +90,7 @@ The inspected Sushi had a Flash-Next chain-width policy and separate GLM tree/co
 - Older PLE full-decode comparison: +0.28%, interval -0.34% to +0.98%; no established end-to-end win. StairCut has promising isolated measurements but no qualified universal or additive gain.
 - The history validation worktree reports 4,516 passed / 448 skipped / zero failed from the full `zig build test`. It includes separate, still-uncommitted baseline fixture repairs: EXL3 hardware eligibility, recurrent-state teardown lifetime, and a GGUF tokenizer test mutating a constant object. Do not attribute this full-suite result to the published history commit alone.
 - Use the updated history revision: at `72419820`, Zig 0.17 inferred the capped query-tail length as `u6`, so adding the pending token wrapped 63 + 1 to zero in ReleaseFast. The fix explicitly widens the arithmetic and tests queries below, at and beyond the 64-token boundary. The same correction is applied to the in-progress DFlash query assembly.
+- Refactored economics integration: ReleaseFast build and full suite passed (4,625 passed / 448 skipped / zero failed). Real MTP and DFlash2 diagnostics each completed eight source-valid responses, with external lookup engagement and actual adaptive settings verified. DFlash2 exercised both generic and linear-GDN verification. This establishes operation, not speed; the unchanged standard-suite ABBA/BAAB comparison against a separate frozen upstream binary is running. See the ledger for artifacts and attribution limits.
 
 ## Attribution and source boundary
 

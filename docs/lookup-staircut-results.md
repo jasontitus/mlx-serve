@@ -1358,3 +1358,25 @@ All responses pass the declared source checks. A separate static review of every
 **Incremental costs:** B stored 9,956–9,960 logical bytes and 12,288 allocated bytes per boot. Mean post-request sampled RSS maxima were 8,468.254 MiB for A and 8,470.906 MiB for B, an observed difference of 2.652 MiB. This is not peak unified-memory measurement or an exact attribution of allocator overhead. No extra model weights were needed.
 
 Adversarial benchmark review corrected future runners to check effective server configuration before timing, explicitly gate performance qualification on declared GPU isolation, and allowlist recorded environment values. Four earlier private diagnostic launch files had inherited environment fields removed with a redaction annotation; request measurements were unchanged.
+
+## Refactor economics: integrated validation and standard-suite campaign
+
+The integrated source snapshot is `12cd42e5` on `feature/speculation-economics-refactor`, following baseline fixture repairs in `0b497db2`. It ports independent candidate economics, MTP admission, DFlash2 lookup and linear-GDN verification into the refactored engine. It does not include the separate decoded-PLE cache.
+
+The ReleaseFast build succeeded, and the complete integrated `zig build test` reported **33/33 steps succeeded, 4,625 tests passed, 448 skipped, zero failed**. Hardware-specific skipped paths remain unverified on this machine. Adversarial review corrected two important measurement/attribution boundaries:
+
+- MTP native comparator warmup is tracked per plan **and realized verifier width**. A first execution at a second width cannot become a supposedly warm reference merely because another width was already observed. Probe opportunities remain bounded and demand-driven.
+- DFlash calibration can learn from local and external lookup support, but external committed-token counters include only corpus/persistent support after actual budget/EOS-clipped commitment. Native action retention is not forced when a mixed continuation genuinely has better predicted economics.
+
+Real-model diagnostics used Qwen3.8-27B and the incoai DFlash2 assistant. Each family completed eight source-valid responses with no engagement-gate errors. The actual HTTP settings receipt confirmed adaptive selection, no forced row count and enabled history before generation.
+
+| Diagnostic | External rounds | Accepted external drafts | Observed verifier paths |
+|---|---:|---:|---|
+| MTP | 38 | 376 | Generic verification, multiple realized widths; 13 native probe flights |
+| DFlash2 | 102 | 526 | Generic and linear-GDN; 8- and 16-row actions, including mixed and native-copy actions |
+
+Artifacts are `runs/refactor-economics-mtp-diagnostic-v1` and `runs/refactor-economics-dflash-diagnostic-v1`. These are feature-engagement and correctness diagnostics, **not paired performance comparisons**; their timings must not be compared across families as a speedup estimate.
+
+The standard-suite comparison is running in `runs/refactor-standard-abba-v1`: unchanged default `tests/bench.sh`/llmprobe scenarios, llmprobe 0.6.17, and eight ABBA/BAAB boots per family (16 total). Native uses the separately frozen upstream `9d5cfc73` binary; feature uses the validated integrated binary with adaptive economics and a fresh writable store per boot. Both binary/runtime identities are frozen. This contrast includes kernel changes, unlike a same-binary history toggle. Default reasoning, sampling, context ladder, concurrency and prefix caching remain intact.
+
+The campaign is declared contended, so it can report observed positive/negative differences but cannot establish isolated causality. Each standard client retains warmup plus three measurements per scenario. Report decode, prefill, TTFT, context and concurrency separately, alongside whole-client time and resource costs. Standard concurrent requests may use MTP even in the DFlash2-enabled configuration; that result measures the serving configuration, not pure DFlash2 batch throughput. No new standard-suite performance result is claimed before balanced arms complete.

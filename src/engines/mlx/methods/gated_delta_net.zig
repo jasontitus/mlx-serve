@@ -320,7 +320,7 @@ pub fn gatedDeltaNetProjected(
         if (tree) |tab| {
             const w = la.in.widths;
             const joined: ?gdn_decode.Joined = if (in_all.ctx != null) .{ .all = in_all, .a_off = w[0] + w[1], .b_off = w[0] + w[1] + w[2] } else null;
-            const r = (try gdn_decode.recurTree(geo, seq_len, ins, joined, tab, self.s)) orelse return error.SpecTreeUnsupported;
+            const r = (try gdn_decode.recurTree(geo, seq_len, ins, joined, tab, self.spec_tree.?.linear, self.s)) orelse return error.SpecTreeUnsupported;
             defer _ = mlx.mlx_array_free(r.y);
             errdefer inline for (.{ r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |a| {
                 _ = mlx.mlx_array_free(a);

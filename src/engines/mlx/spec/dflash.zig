@@ -39,6 +39,7 @@ const sliceProbRow = @import("../sampling/spec_sampling.zig").sliceProbRow;
 const specAcceptProb = @import("mtp/depth.zig").specAcceptProb;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const verifyArgmax = @import("verify.zig").verifyArgmax;
+const economics = @import("dflash/economics.zig");
 
 
 fn embedTrunk(ctx: *const anyopaque, ids: mlx.mlx_array) anyerror!mlx.mlx_array {
@@ -227,6 +228,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // an uncorrected distribution the sidecar was never trained to emit.
     const use_markov = model.markov != null;
     const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
+    // The opt-in controller is confined to the already-supported native DFlash2
+    // tree path. Other assistants, stochastic sampling and trunks stay native.
+    var economics_flight: ?economics.Flight = if (tree_round and economics.enabled())
+        try economics.prepare(self, allocator, anchor_pos)
+    else
+        null;
+    const flight = if (economics_flight) |*f| f else null;
     // A continuation the context backs long enough to fill the tree is
     // verified as the round's chain, with no assistant forward.
     if (tree_round and self.dflash_copy_silent > 0) {
@@ -238,7 +246,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         defer allocator.free(committed);
         pld_index.tailWindow(committed, prompt, gen, t1);
         if (pld_index.backedCopy(committed, dflashTreeNodes(m), DFLASH_COPY_MATCH)) |c| if (c.draft.len == dflashTreeNodes(m))
-            return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, c.draft);
+            return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial,
+                if (flight != null) c.draft[0..@min(c.draft.len, economics.depthLimit(self.max_tokens -| self.completion_tokens))] else c.draft, flight);
+    }
+    if (flight) |f| {
+        f.route();
+        if (f.routed) return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, &.{}, f);
+        try f.beginAssistant(self);
     }
 
     // ── Phase 1: one assistant forward drafts all m tokens ──
@@ -329,7 +343,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
     }
     if (tree_round) {
-        return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{});
+        return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{}, flight);
     }
     var sel_path: ?dflash_mod.SelectedPath = null;
     defer if (sel_path) |*sp| sp.deinit(allocator);

@@ -339,6 +339,7 @@ const Cfg = struct {
     swish: bool = true,
     block: c_int = 512,
     nt: c_int = 256,
+    linear: bool = false,
 
     fn gt(c: Cfg) mlx.mlx_dtype {
         return dec.gateDtype(c.dt, c.st);
@@ -630,6 +631,7 @@ const Dec = struct {
                     .k1tr => {
                         g = .{ .grid = .{ 32, DV, NV }, .tg = .{ 32, 4, 1 } };
                         g.out(&.{ 1, S, NV, DV }, d);
+                        g.int("LINEAR", @intFromBool(dec.linearTreeDispatch(S, c.linear)));
                     },
                     else => unreachable,
                 }
@@ -707,7 +709,9 @@ const Dec = struct {
         }
         self.conv_in = try host.uniform(a, rng, (3 + S) * CH, -2, 2, dt);
         const parents = try a.alloc(i32, S);
-        treeParents(rng, parents);
+        if (c.linear) {
+            for (parents, 0..) |*parent, row| parent.* = @as(i32, @intCast(row)) - 1;
+        } else treeParents(rng, parents);
         const tab = try a.alloc(i32, 6 * S);
         dec.treeTable(parents, tab);
         self.table = try a.alloc(f64, 6 * S);
@@ -1195,6 +1199,8 @@ fn registerDecode(set: *kc.Set) !void {
     try addDec(set, "gdn_decode_tree_pre bf16, f32 gate (q, k, v, g)", .{ .kind = .k1p, .st = f32s, .reads = .wide }, &.{ 2, 8 });
     try addDec(set, "gdn_decode_tree bf16, bf16 state", .{ .kind = .k1tr }, &.{ 2, 8, 16 });
     try addDec(set, "gdn_decode_tree bf16, f32 state", .{ .kind = .k1tr, .st = f32s }, &.{ 2, 8 });
+    try addDec(set, "gdn_decode_tree linear bf16, bf16 state", .{ .kind = .k1tr, .linear = true }, &.{ 9, 15, 16 });
+    try addDec(set, "gdn_decode_tree linear bf16, f32 state", .{ .kind = .k1tr, .st = f32s, .linear = true }, &.{ 9, 16 });
     try addDec(set, "gdn_decode_replay bf16 state", .{ .kind = .k1r }, &.{ 2, 8, 16 });
     try addDec(set, "gdn_decode_replay f32 state (conv)", .{ .kind = .k1r, .st = f32s, .reads = .act }, &.{ 2, 8 });
     try addDec(set, "gdn_decode_replay f32 state (state)", .{ .kind = .k1r, .st = f32s, .reads = .wide }, &.{ 2, 8 });
@@ -1332,12 +1338,12 @@ fn decDrift(t: *Dec, name: []const u8, shape: Shape) !void {
         .k1p, .k1tr => {
             // The wrapper runs K1P then K1TR: ours run the same pair from a K1P fixture of the same seed.
             const pc = comptime Cfg{ .kind = .k1p, .reads = .act };
-            var pre = Dec.init(a, launchOf(pc), .{ .kind = .k1p, .st = c.st });
+            var pre = Dec.init(a, launchOf(pc), .{ .kind = .k1p, .st = c.st, .linear = c.linear });
             defer pre.deinit();
             try std.testing.expect(try pre.prepare(shape, .random, 7));
             try runAll(&pre, shape);
             const state = try pre.rig.input(c.st, &.{ 1, NV, DV, DK }, pre.s0);
-            const r = (try dec.recurTree(geo_dec, S, decInputs(&pre, state), null, pre.args[9], s)) orelse return error.WrapperDeclined;
+            const r = (try dec.recurTree(geo_dec, S, decInputs(&pre, state), null, pre.args[9], c.linear, s)) orelse return error.WrapperDeclined;
             defer freeAll(&.{ r.y, r.conv_input, r.prework.k, r.prework.v, r.prework.gb });
             if (c.kind == .k1p) {
                 for ([_]mlx.mlx_array{ r.prework.k, r.prework.v, r.prework.gb, r.conv_input }, 1..) |x, i| try expectSame(name, i, pre.rig.output(i), x, 0, s);

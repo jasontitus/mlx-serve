@@ -44,20 +44,23 @@ pub const Request = struct {
     queried: bool = false,
     rounds: u32 = 0,
     accepted: u32 = 0,
+    /// DFlash's local tier advances only through engine-committed tokens.
+    local_primed: bool = false,
+    local_generated: usize = 0,
 
     pub fn init(gen: *Generator, allocator: std.mem.Allocator) !Request {
-        const identity = gen.tok.content_sha256 orelse return error.TokenizerRequired;
+        const identity = gen.tok.content_sha256;
+        if (enabled() and identity == null) return error.TokenizerRequired;
         var self = Request{ .allocator = allocator, .drafter = tokens.Drafter.init(allocator) };
         errdefer self.deinit();
         self.drafter.vocab_limit = @intCast(gen.tok.definedVocabSize());
-        const shared = cache(gen.xfm);
         if (corpusPath()) |path| {
-            self.corpus = try shared.acquireCorpus(gen.timer.io, path, identity);
+            self.corpus = try cache(gen.xfm).acquireCorpus(gen.timer.io, path, identity);
             if (self.corpus) |*lease| self.drafter.corpus = lease.index();
         }
         if (storePath()) |path| {
-            if (writes()) try tokens.initializePersistent(gen.timer.io, allocator, path, identity);
-            self.persistent = try shared.acquirePersistent(gen.timer.io, path, identity);
+            if (writes()) try tokens.initializePersistent(gen.timer.io, allocator, path, identity.?);
+            self.persistent = try cache(gen.xfm).acquirePersistent(gen.timer.io, path, identity.?);
             self.drafter.persistent = self.persistent.?.index();
         }
         return self;
@@ -74,7 +77,7 @@ pub const Request = struct {
     /// Cache only the immutable candidate, never the changing admission gate.
     /// A lazy successor probe and its build can ask the same question twice.
     pub fn match(self: *Request, committed: []const u32, t1: u32, cap: u32) !?lookup.Match {
-        const n = @min(committed.len, tokens.max_order - 1);
+        const n: usize = @min(committed.len, tokens.max_order - 1);
         var query: [tokens.max_order]u32 = undefined;
         @memcpy(query[0..n], committed[committed.len - n ..]);
         query[n] = t1;
@@ -105,6 +108,36 @@ pub fn match(gen: *Generator, allocator: std.mem.Allocator, committed: []const u
     return gen.external_history.?.match(committed, t1, cap);
 }
 
+/// The tree result borrows request scratch until the next query. Callers must
+/// turn it into their owned flight geometry before another query or suspension.
+/// MTP's cached single-candidate match and terminal publication are unchanged.
+pub fn queryTree(gen: *Generator, allocator: std.mem.Allocator, depth: u32) !tokens.Look {
+    if (gen.external_history == null) {
+        const request = try allocator.create(Request);
+        errdefer allocator.destroy(request);
+        request.* = try Request.init(gen, allocator);
+        gen.external_history = request;
+    }
+    const request = gen.external_history.?;
+    if (!request.local_primed) {
+        try request.drafter.prime(gen.prompt_ids_owned);
+        request.local_primed = true;
+    }
+    const generated = gen.generated_ids.items;
+    std.debug.assert(request.local_generated <= generated.len);
+    try request.drafter.observe(generated[request.local_generated..]);
+    request.local_generated = generated.len;
+    var query: [tokens.max_order]u32 = undefined;
+    const n: usize = @min(gen.prompt_ids_owned.len + generated.len, query.len - 1);
+    const from_generated = @min(n, generated.len);
+    const from_prompt = n - from_generated;
+    @memcpy(query[0..from_prompt], gen.prompt_ids_owned[gen.prompt_ids_owned.len - from_prompt ..]);
+    @memcpy(query[from_prompt..n], generated[generated.len - from_generated ..]);
+    query[n] = gen.next_token_id;
+    request.queried = false;
+    return request.drafter.look(query[0 .. n + 1], depth, &request.output);
+}
+
 pub fn logStats(gen: *const Generator) void {
     if (gen.external_history) |request| log.info("[history] external_rounds={d} accepted_drafts={d}\n", .{ request.rounds, request.accepted });
 }
@@ -131,4 +164,44 @@ pub fn publish(slot: anytype, outcome: @import("history_publication.zig").Outcom
         return;
     };
     log.info("[history] published prompt_tokens={d} output_tokens={d} outcome={s}\n", .{ slot.full_prompt.len, ids.len, @tagName(outcome) });
+}
+
+test "external history query retains maximum suffix and invalidates changed context" {
+    const a = std.testing.allocator;
+    var ids: [100]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
+    var corpus = try tokens.Corpus.build(a, &ids, tokens.max_order);
+    defer corpus.deinit();
+    var request = Request{ .allocator = a, .drafter = tokens.Drafter.init(a) };
+    defer request.deinit();
+    request.drafter.corpus = &corpus;
+    for ([_]usize{ 62, 63, 64, 90 }) |n| {
+        const matched = (try request.match(ids[0..n], ids[n], 7)) orelse return error.MissingContinuation;
+        try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..7], matched.draft);
+        try std.testing.expectEqual(@as(u32, @intCast(@min(n + 1, tokens.max_order))), matched.suffix);
+        const repeated = (try request.match(ids[0..n], ids[n], 3)) orelse return error.MissingShortContinuation;
+        try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..3], repeated.draft);
+    }
+}
+
+test "external history tree query joins prompt and emitted suffix at maximum order" {
+    const a = std.testing.allocator;
+    var ids: [100]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
+    var corpus = try tokens.Corpus.build(a, &ids, tokens.max_order);
+    defer corpus.deinit();
+    var request = Request{ .allocator = a, .drafter = tokens.Drafter.init(a) };
+    defer request.deinit();
+    request.drafter.corpus = &corpus;
+    var gen: Generator = undefined;
+    gen.external_history = &request;
+    gen.prompt_ids_owned = ids[0..60];
+    for ([_]usize{ 62, 63, 64, 90 }) |n| {
+        gen.generated_ids = .initBuffer(ids[60..n]);
+        gen.generated_ids.items = ids[60..n];
+        gen.next_token_id = ids[n];
+        const got = try queryTree(&gen, a, 7);
+        try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..7], got.tokens);
+        try std.testing.expectEqual(@as(u32, @intCast(@min(n + 1, tokens.max_order))), got.order);
+    }
 }

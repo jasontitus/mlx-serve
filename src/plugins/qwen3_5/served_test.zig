@@ -740,3 +740,121 @@ test "qwen3_5 served: trunk projections tiled in place for the lane give the leg
     for (p.shells()) |sh| try expectVerifyEqualsSerial(sh);
     try expectTree(&p, true);
 }
+
+fn linearTreeProofCase(p: *Pair, rows: usize, branched: bool, keep: usize) !void {
+    const a = testing.allocator;
+    const s = fixture.stream();
+    var parents: [16]i32 = undefined;
+    var depths: [16]i32 = undefined;
+    var tokens: [16]i32 = undefined;
+    for (0..rows) |row| {
+        parents[row] = @as(i32, @intCast(row)) - 1;
+        depths[row] = @intCast(row);
+        tokens[row] = @intCast(11 + row);
+    }
+    if (branched) {
+        parents[rows - 1] = 0;
+        depths[rows - 1] = 1;
+    }
+    const tree = tree_mod.specTreeFor(parents[0..rows], depths[0..rows], @intCast(if (branched) rows - 2 else rows - 1));
+    defer tree.deinit();
+    try testing.expectEqual(!branched, tree.linear);
+    var generic = tree;
+    generic.linear = false;
+    var lanes: [2]Lane = undefined;
+    try lanes[0].init(&p.xfm);
+    defer lanes[0].deinit();
+    try lanes[1].init(&p.xfm);
+    defer lanes[1].deinit();
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const prompt = try fixture.tokens(&g, &ids(19, 7));
+    var output: [2]Array = undefined;
+    for (&lanes, &output, 0..) |*lane, *out, index| {
+        _ = try g.adopt(try p.xfm.forwardWith(&lane.ctx, prompt));
+        lane.ctx.capture_ssm_seq = true;
+        lane.ctx.tree = if (index == 0) &generic else &tree;
+        defer {
+            lane.ctx.tree = null;
+            lane.ctx.capture_ssm_seq = false;
+        }
+        const decode = @import("../../sdk/blocks/gdn/decode.zig");
+        const linear_before = decode.test_linear_tree_calls;
+        out.* = try g.adopt(try p.xfm.forwardWith(&lane.ctx, try fixture.tokens(&g, tokens[0..rows])));
+        try testing.expectEqual(index == 1 and !branched, decode.test_linear_tree_calls > linear_before);
+    }
+    try ops.expectBitEqual(output[0], output[1]);
+    try expectTreeCaptures(lanes[0].ssm, lanes[1].ssm);
+
+    // Every optimized row is the serial step along that row's own ancestors.
+    const vocab = ops.shape(output[1])[2];
+    for (0..rows) |row| {
+        var path: [16]i32 = undefined;
+        var cursor: i32 = @intCast(row);
+        var at: usize = @intCast(depths[row] + 1);
+        const count = at;
+        while (cursor >= 0) : (cursor = parents[@intCast(cursor)]) {
+            at -= 1;
+            path[at] = tokens[@intCast(cursor)];
+        }
+        var serial: Lane = undefined;
+        try serial.init(&p.xfm);
+        defer serial.deinit();
+        _ = try g.adopt(try p.xfm.forwardWith(&serial.ctx, prompt));
+        var result: Array = undefined;
+        for (path[0..count]) |token| result = try g.adopt(try p.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{token})));
+        const r: c_int = @intCast(row);
+        try ops.expectBitEqual(try g.slice(output[1], &.{ 0, r, 0 }, &.{ 1, r + 1, vocab }), result);
+    }
+
+    var kept: [16]i32 = undefined;
+    var kept_u32: [16]u32 = undefined;
+    for (0..keep) |row| {
+        const index = if (branched and row == 1) rows - 1 else row;
+        kept[row] = @intCast(index);
+        kept_u32[row] = @intCast(index);
+    }
+    var conv_rows: [3]i32 = undefined;
+    for (0..3) |i| {
+        const depth: i32 = @as(i32, @intCast(keep)) - 3 + @as(i32, @intCast(i));
+        conv_rows[i] = if (depth < 0) depth + 3 else 3 + kept[@intCast(depth)];
+    }
+    const anchor = ids(19, 7).len;
+    for (&lanes) |*lane| {
+        const step = lane.kv.step;
+        try lane.kv.compactRows(anchor, kept_u32[1..keep], s);
+        try lane.kv.truncate(anchor + keep, s);
+        lane.kv.step = step;
+        for (lane.ssm) |*entry| {
+            try ssm_entry.ssmCommitTreePath(entry, kept[0..keep], conv_rows, s);
+            ssm_entry.ssmFreeSpecCapture(entry);
+        }
+        lane.off = anchor + keep;
+    }
+    var serial: Lane = undefined;
+    try serial.init(&p.xfm);
+    defer serial.deinit();
+    _ = try g.adopt(try p.xfm.forwardWith(&serial.ctx, prompt));
+    for (kept[0..keep]) |row| _ = try g.adopt(try p.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{tokens[@intCast(row)]})));
+    const next = try fixture.tokens(&g, &.{77});
+    const expected = try g.adopt(try p.xfm.forwardWith(&serial.ctx, next));
+    for (&lanes) |*lane| try ops.expectBitEqual(expected, try g.adopt(try p.xfm.forwardWith(&lane.ctx, next)));
+}
+
+test "qwen3_5 served: proven linear trees above eight rows preserve serial logits and rollback through the plugin ABI" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var pk = fixture.Pack.init(0x5e0a);
+    defer pk.deinit();
+    try pack.writePack(&pk, false, true, 8);
+    var p: Pair = undefined;
+    // This proof compares actual forwards, not a newly recorded golden tape.
+    try p.open(&qwen3_5.table, &pk, pack.config(false, true, 8), .{});
+    defer p.close();
+    p.xfm.config.dflash_bound = true;
+    try testing.expect(p.cfg.plugin.?.parsed.caps.spec_tree_linear_gdn);
+    for ([_]usize{ 9, 15, 16 }) |rows| {
+        try linearTreeProofCase(&p, rows, false, 1);
+        try linearTreeProofCase(&p, rows, false, rows - 1);
+        try linearTreeProofCase(&p, rows, true, 2);
+    }
+}

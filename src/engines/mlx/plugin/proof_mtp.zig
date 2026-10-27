@@ -651,6 +651,9 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
     var rig: HistoryRig = undefined;
     try rig.open();
     defer rig.close();
+    for ([_]?[:0]const u8{ null, "fixed:4" }) |control| {
+        var selection = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, if (control) |value| value.ptr else null);
+        defer selection.restore();
     for ([_]u32{ 0, 1, 3 }) |want_accepted| {
         var gen = try rig.generator(&history_query);
         defer gen.deinit(a);
@@ -676,7 +679,7 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
         @memcpy(document[0..16], &history_query);
         document[16] = gen.next_token_id;
         var name: [32]u8 = undefined;
-        const path = try rig.store(try std.fmt.bufPrint(&name, "accept-{d}", .{want_accepted}), &document, proposal[1..]);
+        const path = try rig.store(try std.fmt.bufPrint(&name, "accept-{s}-{d}", .{ control orelse "native", want_accepted }), &document, proposal[1..]);
         defer a.free(path);
         {
             var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
@@ -699,6 +702,13 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
             try testing.expect(st.chain.lookup and st.chain.external_history);
             try testing.expectEqual(@as(u32, 3), st.chain.m);
             try testing.expectEqualSlices(u32, proposal[1..], st.chain.drafts);
+            try testing.expectEqual(control != null, st.chain.economics != null);
+            if (control == null) try testing.expect(gen.mtp_economics == null);
+            if (st.chain.economics) |flight| {
+                try testing.expectEqualSlices(u32, &proposal, flight.tree.tokens[0..flight.tree.len]);
+                try testing.expectEqual(@as(@TypeOf(flight.scope), if (want_accepted == 0) .cold else .carried), flight.scope);
+                try testing.expect(flight.target != null);
+            }
             _ = try historyFinish(&gen, &st, want_accepted);
             try testing.expectEqual(@as(u32, 1), gen.external_history.?.rounds);
             try testing.expectEqual(want_accepted, gen.external_history.?.accepted);
@@ -714,10 +724,13 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
         try testing.expectEqual(@as(u32, 1), gen.external_history.?.rounds);
         try testing.expectEqual(want_accepted, gen.external_history.?.accepted);
     }
+    }
 }
 
 test "plugin MTP history: disabled source allocates no request through native verification and predraft" {
     const a = testing.allocator;
+    var selection = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, "adaptive");
+    defer selection.restore();
     var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, null);
     defer store.restore();
     var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
@@ -742,5 +755,214 @@ test "plugin MTP history: disabled source allocates no request through native ve
     try testing.expect(gen.mtp_pre_draft != null);
     try testing.expect(!gen.mtp_pre_draft.?.lookup);
     try testing.expect(gen.external_history == null);
+    try testing.expect(gen.mtp_economics == null);
+    try testing.expect(st.chain.economics == null);
     try testing.expect(rig.b.xfm.token_history == null);
+}
+
+test "plugin MTP economics: width trials preserve probes and changed plans recalibrate" {
+    const a = testing.allocator;
+    const economics = @import("../spec/mtp/economics.zig");
+    var selection = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, "adaptive");
+    defer selection.restore();
+    var prices = history_env.override(.MLX_SERVE_LOOKUP_PRICES, null);
+    defer prices.restore();
+    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
+    defer corpus.restore();
+    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
+    defer readonly.restore();
+    const bounds = depth_bounds.active;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
+    defer depth_bounds.active = bounds;
+    const predraft = history_trace.mtp_predraft_override;
+    history_trace.mtp_predraft_override = false;
+    defer history_trace.mtp_predraft_override = predraft;
+    var rig: HistoryRig = undefined;
+    try rig.open();
+    defer rig.close();
+    var gen = try rig.generator(&history_query);
+    defer gen.deinit(a);
+    var document: [17]u32 = undefined;
+    @memcpy(document[0..16], &history_query);
+    document[16] = gen.next_token_id;
+    const path = try rig.store("economics-probes", &document, &history_external);
+    defer a.free(path);
+    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
+    defer store.restore();
+
+    // An unmeasured lookup cannot displace the native head.
+    try testing.expect((try gen.mtpLookupChain(a, gen.mtpRoundPlan(), gen.next_token_id)) == null);
+    try testing.expect(gen.mtp_economics != null);
+    const plan = gen.mtpRoundPlan();
+    try testing.expect(economics.probePending(&gen, plan));
+    // Exercise the real plugin chain initializer for the planner's two-round
+    // width-trial block: neither round may acquire a flight or spend a probe.
+    var trial_plan = plan;
+    trial_plan.width_trial = true;
+    for (0..2) |_| {
+        var trial = try economics.initChain(&gen, a, trial_plan, gen.next_token_id);
+        defer trial.deinit(a);
+        try testing.expect(trial.economics == null);
+        try testing.expect(!economics.probePending(&gen, trial_plan));
+    }
+    try testing.expectEqual(@as(usize, 0), gen.mtp_economics.?.probes.count());
+    for (0..3) |round| {
+        var st = try historyBegin(&gen);
+        defer st.deinit(a);
+        try testing.expect(!st.chain.lookup);
+        try testing.expectEqual(round < 2, st.chain.economics != null);
+        if (st.chain.economics) |flight| {
+            try testing.expect(flight.native and flight.target != null);
+            try testing.expectEqual(@as(u32, 4), flight.rows);
+        }
+        _ = try historyFinish(&gen, &st, null);
+        if (round == 0) {
+            try testing.expect(gen.mtp_economics.?.nativeFor(0, plan) == null);
+        } else {
+            try testing.expect(gen.mtp_economics.?.nativeFor(0, plan) != null);
+            try testing.expect(!economics.probePending(&gen, plan));
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), gen.mtp_economics.?.probes.getPtr(0).?.cells[0].attempts);
+    try testing.expect(gen.mtp_economics.?.cut.prices.known(4, .chain, 0, .generic) != null);
+    depth_bounds.active = .{ .min = 2, .max = 2 };
+    const changed = gen.mtpRoundPlan();
+    try testing.expect(gen.mtp_economics.?.nativeFor(0, changed) == null);
+    try testing.expect(!economics.probePending(&gen, changed));
+    // Only renewed qualifying external demand, not the depth transition itself,
+    // may open the changed plan's calibration pair.
+    const candidate = (try gen.external_history.?.match(&history_query, document[16], 2)).?;
+    try testing.expectEqual(@as(u32, 0), try economics.select(&gen, a, candidate, 2, 2, document[16],
+        @import("../../../sdk/util/io_util.zig").Stopwatch.init(gen.timer.io), changed));
+    try testing.expect(economics.probePending(&gen, changed));
+    for (0..2) |round| {
+        var st = try historyBegin(&gen);
+        defer st.deinit(a);
+        try testing.expect(st.chain.economics.?.native);
+        try testing.expectEqual(@as(u32, 3), st.chain.economics.?.rows);
+        _ = try historyFinish(&gen, &st, null);
+        try testing.expectEqual(round == 1, gen.mtp_economics.?.nativeFor(0, changed) != null);
+    }
+    try testing.expect(!economics.probePending(&gen, changed));
+    try testing.expect(gen.mtp_economics.?.nativeFor(0, plan) != null);
+}
+
+test "plugin MTP economics: controlled rows respect depth floor and emitted token budget" {
+    const a = testing.allocator;
+    var selection = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, "max");
+    defer selection.restore();
+    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
+    defer corpus.restore();
+    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
+    defer readonly.restore();
+    const bounds = depth_bounds.active;
+    depth_bounds.active = .{ .min = 3, .max = 5 };
+    defer depth_bounds.active = bounds;
+    var rig: HistoryRig = undefined;
+    try rig.open();
+    defer rig.close();
+    const path = try rig.store("economics-budget", &history_query, &history_external);
+    defer a.free(path);
+    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
+    defer store.restore();
+    var gen = try rig.generator(history_query[0..15]);
+    defer gen.deinit(a);
+    gen.max_tokens = gen.completion_tokens + 3;
+    try testing.expect((try gen.mtpLookupChain(a, gen.mtpRoundPlan(), 47)) == null);
+    gen.max_tokens = gen.completion_tokens + 4;
+    var chain = (try gen.mtpLookupChain(a, gen.mtpRoundPlan(), 47)) orelse return error.ExpectedHistoryChain;
+    defer chain.deinit(a);
+    try testing.expectEqual(@as(u32, 3), chain.m);
+    try testing.expectEqual(@as(u32, 4), chain.economics.?.rows);
+    const held = chain.economics.?.tree;
+    _ = try gen.external_history.?.match(history_other_query[0..15], 95, 5);
+    try testing.expectEqualSlices(u32, history_external[0..3], chain.drafts);
+    try testing.expectEqualSlices(u32, history_external[0..3], held.tokens[1..held.len]);
+    {
+        var adaptive = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, "adaptive");
+        defer adaptive.restore();
+        try testing.expect((try gen.mtpLookupChain(a, gen.mtpRoundPlan(), 47)) == null);
+        const rt = gen.mtp_economics.?;
+        const native_plan = gen.mtpRoundPlan();
+        (try rt.reserveNative(0, native_plan)).?.observe(100, 1, native_plan.m_lo + 1);
+        (try rt.reserveNative(0, native_plan)).?.observe(100, 1, native_plan.m_lo + 1);
+        rt.cut.prices.observe(4, 1, .chain, 0, .generic);
+        var measured = (try gen.mtpLookupChain(a, gen.mtpRoundPlan(), 47)) orelse return error.ExpectedMeasuredLookup;
+        defer measured.deinit(a);
+        try testing.expectEqual(@as(u32, 3), measured.m);
+        // A dispatched native successor is sunk work, not this cold comparator.
+        try testing.expectEqual(@as(u32, 0), try gen.mtpLookupDrafts(a, gen.mtpRoundPlan(), 47));
+        var other_plan = native_plan;
+        other_plan.m_hi += 1;
+        try testing.expect((try gen.mtpLookupChain(a, other_plan, 47)) == null);
+    }
+}
+
+test "plugin MTP economics: alternating extension widths require a warmed native comparator" {
+    const a = testing.allocator;
+    const economics = @import("../spec/mtp/economics.zig");
+    const Watch = @import("../../../sdk/util/io_util.zig").Stopwatch;
+    var selection = history_env.override(.MLX_SERVE_LOOKUP_SELECTION, "adaptive");
+    defer selection.restore();
+    var prices = history_env.override(.MLX_SERVE_LOOKUP_PRICES, null);
+    defer prices.restore();
+    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
+    defer corpus.restore();
+    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
+    defer readonly.restore();
+    const bounds = depth_bounds.active;
+    depth_bounds.active = .{ .min = 2, .max = 4 };
+    defer depth_bounds.active = bounds;
+    const predraft = history_trace.mtp_predraft_override;
+    history_trace.mtp_predraft_override = false;
+    defer history_trace.mtp_predraft_override = predraft;
+    var rig: HistoryRig = undefined;
+    try rig.open();
+    defer rig.close();
+    var gen = try rig.generator(&history_query);
+    defer gen.deinit(a);
+    var document: [17]u32 = undefined;
+    @memcpy(document[0..16], &history_query);
+    document[16] = gen.next_token_id;
+    const path = try rig.store("economics-extending-probes", &document, &history_external);
+    defer a.free(path);
+    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
+    defer store.restore();
+    const plan: @import("../spec/mtp/ev_plan.zig").MtpRoundPlan = .{ .m_lo = 2, .m_hi = 4, .tau_ln = -0.5 };
+    try testing.expect((try gen.mtpLookupChain(a, plan, gen.next_token_id)) == null);
+    const rt = gen.mtp_economics.?;
+    for ([_]bool{ false, true, false }, 0..) |extend, round| {
+        try testing.expect(economics.probePending(&gen, plan));
+        const watch = Watch.init(gen.timer.io);
+        const chain = blk: {
+            var draft = try economics.initChain(&gen, a, plan, gen.next_token_id);
+            errdefer draft.deinit(a);
+            try gen.mtpChainBuild(&draft, 0, plan.m_lo);
+            // Control only the confidence gate; drafts, served head state,
+            // verifier, commit, clocks and economics finish remain real.
+            const confidence: f32 = if (extend) -0.1 else -1;
+            for (draft.conf_arrs.?[0..draft.n_conf]) |*arr| {
+                _ = mlx.mlx_array_free(arr.*);
+                arr.* = mlx.mlx_array_new_data(&confidence, &[_]c_int{1}, 1, .float32);
+            }
+            break :blk draft;
+        };
+        var st = try gen.mtpRoundAfterChain(a, chain, false, watch, watch);
+        defer st.deinit(a);
+        try testing.expectEqual(@as(u32, if (extend) 5 else 3), st.verify_len);
+        _ = try historyFinish(&gen, &st, null);
+        if (round == 0) {
+            try testing.expect(rt.nativeFor(0, plan) == null);
+        } else if (round == 1) {
+            try testing.expect(rt.nativeFor(0, plan) == null);
+            try testing.expect(rt.cut.prices.known(3, .chain, 0, .generic) == null);
+            try testing.expect(rt.cut.prices.known(5, .chain, 0, .generic) == null);
+            try testing.expect(economics.probePending(&gen, plan));
+        } else {
+            try testing.expect(rt.nativeFor(0, plan) != null);
+            try testing.expect(rt.cut.prices.known(3, .chain, 0, .generic) != null);
+            try testing.expect(!economics.probePending(&gen, plan));
+        }
+    }
+    try testing.expectEqual(@as(u32, 3), rt.probes.getPtr(0).?.cells[0].attempts);
 }

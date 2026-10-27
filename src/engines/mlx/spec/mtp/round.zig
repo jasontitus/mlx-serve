@@ -302,7 +302,7 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     } else blk: {
         const plan_now = self.mtpRoundPlan();
         if (try self.mtpLookupChain(allocator, plan_now, self.next_token_id)) |lc| break :blk lc;
-        var c = try self.mtpChainInit(allocator, plan_now, self.next_token_id);
+        var c = try @import("economics.zig").initChain(self, allocator, plan_now, self.next_token_id);
         errdefer c.deinit(allocator);
         if (self.mtp_batch_head) {
             return .{ .open = .{
@@ -391,6 +391,7 @@ pub fn mtpRoundAfterChain(
         }
     }
     const m: u32 = chain.m;
+    try @import("economics.zig").beginTarget(self, &chain, round_watch);
     // Chain complete — release the chain hidden (only chunk B needed it).
     if (chain.h_chain) |h| {
         _ = mlx.mlx_array_free(h);

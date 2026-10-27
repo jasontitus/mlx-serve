@@ -1791,14 +1791,14 @@ const fp8_served = [_]Shape{ shp(1, 640, 4096), shp(8, 640, 2560), shp(3, 512, 3
 
 /// The row-exact decode's projections on M1..M4 (and wherever lane_qmm declines): Nemotron-H (2688, 1856) and dense
 /// qwen3_5 widths (4096, 1024), both K-chunk counts (16 to N 2048, 8 past it). scalar: one row; rows: 2..3 at 4 bits;
-/// frag (with prep): 2..8; mma: past 8, and one row where scalar's bits are not mma's.
+/// frag (with prep): 2..16; mma: past 16, and one row where scalar's bits are not mma's.
 const sq_registrations = .{
     .{ SqKind.scalar, 1, &[_]Shape{ shp(256, 1, 4096), shp(512, 1, 2688) }, [3]spec.Tile{ .{ .size = 2, .step = 1, .min = 1 }, .{}, .{ .size = 1024, .step = 64, .min = 64 } } },
     .{ SqKind.rows, 2, &[_]Shape{ shp(256, 1, 4096), shp(512, 1, 2688) }, [3]spec.Tile{ .{ .size = 2, .step = 1, .min = 1 }, .{}, .{} } },
     .{ SqKind.rows, 3, &[_]Shape{ shp(256, 1, 4096), shp(512, 1, 2688) }, [3]spec.Tile{ .{ .size = 2, .step = 1, .min = 1 }, .{}, .{} } },
     .{ SqKind.mma, 0, &[_]Shape{ shp(16, 1024, 2688), shp(12, 4096, 1024), shp(9, 1024, 1856) }, [3]spec.Tile{ .{ .size = 8, .step = 1, .min = 1 }, .{ .size = 32, .step = 8, .min = 8 }, .{} } },
-    .{ SqKind.frag, 0, &[_]Shape{ shp(2, 2048, 4096), shp(8, 1024, 2688) }, [3]spec.Tile{ .{ .size = 8, .step = 1, .min = 2 }, .{}, .{} } },
-    .{ SqKind.prep, 0, &[_]Shape{ shp(2, 8, 4096), shp(8, 8, 2688) }, [3]spec.Tile{ .{ .size = 8, .step = 1, .min = 1 }, .{}, .{} } },
+    .{ SqKind.frag, 0, &[_]Shape{ shp(2, 2048, 4096), shp(8, 1024, 2688), shp(9, 4096, 1024), shp(15, 1024, 2688), shp(16, 1024, 2688) }, [3]spec.Tile{ .{ .size = 8, .step = 1, .min = 2 }, .{}, .{} } },
+    .{ SqKind.prep, 0, &[_]Shape{ shp(2, 8, 4096), shp(8, 8, 2688), shp(9, 8, 4096), shp(16, 8, 2688) }, [3]spec.Tile{ .{ .size = 8, .step = 1, .min = 1 }, .{}, .{} } },
 };
 
 /// The row-exact decode on M5 (DFlash verify windows up to 16 rows, any width to 128): Nemotron-H and dense

@@ -927,12 +927,20 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
 test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
     // A tree of 1 or 2 nodes has fewer rows than the conv window it commits.
     for ([_]usize{ 1, 2, 8 }) |nodes| {
-        try gdnDecodeTreeCase(.bfloat16, nodes);
-        try gdnDecodeTreeCase(.float32, nodes);
+        try gdnDecodeTreeCase(.bfloat16, nodes, false);
+        try gdnDecodeTreeCase(.float32, nodes, false);
     }
 }
 
-fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
+test "gdn_decode linear tree: 9..16 rows match generic recurrence and every prefix replay" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    for ([_]usize{ 9, 15, 16 }) |nodes| {
+        try gdnDecodeTreeCase(.bfloat16, nodes, true);
+        try gdnDecodeTreeCase(.float32, nodes, true);
+    }
+}
+
+fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize, linear: bool) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x7EE);
     const rnd = prng.random();
@@ -945,8 +953,16 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
     // every prefix is a tree of its own.
     const all_parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
     const all_paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
-    const parents = all_parents[0..nodes];
-    const paths = all_paths[0..nodes];
+    var linear_parents: [16]i32 = undefined;
+    var linear_order: [16]i32 = undefined;
+    var linear_paths: [16][]const i32 = undefined;
+    for (0..16) |row| {
+        linear_parents[row] = @as(i32, @intCast(row)) - 1;
+        linear_order[row] = @intCast(row);
+        linear_paths[row] = linear_order[0 .. row + 1];
+    }
+    const parents = if (linear) linear_parents[0..nodes] else all_parents[0..nodes];
+    const paths = if (linear) linear_paths[0..nodes] else all_paths[0..nodes];
     const w: c_int = @intCast(nodes);
     const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, w, c_dim }, 1.0, dt, s);
     defer _ = mlx.mlx_array_free(qkv);
@@ -969,14 +985,21 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
             return .{ .qkv = q, .z = f[6], .a = aa, .b = bb, .conv_state = f[0], .ssm_state = f[1], .conv_w = f[2], .A_log = f[3], .dt_bias = f[4], .q_scale = qs, .k_scale = qs, .norm_w = f[5], .eps = e, .signs = .{ .ctx = null } };
         }
     }.of;
-    var table: [6 * all_parents.len]i32 = undefined;
+    var table: [6 * 16]i32 = undefined;
     gdn_decode.treeTable(parents, table[0 .. 6 * nodes]);
     const tab = mlx.mlx_array_new_data(&table, &[_]c_int{6 * w}, 1, .int32);
     defer _ = mlx.mlx_array_free(tab);
-    const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, s)) orelse return error.TreeDeclined;
+    const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, linear, s)) orelse return error.TreeDeclined;
     defer inline for (.{ tree.y, tree.conv_input, tree.prework.k, tree.prework.v, tree.prework.gb }) |x| {
         _ = mlx.mlx_array_free(x);
     };
+    if (linear) {
+        const generic = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, false, s)) orelse return error.TreeDeclined;
+        defer inline for (.{ generic.y, generic.conv_input, generic.prework.k, generic.prework.v, generic.prework.gb }) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(tree.y, generic.y, s));
+    }
     // Read in place from a joined [qkv | z | a | b] projection, the same bits.
     {
         var all = mlx.mlx_array_new();
@@ -993,7 +1016,7 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
         try sliceQkvPart(&parts[0], all, 0, c_dim, s);
         try sliceQkvPart(&parts[1], all, a_off, hv, s);
         try sliceQkvPart(&parts[2], all, a_off + hv, hv, s);
-        const j = (try gdn_decode.recurTree(g, w, inputs(parts[0], parts[1], parts[2], fixed, q_scale, eps_arr), .{ .all = all, .a_off = a_off, .b_off = a_off + hv }, tab, s)) orelse return error.JoinedDeclined;
+        const j = (try gdn_decode.recurTree(g, w, inputs(parts[0], parts[1], parts[2], fixed, q_scale, eps_arr), .{ .all = all, .a_off = a_off, .b_off = a_off + hv }, tab, linear, s)) orelse return error.JoinedDeclined;
         defer inline for (.{ j.y, j.conv_input, j.prework.k, j.prework.v, j.prework.gb }) |x| {
             _ = mlx.mlx_array_free(x);
         };

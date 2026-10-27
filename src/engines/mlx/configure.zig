@@ -16,12 +16,18 @@ const depth_bounds = @import("spec/mtp_depth_bounds.zig");
 const mlx_stream = @import("modules/stream.zig");
 
 pub fn settings(out: *host.Settings) void {
+    const lookup = @import("spec/economics_settings.zig").selection();
     out.* = .{
         .prefill_chunk = generate_mod.prefillCli().override,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .prefill_decode_share = prefill_interleave.prefillDecodeShare(),
         .mtp_head_kv_quant = @import("transformer.zig").cli().mtp_head_kv_quant,
         .explicit_prefill_chunk = generate_mod.explicitPrefillChunkU32(),
+        .lookup = .{
+            .selection = @tagName(lookup.mode),
+            .rows = lookup.rows,
+            .history_enabled = @import("spec/history.zig").enabled(),
+        },
     };
 }
 

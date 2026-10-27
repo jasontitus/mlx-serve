@@ -211,6 +211,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .tree = if (f.tree.table.ctx == null) null else .{
             .table = .{ .ctx = f.tree.table.ctx },
             .attn = .{ .depth = .{ .ctx = f.tree.depth.ctx }, .path = .{ .ctx = f.tree.path.ctx }, .max_depth = f.tree.max_depth },
+            .linear = f.size >= @sizeOf(abi.Forward) and f.tree_linear_gdn,
         },
         .pipeline_every = f.pipeline_every,
     };

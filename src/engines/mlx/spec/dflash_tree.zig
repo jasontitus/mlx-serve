@@ -12,6 +12,8 @@ const Generator = @import("../generate/generator.zig").Generator;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dflashTraceEnabled = @import("mtp/trace.zig").dflashTraceEnabled;
 const verifyArgmax = @import("verify.zig").verifyArgmax;
+const economics = @import("dflash/economics.zig");
+const adapter = @import("lookup_adapter.zig");
 
 
 var dflash_tree_logged = false;
@@ -63,13 +65,17 @@ pub fn dflashTreeRound(
     kv_step_snap: usize,
     serial: bool,
     copy: []const u32,
+    flight: ?*economics.Flight,
 ) !DrafterStepResult {
     const xfm = self.xfm;
     const s = xfm.s;
     const MAX_W = DFLASH_TREE_W;
     const tracing = dflashTraceEnabled();
     var ph = io_util.Stopwatch.init(self.timer.io);
-    const max_nodes = dflashTreeNodes(m);
+    const max_nodes = if (flight != null) MAX_W - 1 else dflashTreeNodes(m);
+    const depth_limit = economics.depthLimit(self.max_tokens -| self.completion_tokens);
+    var candidate = economics.Tree.init(t1);
+    var native = economics.Tree.init(t1);
     if (!dflash_tree_logged) {
         dflash_tree_logged = true;
         log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{max_nodes});
@@ -84,19 +90,26 @@ pub fn dflashTreeRound(
     parents[0] = -1;
     depth[0] = 0;
     toks[0] = @intCast(t1);
-    if (copy.len == 0) {
+    if (copy.len == 0 and draft_logits != null) {
         var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden.?, draft_logits.?, t1, s);
         defer lat.deinit(allocator);
         // A sampled target's scores carry its own noise at each position's candidates.
         const noise: ?[]f32 = if (serial) try self.treeNoise(allocator, &lat) else null;
         defer if (noise) |nz| allocator.free(nz);
+        var admission: [MAX_W - 1]usize = undefined;
+        var confidence: [MAX_W - 1]f32 = undefined;
         var tree = try dflash_mod.bestFirstTree(allocator, &lat, .{
             .max_nodes = max_nodes,
             .temperature = if (serial) self.sampling.temperature else 1.0,
             .noise = noise,
+            .admission_order = if (flight != null) &admission else null,
+            .confidence = if (flight != null) &confidence else null,
         });
         defer tree.deinit(allocator);
-        for (tree.tokens, tree.parents, tree.depth) |tok, par, d| {
+        if (flight != null) {
+            candidate = adapter.neuralTree(t1, tree.tokens, tree.parents, tree.depth, confidence[0..tree.tokens.len], depth_limit);
+            native = adapter.neuralAdmissionTree(&candidate, tree.tokens, tree.parents, admission[0..tree.tokens.len], dflashTreeNodes(m));
+        } else for (tree.tokens, tree.parents, tree.depth) |tok, par, d| {
             parents[w] = if (par < 0) 0 else par + 1;
             depth[w] = @intCast(d + 1);
             toks[w] = @intCast(tok);
@@ -108,11 +121,30 @@ pub fn dflashTreeRound(
         log.info("[dflash] context copy verified as the round's chain ({d} rows)\n", .{copy.len + 1});
     }
     for (copy, 1..) |tok, d| {
-        parents[w] = @intCast(w - 1);
-        depth[w] = @intCast(d);
-        toks[w] = @intCast(tok);
-        w += 1;
+        if (flight != null) {
+            // The backed native copy remains a complete eligible incumbent;
+            // mixed projection never silently replaces its chain geometry.
+            const row = native.add(d - 1, tok, 1, .look, 1).?;
+            native.look_order[row] = DFLASH_COPY_MATCH;
+        } else {
+            parents[w] = @intCast(w - 1);
+            depth[w] = @intCast(d);
+            toks[w] = @intCast(tok);
+            w += 1;
+        }
     }
+    if (flight) |f| {
+        if (copy.len > 0) candidate = native;
+        f.select(&native, &candidate, copy.len > 0);
+        w = f.chosen.len;
+        std.debug.assert(w <= MAX_W);
+        for (0..w) |i| {
+            parents[i] = f.chosen.parents[i];
+            depth[i] = if (i == 0) 0 else depth[@intCast(parents[i])] + 1;
+            toks[i] = @intCast(f.chosen.tokens[i]);
+        }
+    }
+    self.dflash_round_width = @intCast(w - 1);
     var max_depth: i32 = 0;
     for (depth[0..w]) |d| max_depth = @max(max_depth, d);
     if (tracing) {
@@ -131,6 +163,7 @@ pub fn dflashTreeRound(
         allocator.free(cap_out);
     }
     for (cap_out) |*a| a.* = mlx.mlx_array_new();
+    if (flight) |f| try f.beginVerify(self);
     var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
     self.ctx.capture_layers = &cl;
     self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
@@ -164,25 +197,21 @@ pub fn dflashTreeRound(
 
     // Walk the target's tokens down the tree.
     var path_rows: [MAX_W]u32 = undefined;
-    path_rows[0] = 0;
-    var accepted: u32 = 0;
-    walk: while (true) {
-        const cur = path_rows[accepted];
-        const want: i32 = ids[cur];
-        for (1..w) |c| {
-            if (parents[c] == @as(i32, @intCast(cur)) and toks[c] == want) {
-                accepted += 1;
-                path_rows[accepted] = @intCast(c);
-                continue :walk;
-            }
-        }
-        break;
+    var accepted = walkTree(toks[0..w], parents[0..w], ids, &path_rows);
+    const raw_accepted = accepted;
+    if (flight) |f| {
+        var reached: [MAX_W]u32 = undefined;
+        for (path_rows[1 .. accepted + 1], 0..) |row, i| reached[i] = @intCast(toks[row]);
+        reached[accepted] = @intCast(ids[path_rows[accepted]]);
+        f.accept(reached[0 .. accepted + 1]);
     }
     accepted = capAcceptedForTokenBudget(accepted, self.completion_tokens, self.max_tokens);
-    const next_pending: u32 = @intCast(ids[path_rows[accepted]]);
+    const eos_stop = clipAtEos(toks[0..w], path_rows[0 .. accepted + 1], self.eos_token_ids);
+    if (eos_stop) |stop| accepted = stop.accepted;
+    const next_pending: u32 = if (eos_stop) |stop| stop.token else @intCast(ids[path_rows[accepted]]);
     if (serial) self.sampling.draw = self.generated_ids.items.len + accepted + 2;
     // A copy that keeps nothing four rounds running pauses the copies.
-    if (copy.len > 0) {
+    if (copy.len > 0 and (flight == null or flight.?.retained_native)) {
         self.dflash_copy_misses = if (accepted == 0) self.dflash_copy_misses + 1 else 0;
         if (self.dflash_copy_misses >= 4) {
             self.dflash_copy_misses = 0;
@@ -247,11 +276,16 @@ pub fn dflashTreeRound(
     }
 
     const tokens = try allocator.alloc(u32, n_commit);
+    errdefer allocator.free(tokens);
+    try self.generated_ids.ensureUnusedCapacity(allocator, n_commit);
     for (0..n_commit) |j| tokens[j] = @intCast(toks[path_rows[j]]);
-    for (tokens) |t| try self.generated_ids.append(allocator, t);
+    // No fallible pricing work may follow publication of generated IDs.
+    if (flight) |f| try f.finish(self, raw_accepted, @intCast(n_commit));
+    self.generated_ids.appendSliceAssumeCapacity(tokens);
     self.dflash_accepted_tokens += accepted;
     self.next_token_id = next_pending;
     self.advanceStep(@intCast(n_commit));
+    if (flight) |f| f.recordCommitted(self.external_history, path_rows[0..n_commit]);
     self.checkDflashRuntimeGate();
     if (self.completion_tokens >= self.max_tokens) {
         self.done = true;
@@ -262,4 +296,49 @@ pub fn dflashTreeRound(
         self.dflash_gap_watch = io_util.Stopwatch.init(self.timer.io);
     }
     return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
+}
+
+/// Host walk is the single source of rows used by KV compaction, recurrent
+/// rollback and assistant capture gathering. A rejected sibling is never kept.
+fn walkTree(tokens: []const i32, parents: []const i32, targets: []const i32, path: *[DFLASH_TREE_W]u32) u32 {
+    std.debug.assert(tokens.len == parents.len and targets.len >= tokens.len and tokens.len <= DFLASH_TREE_W);
+    path[0] = 0;
+    var accepted: u32 = 0;
+    walk: while (true) {
+        const current = path[accepted];
+        for (1..tokens.len) |row| {
+            if (parents[row] == @as(i32, @intCast(current)) and tokens[row] == targets[current]) {
+                accepted += 1;
+                path[accepted] = @intCast(row);
+                continue :walk;
+            }
+        }
+        return accepted;
+    }
+}
+
+const EosStop = struct { accepted: u32, token: u32 };
+fn clipAtEos(tokens: []const i32, path: []const u32, eos: []const u32) ?EosStop {
+    for (path[1..], 1..) |row, depth| {
+        const token: u32 = @intCast(tokens[row]);
+        for (eos) |stop| if (token == stop) return .{ .accepted = @intCast(depth - 1), .token = token };
+    }
+    return null;
+}
+
+test "DFlash tree walk supplies noncontiguous rollback rows and correction" {
+    var path: [DFLASH_TREE_W]u32 = undefined;
+    const accepted = walkTree(&.{ 10, 11, 12, 21, 22 }, &.{ -1, 0, 1, 0, 3 }, &.{ 21, 99, 99, 22, 30 }, &path);
+    try std.testing.expectEqual(@as(u32, 2), accepted);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 4 }, path[0 .. accepted + 1]);
+    const clipped = capAcceptedForTokenBudget(accepted, 0, 2);
+    try std.testing.expectEqual(@as(u32, 1), clipped);
+    try std.testing.expectEqual(@as(u32, 3), path[clipped]);
+}
+
+test "DFlash EOS censors the kept path before rollback and publication" {
+    const stop = clipAtEos(&.{ 10, 11, 99, 21, 22 }, &.{ 0, 3, 4 }, &.{22}).?;
+    try std.testing.expectEqual(@as(u32, 1), stop.accepted);
+    try std.testing.expectEqual(@as(u32, 22), stop.token);
+    try std.testing.expect(clipAtEos(&.{ 10, 11, 99, 21, 22 }, &.{ 0, 3 }, &.{99}) == null);
 }

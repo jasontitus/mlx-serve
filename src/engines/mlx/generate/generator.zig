@@ -312,6 +312,9 @@ pub const Generator = struct {
     mtp_lookup_gen: usize = 0,
     /// Lazily allocated only when external history is configured.
     external_history: ?*@import("../spec/history.zig").Request = null,
+    mtp_economics: ?*@import("../spec/mtp/economics.zig").Runtime = null,
+    dflash_economics: ?*@import("../spec/dflash/economics.zig").Runtime = null,
+    mtp_economics_carried: bool = false,
     /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
     mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
     mtp_round_ema: f32 = 0,
@@ -557,6 +560,16 @@ pub const Generator = struct {
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        if (self.mtp_economics) |runtime| {
+            runtime.deinit();
+            allocator.destroy(runtime);
+            self.mtp_economics = null;
+        }
+        if (self.dflash_economics) |runtime| {
+            runtime.deinit();
+            allocator.destroy(runtime);
+            self.dflash_economics = null;
+        }
         if (self.external_history) |request| {
             request.deinit();
             allocator.destroy(request);

@@ -52,7 +52,7 @@ pub const Memo = struct {
 };
 
 /// Draft-tree verify rows (`abi.Tree`): the GDN table and the attention rows' depths and ancestor paths.
-pub const Tree = struct { table: Array, attn: @import("../blocks/attention/row_attn.zig").Tree };
+pub const Tree = struct { table: Array, attn: @import("../blocks/attention/row_attn.zig").Tree, linear: bool = false };
 
 /// One forward as a block sees it. `g` is the current layer's graph: arrays made in it die with the layer unless
 /// the base keeps them.

@@ -449,6 +449,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         } else .{},
         .pipeline_every = ctx.pipeline_build,
         .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
+        .tree_linear_gdn = if (ctx.tree) |t| t.linear and
+            (if (xfm.config.plugin) |pb| pb.parsed.caps.spec_tree_linear_gdn else false) else false,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

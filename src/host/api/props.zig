@@ -128,6 +128,7 @@ const PropsSettings = struct {
     prefix_cache_ram_enabled: bool = true,
     /// `--prefill-decode-share`: decode's target wall-time fraction during another slot's prefill.
     prefill_decode_share: f32 = 0,
+    lookup: ?mlx_engine.LookupSettings = null,
 };
 
 const PropsEngine = @import("../engines/served.zig").Kind;
@@ -146,6 +147,7 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
     out.drafter = "none";
     out.pld = PldDefaults.off;
     out.prefill_decode_share = 0;
+    out.lookup = null;
     return out;
 }
 
@@ -193,6 +195,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefix_cache_disk_bytes = http_server.launch().prefix_cache_disk_bytes,
         .prefix_cache_ram_enabled = http_server.launch().prefix_cache_capacity > 0 and http_server.launch().prefix_cache_ram_enabled,
         .prefill_decode_share = es.prefill_decode_share,
+        .lookup = es.lookup,
     };
 }
 
@@ -213,7 +216,14 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}}", .{
             st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
         });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    var lookup_buf: [160]u8 = undefined;
+    const lookup_json = if (st.lookup) |lookup|
+        try std.fmt.bufPrint(&lookup_buf, "{{\"version\":{d},\"selection\":\"{s}\",\"rows\":{d},\"history_enabled\":{}}}", .{
+            lookup.version, lookup.selection, lookup.rows, lookup.history_enabled,
+        })
+    else
+        "null";
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}},\"lookup\":{s}}}", .{
         build_options.version,     st.engine,
         st.kv_quant,               @tagName(st.kv_attn_mode),
         st.decode_attn_quant,      st.prefill_chunk,
@@ -222,6 +232,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         st.pld.key_len,            st.max_concurrent,
         st.prefill_decode_share,   st.prefix_cache_ram_enabled,
         st.prefix_cache_mem_bytes, st.prefix_cache_disk_bytes,
+        lookup_json,
     });
 }
 
@@ -452,6 +463,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .max_concurrent = 4,
         .prefix_cache_mem_bytes = 2048,
         .prefix_cache_disk_bytes = 0,
+        .lookup = .{ .selection = "fixed", .rows = 9, .history_enabled = true },
     });
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
@@ -471,6 +483,10 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectApproxEqAbs(@as(f64, 0.95), mtp.get("acceptance_param").?.float, 1e-6);
     try testing.expectEqual(@as(i64, 32768), mtp.get("max_ctx").?.integer);
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
+    const lookup = st.get("lookup").?.object;
+    try testing.expectEqualStrings("fixed", lookup.get("selection").?.string);
+    try testing.expectEqual(@as(i64, 9), lookup.get("rows").?.integer);
+    try testing.expect(lookup.get("history_enabled").?.bool);
 
     const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .kv_attn_mode = .dense, .decode_attn_quant = false, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
     defer testing.allocator.free(exact);
@@ -567,6 +583,12 @@ test "embeddedEngineSettings: an engine-backed model reports only the levers its
 
     try testing.expect(embeddedEngineSettings(base, .mlx, false).decode_attn_quant);
     try testing.expectEqual(@as(f32, 0.5), embeddedEngineSettings(base, .mlx, false).prefill_decode_share);
+    var configured = base;
+    configured.lookup = .{ .selection = "adaptive", .history_enabled = true };
+    for ([_]PropsEngine{ .ds4, .llama, .ane }) |engine| {
+        try testing.expect(embeddedEngineSettings(configured, engine, false).lookup == null);
+    }
+    try testing.expect(embeddedEngineSettings(configured, .mlx, false).lookup.?.history_enabled);
 }
 
 test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {

@@ -113,6 +113,14 @@ pub const Facts = struct {
     hot_cache_bytes: u64 = 0,
 };
 
+/// Parsed controller configuration, not per-request engagement or hardware support.
+pub const LookupSettings = struct {
+    version: u32 = 1,
+    selection: []const u8 = "native",
+    rows: u32 = 0,
+    history_enabled: bool = false,
+};
+
 /// Engine-wide settings `/props` reports.
 pub const Settings = struct {
     prefill_chunk: usize = 0,
@@ -121,6 +129,7 @@ pub const Settings = struct {
     mtp_head_kv_quant: bool = false,
     /// `--prefill-chunk` when given, else 0.
     explicit_prefill_chunk: u32 = 0,
+    lookup: LookupSettings = .{},
 };
 
 /// Live engine numbers the metrics sampler publishes.

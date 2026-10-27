@@ -53,12 +53,15 @@ pub fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is
 /// The next round's empty chain, or null when this request must not pre-draft.
 /// `allow_lookup`: false for group pre-drafts, which build every chain batched.
 pub fn mtpPreDraftOpen(self: *Generator, allocator: std.mem.Allocator, allow_lookup: bool) !?MtpPreDraft {
+    self.mtp_economics_carried = true;
+    defer self.mtp_economics_carried = false;
     if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return null;
     if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_planner_pending) return null;
     std.debug.assert(self.mtp_pre_draft == null);
     const plan = self.mtpRoundPlan();
     // The plan itself can end speculation or park the request on a serial probe.
     if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return null;
+    if (@import("economics.zig").probePending(self, plan)) return null;
     if (allow_lookup) if (try self.mtpLookupChain(allocator, plan, self.next_token_id)) |chain| return chain;
     return try self.mtpChainInit(allocator, plan, self.next_token_id);
 }

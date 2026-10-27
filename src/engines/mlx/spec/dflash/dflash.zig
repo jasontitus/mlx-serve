@@ -2212,6 +2212,10 @@ pub const TreeParams = struct {
     /// into the scores (null for a greedy target).
     noise: ?[]const f32 = null,
     noise_w: f32 = 0.7,
+    /// Optional caller-owned metadata, reordered with the execution rows.
+    /// Admission rank preserves the native best-first incumbent after preorder.
+    admission_order: ?[]usize = null,
+    confidence: ?[]f32 = null,
 };
 
 /// Nodes in the order taken (a parent always before its children): `tokens`,
@@ -2233,8 +2237,16 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
     const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
     var queue: std.ArrayList(Item) = .empty;
     defer queue.deinit(allocator);
-    var tree = DraftTree{ .tokens = try allocator.alloc(u32, p.max_nodes), .parents = try allocator.alloc(i32, p.max_nodes), .depth = try allocator.alloc(u32, p.max_nodes) };
-    errdefer tree.deinit(allocator);
+    var transferred = false;
+    const tokens = try allocator.alloc(u32, p.max_nodes);
+    errdefer if (!transferred) allocator.free(tokens);
+    const parents = try allocator.alloc(i32, p.max_nodes);
+    errdefer if (!transferred) allocator.free(parents);
+    const depths = try allocator.alloc(u32, p.max_nodes);
+    errdefer if (!transferred) allocator.free(depths);
+    const tree = DraftTree{ .tokens = tokens, .parents = parents, .depth = depths };
+    if (p.admission_order) |out| std.debug.assert(out.len >= p.max_nodes);
+    if (p.confidence) |out| std.debug.assert(out.len >= p.max_nodes);
     var scores: [64]f32 = undefined;
     std.debug.assert(k <= scores.len);
 
@@ -2278,22 +2290,41 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
         tree.parents[n] = it.parent;
         tree.depth[n] = it.depth;
+        if (p.confidence) |out| out[n] = it.value;
         if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
         n += 1;
     }
-    if (n < p.max_nodes) {
+    if (p.confidence) |out| {
+        // Descending conversion leaves each parent's log reach intact.
+        var row = n;
+        while (row > 0) {
+            row -= 1;
+            const parent = tree.parents[row];
+            out[row] = @exp(out[row] - if (parent < 0) @as(f32, 0) else out[@intCast(parent)]);
+        }
+    }
+    // Transfer the allocations before shrinking so a later allocation failure
+    // releases the current slices, never stale pre-realloc pointers.
+    transferred = true;
+    return finishTree(allocator, tree, n, p);
+}
+
+fn finishTree(allocator: std.mem.Allocator, initial: DraftTree, n: usize, p: TreeParams) !DraftTree {
+    var tree = initial;
+    errdefer tree.deinit(allocator);
+    if (n < tree.tokens.len) {
         tree.tokens = try allocator.realloc(tree.tokens, n);
         tree.parents = try allocator.realloc(tree.parents, n);
         tree.depth = try allocator.realloc(tree.depth, n);
     }
-    try preorder(allocator, &tree);
+    try preorder(allocator, &tree, p.admission_order, p.confidence);
     return tree;
 }
 
 /// Renumber the nodes depth-first, each node's children in the order they
 /// were taken (best first): the likeliest path lands on consecutive rows, so
 /// a round that keeps it moves no KV rows.
-fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
+fn preorder(allocator: std.mem.Allocator, t: *DraftTree, admission_order: ?[]usize, confidence: ?[]f32) !void {
     const n = t.tokens.len;
     if (n == 0) return;
     const order = try allocator.alloc(usize, n);
@@ -2325,10 +2356,14 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     defer allocator.free(parents);
     const depth = try allocator.dupe(u32, t.depth);
     defer allocator.free(depth);
+    const old_confidence = if (confidence) |values| try allocator.dupe(f32, values[0..n]) else null;
+    defer if (old_confidence) |values| allocator.free(values);
     for (order, 0..) |old, i| {
         t.tokens[i] = tokens[old];
         t.depth[i] = depth[old];
         t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
+        if (admission_order) |values| values[i] = old;
+        if (confidence) |values| values[i] = old_confidence.?[old];
     }
 }
 
@@ -4882,4 +4917,41 @@ test "dflash: native LiLiCorr configs preserve borrowed and own output heads" {
         if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
         try testing.expectEqualSlices(u32, case.captures, config.captureIds());
     }
+}
+
+test "DFlash economics preserves best-first admission across preorder" {
+    const allocator = std.testing.allocator;
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22 };
+    var unary = [_]f32{ 0, 0, -10, 0, -5, -10 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [9]f32 = @splat(0);
+    const lat = Lattice{ .m = 2, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var admission: [4]usize = undefined;
+    var confidence: [4]f32 = undefined;
+    var wide = try bestFirstTree(allocator, &lat, .{ .max_nodes = 4, .tau = 1, .edge_w = 1, .children = 2, .admission_order = &admission, .confidence = &confidence });
+    defer wide.deinit(allocator);
+    var small = try bestFirstTree(allocator, &lat, .{ .max_nodes = 2, .tau = 1, .edge_w = 1, .children = 2 });
+    defer small.deinit(allocator);
+    const adapter = @import("../lookup_adapter.zig");
+    const neural = adapter.neuralTree(99, wide.tokens, wide.parents, wide.depth, &confidence, 15);
+    const incumbent = adapter.neuralAdmissionTree(&neural, wide.tokens, wide.parents, &admission, 2);
+    try testing.expectEqualSlices(u32, small.tokens, incumbent.tokens[1..incumbent.len]);
+    try testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, incumbent.parents[0..incumbent.len]);
+    for (confidence) |value| try testing.expect(value > 0 and value <= 1);
+}
+
+fn allocationFailureTree(allocator: std.mem.Allocator) !void {
+    var cands = [_]i32{ 10, 11, 20, 21 };
+    var unary = [_]f32{ 0, -1, 0, -1 };
+    var e0 = [_]f32{ 0, 0 };
+    var e: [4]f32 = @splat(0);
+    const lat = Lattice{ .m = 2, .k = 2, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var admission: [15]usize = undefined;
+    var confidence: [15]f32 = undefined;
+    var tree = try bestFirstTree(allocator, &lat, .{ .max_nodes = 15, .admission_order = &admission, .confidence = &confidence });
+    defer tree.deinit(allocator);
+}
+
+test "DFlash tree allocation failure releases partial and resized ownership" {
+    try testing.checkAllAllocationFailures(testing.allocator, allocationFailureTree, .{});
 }

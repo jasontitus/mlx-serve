@@ -270,6 +270,9 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     }
 
     const group_argmax = st.verify_argmax.present();
+    if (chain.economics) |flight| {
+        if (group_argmax or prepared) flight.solo = false;
+    }
     var verify_argmax = st.verify_argmax;
     st.verify_argmax = .{};
     defer verify_argmax.deinit();
@@ -511,6 +514,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
             self.mtp_trace.add(.commit, ph.read());
             ph.reset();
         }
+        try @import("economics.zig").finish(self, chain, m, observed_limit == m, st.verify_len);
         try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
         if (tracing) {
             self.mtp_trace.add(.predraft, ph.read());
@@ -621,6 +625,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.mtp_trace.add(.commit, ph.read());
         ph.reset();
     }
+    try @import("economics.zig").finish(self, chain, accepted, stop_prefix.stop == null and observed_limit == m, st.verify_len);
     try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
     if (tracing) {
         self.mtp_trace.add(.predraft, ph.read());

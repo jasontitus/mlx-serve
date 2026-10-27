@@ -391,7 +391,7 @@ fn treeVerify(w: *const Gdn.Weights, c: *Ctx, p: Proj, ins: gdn_decode.Inputs, s
     const geo = &w.geo;
     const wd = w.in.widths;
     const joined: ?gdn_decode.Joined = if (p.all) |all| .{ .all = all, .a_off = wd[0] + wd[1], .b_off = wd[0] + wd[1] + wd[2] } else null;
-    const r = (try gdn_decode.recurTree(geo.dec(), c.rows, ins, joined, table, g.s)) orelse return error.SpecTreeUnsupported;
+    const r = (try gdn_decode.recurTree(geo.dec(), c.rows, ins, joined, table, c.tree.?.linear, g.s)) orelse return error.SpecTreeUnsupported;
     inline for (.{ r.y, r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |x| _ = try g.adopt(x);
     const z_src = if (joined) |j| j.all else p.z;
     const z_off: c_int = if (joined != null) wd[0] else 0;

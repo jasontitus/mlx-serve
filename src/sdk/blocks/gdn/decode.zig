@@ -316,11 +316,13 @@ pub const RecurTree = struct { y: mlx.mlx_array, conv_input: mlx.mlx_array, prew
 
 var k1p_cache: ?mlx.mlx_fast_metal_kernel = null;
 var k1tr_cache: ?mlx.mlx_fast_metal_kernel = null;
-var tree_cfgs: [MAX_SEQ + 1]?[2]mlx.mlx_fast_metal_kernel_config = @splat(null);
+var tree_cfgs: [2][MAX_SEQ + 1]?[2]mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
 const TreeKey = struct { k: CfgKey, cols: [4]c_int };
 var tree_cfg_key: ?TreeKey = null;
+/// Test-only engagement evidence across the engine/plugin/SDK call boundary.
+pub var test_linear_tree_calls: usize = 0;
 
-fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, cols: [4]c_int) ![2]mlx.mlx_fast_metal_kernel_config {
+fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, cols: [4]c_int, linear: bool) ![2]mlx.mlx_fast_metal_kernel_config {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const pre = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(pre);
@@ -337,6 +339,7 @@ fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dt
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(tree, &[_]c_int{ 1, t_len, g.hv, g.dv }, 4, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(tree, 32, g.dv, g.hv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(tree, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(tree, "LINEAR", @intFromBool(linear)));
     for ([_]mlx.mlx_fast_metal_kernel_config{ pre, tree }) |cfg| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
@@ -352,10 +355,13 @@ fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dt
 /// commit slices, and the per-row recurrence inputs `replay` reads. The
 /// states stay where they were: the commit replays the kept path. `joined`,
 /// when in.qkv/a/b are slices of it, is read in place.
-pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: mlx.mlx_array, s: mlx.mlx_stream) !?RecurTree {
+pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: mlx.mlx_array, linear_proven: bool, s: mlx.mlx_stream) !?RecurTree {
     if (!mlx.streamIsGpu(s)) return null;
     const key = seqDtypes(g, t_len, in) orelse return null;
     if (!sizeIs(table, 6 * t_len)) return null;
+    const linear = linearTreeDispatch(t_len, linear_proven);
+    if (@import("builtin").is_test and linear) test_linear_tree_calls += 1;
+    const mode: usize = @intFromBool(linear);
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     var cols = [4]c_int{ c, g.hv, 0, 0 };
     var srcs = [3]mlx.mlx_array{ in.qkv, in.a, in.b };
@@ -369,15 +375,15 @@ pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: 
     if (k1tr_cache == null) k1tr_cache = try makeKernel("msv_gdn_decode_tree", &.{ "pq", "pk", "pv", "pg", "state_in", "parents" }, &.{"y"}, K1TR_SOURCE, "");
     const tkey = TreeKey{ .k = key, .cols = cols };
     if (tree_cfg_key == null or !std.meta.eql(tree_cfg_key.?, tkey)) {
-        for (&tree_cfgs) |*slot| if (slot.*) |cs| {
+        for (&tree_cfgs) |*modes| for (modes) |*slot| if (slot.*) |cs| {
             for (cs) |cfg| _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
             slot.* = null;
         };
         tree_cfg_key = tkey;
     }
     const idx: usize = @intCast(t_len);
-    if (tree_cfgs[idx] == null) tree_cfgs[idx] = try buildTreeConfigs(g, t_len, key.dt, key.st, cols);
-    const cfgs = tree_cfgs[idx].?;
+    if (tree_cfgs[mode][idx] == null) tree_cfgs[mode][idx] = try buildTreeConfigs(g, t_len, key.dt, key.st, cols, linear);
+    const cfgs = tree_cfgs[mode][idx].?;
 
     const in1 = [_]mlx.mlx_array{ srcs[0], srcs[1], srcs[2], in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, table };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
@@ -403,6 +409,20 @@ pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: 
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, o2, 0));
     return .{ .y = y, .conv_input = pre[4], .prework = .{ .k = pre[1], .v = pre[2], .gb = pre[3] } };
+}
+
+/// A proof is mandatory even at the profitable width; short native rows keep
+/// the existing kernel configuration and price namespace.
+pub fn linearTreeDispatch(rows: c_int, proven: bool) bool {
+    return proven and rows > 8 and rows <= MAX_SEQ;
+}
+
+test "GDN linear dispatch requires topology proof above eight rows" {
+    for ([_]c_int{ 1, 8, 9, 15, 16 }) |rows| {
+        try std.testing.expect(!linearTreeDispatch(rows, false));
+        try std.testing.expectEqual(rows > 8, linearTreeDispatch(rows, true));
+    }
+    try std.testing.expect(!linearTreeDispatch(MAX_SEQ + 1, true));
 }
 
 /// `recurTree`'s table for rows with `parents` (-1 = the root): the parents,

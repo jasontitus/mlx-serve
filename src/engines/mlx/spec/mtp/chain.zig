@@ -8,6 +8,7 @@ const transformer_mod = @import("../../transformer.zig");
 const tokenizer_mod = @import("../../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../../sdk/config/model.zig");
 const log = @import("../../../../sdk/util/log.zig");
+const io_util = @import("../../../../sdk/util/io_util.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../../sdk/spec/mtp_acceptance.zig");
@@ -202,10 +203,12 @@ pub const MtpPreDraft = struct {
     lookup: bool = false,
     /// Immutable source attribution for this flight, including grouped/clipped chains.
     external_history: bool = false,
+    economics: ?*@import("economics.zig").Flight = null,
     /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
     place: ?HeadPlace = null,
 
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
+        if (self.economics) |flight| allocator.destroy(flight);
         _ = mlx.mlx_array_free(self.t1_arr);
         if (self.place) |p| _ = mlx.mlx_array_free(p.live_end);
         for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
@@ -330,7 +333,7 @@ const LookupProposal = struct { match: mtp_lookup.Match, drafts: u32, external: 
 
 /// Keep stock prompt lookup as the incumbent. External history is considered
 /// only when that proposal loses the existing suffix/cost/acceptance gate.
-fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?LookupProposal {
+fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32, native_prepared: bool) !?LookupProposal {
     if (!mtpLookupEnabled() or self.mtp_batch_head) return null;
     if (group_planner.enabled() and self.mtp_planner_owned) return null;
     const idx = try self.mtpLookupIndex(allocator);
@@ -342,18 +345,28 @@ fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRound
         if (k > 0) return .{ .match = got, .drafts = k, .external = false };
     }
     if (remaining == 0 or idx.toks.items.len + 1 < mtp_lookup.MIN_SUFFIX) return null;
+    const economics = @import("economics.zig");
+    // The cold comparator cannot charge an already-dispatched successor twice.
+    if (native_prepared and economics.enabled()) return null;
+    const query_watch = if (economics.enabled()) io_util.Stopwatch.init(self.timer.io) else null;
     const got = try @import("../history.zig").match(self, allocator, idx.toks.items, t1, lookup_cap) orelse return null;
+    if (query_watch) |watch| {
+        const cap = @min(remaining, lookup_cap);
+        const floor = depth_bounds.floorFor(depth_bounds.active, lookup_cap);
+        const k = try economics.select(self, allocator, got, cap, floor, t1, watch, plan);
+        return if (k > 0) .{ .match = got, .drafts = k, .external = true } else null;
+    }
     const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
     return if (k > 0) .{ .match = got, .drafts = k, .external = true } else null;
 }
 
 /// How many drafts the stock lookup gate takes; zero retains the MTP head.
 pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
-    return if (try lookupProposal(self, allocator, plan, t1)) |proposal| proposal.drafts else 0;
+    return if (try lookupProposal(self, allocator, plan, t1, true)) |proposal| proposal.drafts else 0;
 }
 
 pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
-    const proposal = try lookupProposal(self, allocator, plan, t1) orelse return null;
+    const proposal = try lookupProposal(self, allocator, plan, t1, false) orelse return null;
     const k = proposal.drafts;
     const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
     if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
@@ -383,7 +396,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     lplan.m_lo = k;
     lplan.m_hi = k;
     lplan.width_trial = false;
-    return .{
+    var chain: MtpPreDraft = .{
         .plan = lplan,
         .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
         .t1 = t1,
@@ -400,6 +413,12 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
         .lookup = true,
         .external_history = proposal.external,
     };
+    errdefer {
+        _ = mlx.mlx_array_free(chain.t1_arr);
+        for (draft_arrs) |arr| _ = mlx.mlx_array_free(arr);
+    }
+    try @import("economics.zig").attachLookup(self, allocator, &chain);
+    return chain;
 }
 
 /// Round N's accept decision as lazy arrays: `a` (0-d int32) drafts accepted, the next
@@ -514,7 +533,7 @@ pub fn mtpLazyPredraftEnabled() bool {
 /// The gate for building round N+1's chain from round N's lazy results, read before any host read.
 pub fn mtpLazyGate(self: *const Generator, st: *const MtpRoundState, greedy: bool, grouped: bool) LazyGate {
     return .{
-        .enabled = mtpLazyPredraftEnabled(),
+        .enabled = mtpLazyPredraftEnabled() and st.chain.economics == null,
         .greedy = greedy,
         .solo = !grouped and !self.mtp_batch_head and self.mtp_group_cap == 0 and st.verify_len == 1 + st.chain.m,
         .padded = self.mtpPaddedHistory(),
@@ -535,6 +554,7 @@ pub fn mtpLazyPreDraft(self: *Generator, allocator: std.mem.Allocator, chain: *c
     const m = chain.m;
     const plan = self.mtpRoundPlan();
     if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return null;
+    if (@import("economics.zig").probePending(self, plan)) return null;
     var v = try mtpLazyVerdict(s, am, chain.draft_arrs[0..m], verify_hidden_all);
     defer v.deinit();
     var upcoming = try self.mtpChainInit(allocator, plan, 0);

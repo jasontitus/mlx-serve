@@ -130,7 +130,9 @@ pub const Caps = packed struct(u64) {
     /// Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`):
     /// requests interleave and batch instead of running single-flight.
     slot_state: bool = false,
-    _: u34 = 0,
+    /// Exact host-proven chains above eight tree rows use the linear GDN recurrence.
+    spec_tree_linear_gdn: bool = false,
+    _: u33 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -409,6 +411,9 @@ pub const Forward = extern struct {
     /// finite: a left-padded prompt's pads masked), summed into every layer's scores (`Caps.prefill_mask`); empty =
     /// none.
     mask_add: Array = .{},
+    /// Host proof over the executed parents AND depths, not a width heuristic.
+    /// Only sent to a plugin declaring `Caps.spec_tree_linear_gdn`.
+    tree_linear_gdn: bool = false,
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs

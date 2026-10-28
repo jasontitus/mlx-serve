@@ -1,0 +1,32 @@
+{
+  "capture": "Native SwiftUI SettingsView hosted in NSWindow; bitmap captured from the live NSHostingView. Not a mockup.",
+  "platform": "M2 Max, macOS",
+  "viewport_points": [
+    1120,
+    900
+  ],
+  "appearance": "light, system window background",
+  "server_started": false,
+  "model_inference": false,
+  "temporary_harness_changes": [
+    "Alternate process entrypoint uses actual AppState(startServerAtLaunch:false) with isolated home/defaults.",
+    "Initializer extension selects the existing Speculative Decoding category.",
+    "Unmodified Settings controls and layout render in a native window."
+  ],
+  "revisions": {
+    "before": {
+      "commit": "9cf839fa43113a6b490787b9022d6e8c9efef12c",
+      "settings_view_sha256": "8d0aa000a2db44e20f563750d037b6e6094bcbd8c748603d0133d09e5b31144b",
+      "image_sha256": "d158726dba5c2d736433f1de9ee53d590d4e37a578a459c546d26e0c285cdf02"
+    },
+    "after": {
+      "commit": "3fb027ddbd5a3d7fbd7e06b5d15f95f28831d320",
+      "settings_view_sha256": "cb4e21c8c0022a1aacb45825d2b9925eb03cd0e054d765ef8ee1c4e804784e20",
+      "image_sha256": "76ad307dafb37d9cefba30f1784874a7446a899b6181dcabe7d6dfd497d415ff"
+    }
+  },
+  "image_pixels": [
+    2240,
+    1800
+  ]
+}

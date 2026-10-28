@@ -1,0 +1,15 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
+const source = resolve(process.argv[2]);
+const output = resolve(process.argv[3]);
+const bytes = readFileSync(source);
+const digest = createHash('sha256').update(bytes).digest('hex');
+if (digest !== '77a9d7b6b82eba5fdd846592ec00342a8dced85c472dc241b5a2a094591c8707') throw Error('Unapproved llmprobe bundle');
+const entry = 'main().catch((error) => {\n  console.error("Fatal error:", error);\n  process.exit(2);\n});';
+const text = bytes.toString('utf8');
+if (text.split(entry).length !== 2) throw Error('Unexpected CLI entry shape');
+const adapted = text.replace(entry, 'export { EngineClient, noDeadlineDispatcher };');
+writeFileSync(output, adapted, { flag: 'wx', mode: 0o600 });
+writeFileSync(output + '.provenance.json', JSON.stringify({source, source_sha256:digest, adapted_sha256:createHash('sha256').update(adapted).digest('hex'), transformation:'Replace CLI main invocation with exports only; EngineClient.streamTimed and its dependencies unchanged.', methodology:'llmprobe 0.6.17 streamTimed; normalized recorded replay, not the stock llmprobe workload'}, null, 2)+'\n', {flag:'wx',mode:0o600});
+console.log(output);

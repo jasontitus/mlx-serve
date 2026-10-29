@@ -33,6 +33,8 @@ Engine code is pinned independently of the handoff/tooling branch:
 
 Real runs verify the receipt's helper-file hashes. Keep this tooling checkout (including this README) unchanged after setup; changed tooling requires a deliberately fresh setup/receipt, not editing receipt hashes to bypass provenance checks.
 
+Source validation checks pinned submodule commits and their full tracked contents. The standard `build-mlx.sh` intentionally applies the checked-in mlx-c compatibility patch; the runner verifies that exact patched state using a temporary Git index, without changing the checkout's index. Other tracked modifications still fail. This corrects the original handoff's false refusal of a successful supported build; both M5 builds passed the corrected check, while a diagnostic source modification was rejected.
+
 Setup installs **llmprobe 0.6.17**, not `latest`, into `WORK/timing`, records its npm lock hash, verifies the pinned SHA-256 of `node_modules/llmprobe/bin/dist/llmprobe.mjs`, and derives `WORK/timing/llmprobe-timing-client.mjs` using `prepare-timing-client.mjs`. The adapter exports the existing timing client without launching llmprobe's CLI. This is normalized recorded replay using llmprobe's `streamTimed`, **not the stock llmprobe workload**.
 
 ## Private data and local model

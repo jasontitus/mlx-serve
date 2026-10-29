@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -109,9 +110,38 @@ def check_sources(work, pins):
         require(Path(root).resolve() == tree.resolve(), f'Not a separate source checkout: {tree}')
         commit = command(['git', '-C', str(tree), 'rev-parse', 'HEAD'], env=git_env)
         require(commit == expected, f'{arm}: engine commit differs from pin')
-        dirty = command(['git', '-C', str(tree), 'status', '--porcelain', '--untracked-files=no'], env=git_env)
+        dirty = command(['git', '-C', str(tree), 'status', '--porcelain', '--untracked-files=no',
+                         '--ignore-submodules=dirty'], env=git_env)
         require(not dirty, f'{arm}: tracked source changes; refusing mixed provenance')
-        sources[arm] = {'path': str(tree), 'commit': commit, 'tracked_clean': True}
+        submodules = {}
+        for entry in command(['git', '-C', str(tree), 'ls-tree', '-r', 'HEAD'], env=git_env).splitlines():
+            metadata, name = entry.split('\t', 1)
+            mode, kind, pinned = metadata.split()
+            if mode != '160000':
+                continue
+            directory = tree / name
+            if not (directory / '.git').exists():
+                require(not (work / 'setup-receipt.json').exists(), f'{arm}: missing built submodule {name}')
+                submodules[name] = {'initialized': False}
+                continue
+            have = command(['git', '-C', str(directory), 'rev-parse', 'HEAD'], env=git_env)
+            require(have == pinned, f'{arm}: submodule commit differs from pin: {name}')
+            # build-mlx.sh intentionally applies this checked-in compatibility patch.
+            # Compare the entire tracked worktree to an independent expected index;
+            # arbitrary vendor edits must still fail, without changing the real index.
+            patch = tree / 'patches/mlxc-gather-qmm-global-scale.patch' if name == 'lib/mlxc-src' else None
+            with tempfile.TemporaryDirectory(prefix='pr999-source-index-') as scratch:
+                index_env = {**git_env, 'GIT_INDEX_FILE': str(Path(scratch) / 'index')}
+                prefix = ['git', '-C', str(directory)]
+                command(prefix + ['read-tree', 'HEAD'], env=index_env)
+                if patch is not None:
+                    command(prefix + ['apply', '--cached', '--whitespace=nowarn', str(patch)], env=index_env)
+                result = subprocess.run(prefix + ['diff', '--quiet'], env=index_env, timeout=30)
+                require(result.returncode == 0, f'{arm}: unexpected submodule source changes: {name}')
+            submodules[name] = {'initialized': True, 'commit': have,
+                               'build_patch_sha256': sha(patch) if patch is not None else None}
+        sources[arm] = {'path': str(tree), 'commit': commit, 'tracked_clean': True,
+                        'submodules': submodules}
     return sources
 
 
